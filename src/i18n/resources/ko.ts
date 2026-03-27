@@ -2395,6 +2395,7 @@ export const ko: TranslationTree = {
 			buttons: {
 				archive: "보관",
 				unarchive: "보관 해제",
+				editTimeEntries: "시간 기록 편집",
 			},
 			notices: {
 				titleRequired: "작업 제목을 입력하세요",

@@ -2,7 +2,7 @@
 import { App, Notice, TFile, TAbstractFile, setIcon, setTooltip } from "obsidian";
 import TaskNotesPlugin from "../main";
 import { TaskModal } from "./TaskModal";
-import { TaskDependency, TaskInfo } from "../types";
+import { TaskDependency, TaskInfo, TimeEntry } from "../types";
 import {
 	getCurrentTimestamp,
 	formatDateForStorage,
@@ -53,6 +53,8 @@ export class TaskEditModal extends TaskModal {
 	private initialTags = "";
 	private isShowingConfirmation = false;
 	private pendingClose = false;
+	private timeEntries: TimeEntry[] = [];
+	private metadataTotalTimeValue: HTMLElement | null = null;
 
 	constructor(app: App, plugin: TaskNotesPlugin, options: TaskEditOptions) {
 		super(app, plugin);
@@ -136,6 +138,9 @@ export class TaskEditModal extends TaskModal {
 			.map((item) => item.path!);
 		this.pendingBlockingUpdates = { added: [], removed: [], raw: {} };
 		this.unresolvedBlockingEntries = [];
+
+		// Initialize time entries
+		this.timeEntries = this.task.timeEntries ? [...this.task.timeEntries] : [];
 
 		// Initialize user fields from frontmatter
 		await this.initializeUserFields();
@@ -454,13 +459,28 @@ export class TaskEditModal extends TaskModal {
 		const metadataContent = this.metadataContainer.createDiv("metadata-content");
 
 		// Total tracked time
-		const totalTimeSpent = calculateTotalTimeSpent(this.task.timeEntries || []);
-		if (totalTimeSpent > 0) {
-			const timeDiv = metadataContent.createDiv("metadata-item");
-			timeDiv.createSpan("metadata-key").textContent =
-				this.t("modals.taskEdit.metadata.totalTrackedTime") + " ";
-			timeDiv.createSpan("metadata-value").textContent = formatTime(totalTimeSpent);
-		}
+		const timeDiv = metadataContent.createDiv("metadata-item");
+		timeDiv.createSpan("metadata-key").textContent =
+			this.t("modals.taskEdit.metadata.totalTrackedTime") + " ";
+		
+		this.metadataTotalTimeValue = timeDiv.createSpan("metadata-value");
+		this.refreshTotalTimeDisplay();
+
+		// Edit button
+		const editBtn = timeDiv.createEl("button", {
+			cls: "tasknotes-edit-button clickable-icon",
+		});
+		setIcon(editBtn, "pencil");
+		setTooltip(editBtn, this.t("modals.taskEdit.buttons.editTimeEntries"), { placement: "top" });
+		editBtn.addEventListener("click", (e) => {
+			e.preventDefault();
+			e.stopPropagation();
+			const { TimeEntryEditorModal } = require("./TimeEntryEditorModal");
+			new TimeEntryEditorModal(this.app, this.plugin, { ...this.task, timeEntries: this.timeEntries }, (updatedEntries: TimeEntry[]) => {
+				this.timeEntries = updatedEntries;
+				this.refreshTotalTimeDisplay();
+			}).open();
+		});
 
 		// Created date
 		if (this.task.dateCreated) {
@@ -488,6 +508,13 @@ export class TaskEditModal extends TaskModal {
 			pathDiv.createSpan("metadata-key").textContent =
 				this.t("modals.taskEdit.metadata.file") + " ";
 			pathDiv.createSpan("metadata-value").textContent = this.task.path;
+		}
+	}
+
+	private refreshTotalTimeDisplay(): void {
+		if (this.metadataTotalTimeValue) {
+			const totalTimeSpent = calculateTotalTimeSpent(this.timeEntries);
+			this.metadataTotalTimeValue.textContent = formatTime(totalTimeSpent);
 		}
 	}
 
@@ -939,6 +966,11 @@ export class TaskEditModal extends TaskModal {
 		const userFieldsChanges = this.getUserFieldChanges();
 		if (Object.keys(userFieldsChanges).length > 0) {
 			(changes as any).customFrontmatter = userFieldsChanges;
+		}
+
+		// Compare time entries
+		if (JSON.stringify(this.timeEntries) !== JSON.stringify(this.task.timeEntries || [])) {
+			changes.timeEntries = this.timeEntries;
 		}
 
 		// Always update modified timestamp if there are changes

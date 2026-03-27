@@ -2445,6 +2445,7 @@ export const zh: TranslationTree = {
 			buttons: {
 				archive: "归档",
 				unarchive: "取消归档",
+				editTimeEntries: "编辑时间记录",
 			},
 			notices: {
 				titleRequired: "请输入任务标题",

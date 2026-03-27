@@ -37,6 +37,7 @@ Example:
   - A toggle button inside the modal lets you switch between form and table view per session
   - Click any row in table view to expand it inline for editing
   - A new plugin setting **Settings -> Features -> Time Tracking -> Time entry editor style** controls the default view mode (form or table)
+- Added an **Edit** button (pencil icon) next to the total tracked time in the **Task Edit Modal** to quickly manage your time entries without leaving the task editor
 
 ## Fixed
 

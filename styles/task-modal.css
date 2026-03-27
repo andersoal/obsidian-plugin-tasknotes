@@ -904,12 +904,41 @@ body.is-mobile .tasknotes-plugin.minimalist-task-modal.expanded .modal-button-co
 .tasknotes-plugin .metadata-key {
     color: var(--text-muted);
     font-weight: 500;
-    min-width: 80px;
+    min-width: 140px;
 }
 
 .tasknotes-plugin .metadata-value {
     color: var(--text-normal);
     font-family: var(--font-monospace);
+}
+
+.tasknotes-plugin .tasknotes-edit-button {
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    padding: var(--size-2-1);
+    margin-left: var(--size-4-1);
+    height: auto;
+    width: auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    color: var(--text-muted);
+    opacity: 0.6;
+    transition: opacity 0.2s ease, color 0.2s ease, background-color 0.2s ease;
+    border-radius: var(--radius-s);
+}
+
+.tasknotes-plugin .tasknotes-edit-button:hover {
+    opacity: 1;
+    color: var(--text-normal);
+    background-color: var(--background-modifier-hover);
+}
+
+.tasknotes-plugin .tasknotes-edit-button svg {
+    width: 14px;
+    height: 14px;
 }
 
 /* =====================================================================

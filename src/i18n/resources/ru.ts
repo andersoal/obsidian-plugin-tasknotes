@@ -2445,6 +2445,7 @@ export const ru: TranslationTree = {
 			buttons: {
 				archive: "Архивировать",
 				unarchive: "Разархивировать",
+				editTimeEntries: "Редактировать записи времени",
 			},
 			notices: {
 				titleRequired: "Пожалуйста, введите название задачи",
