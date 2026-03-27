@@ -571,6 +571,10 @@ export const ru: TranslationTree = {
 				autoStopDesc: "Автоматически останавливать отслеживание времени при отметке задачи как выполненной",
 				stopNotificationName: "Уведомление об остановке отслеживания времени",
 				stopNotificationDesc: "Показывать уведомление при автоматической остановке отслеживания времени",
+				editorStyleName: "Time entry editor style",
+				editorStyleDesc: "Default layout when opening the time entry editor for a task",
+				editorStyleForm: "Form (expanded — one form per entry)",
+				editorStyleTable: "Table (compact — all entries in rows)",
 			},
 			recurring: {
 				maintainOffsetName: "Сохранять смещение срока выполнения в повторяющихся задачах",

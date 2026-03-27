@@ -572,6 +572,10 @@ export const pt: TranslationTree = {
 				stopNotificationName: "Notificação de parada de registro de tempo",
 				stopNotificationDesc:
 					"Mostrar notificação quando o registro de tempo é parado automaticamente",
+				editorStyleName: "Estilo do editor de registros de tempo",
+				editorStyleDesc: "Layout padrão ao abrir o editor de registros de tempo",
+				editorStyleForm: "Formulário (expandido — um formulário por entrada)",
+				editorStyleTable: "Tabela (compacto — todas as entradas em linhas)",
 			},
 			stopNotificationName: "Notificação de parada de registro de tempo",
 			stopNotificationDesc: "Mostrar notificação quando o registro de tempo é parado automaticamente",
@@ -2586,6 +2590,16 @@ export const pt: TranslationTree = {
 			saveFailed: "Falha ao salvar registros de tempo",
 			openFailed: "Falha ao abrir editor de registro de tempo",
 			noTasksWithEntries: "Nenhuma tarefa possui registros de tempo para editar",
+			// Table view
+			switchToTable: "Alternar para visualização em tabela",
+			switchToForm: "Alternar para visualização em formulário",
+			tableHeaderDate: "Data",
+			tableHeaderStart: "Início",
+			tableHeaderEnd: "Fim",
+			tableHeaderDuration: "Duração",
+			tableHeaderDescription: "Descrição",
+			tableRunning: "Em execução",
+			tableClickToEdit: "Clique na linha para expandir e editar",
 			validation: {
 				missingStartTime: "Hora de início é obrigatória",
 				endBeforeStart: "Hora de término deve ser após a hora de início"

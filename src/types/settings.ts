@@ -163,6 +163,7 @@ export interface TaskNotesSettings {
 	// Time tracking settings
 	autoStopTimeTrackingOnComplete: boolean;
 	autoStopTimeTrackingNotification: boolean;
+	timeEntryEditorStyle: "form" | "table"; // default view mode for time entry editor modal
 	// Relationships widget settings (unified subtasks, projects, and dependencies)
 	showRelationships: boolean;
 	relationshipsPosition: "top" | "bottom";

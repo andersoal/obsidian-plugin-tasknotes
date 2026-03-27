@@ -577,6 +577,10 @@ export const en: TranslationTree = {
 				stopNotificationName: "Time tracking stop notification",
 				stopNotificationDesc:
 					"Show notification when time tracking is automatically stopped",
+				editorStyleName: "Time entry editor style",
+				editorStyleDesc: "Default layout when opening the time entry editor for a task",
+				editorStyleForm: "Form (expanded — one form per entry)",
+				editorStyleTable: "Table (compact — all entries in rows)",
 			},
 			recurring: {
 				maintainOffsetName: "Maintain due date offset in recurring tasks",
@@ -2636,6 +2640,16 @@ export const en: TranslationTree = {
 			saveFailed: "Failed to save time entries",
 			openFailed: "Failed to open time entry editor",
 			noTasksWithEntries: "No tasks have time entries to edit",
+			// Table view
+			switchToTable: "Switch to table view",
+			switchToForm: "Switch to form view",
+			tableHeaderDate: "Date",
+			tableHeaderStart: "Start",
+			tableHeaderEnd: "End",
+			tableHeaderDuration: "Duration",
+			tableHeaderDescription: "Description",
+			tableRunning: "Running",
+			tableClickToEdit: "Click row to expand for editing",
 			validation: {
 				missingStartTime: "Start time is required",
 				endBeforeStart: "End time must be after start time",

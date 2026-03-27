@@ -14,6 +14,13 @@ Always acknowledge contributors and those who report issues.
 Example:
 
 ```
+## Added
+
+- Time entry editor now supports a compact **table view** in addition to the existing expanded form view
+  - A toggle button inside the modal lets you switch between form and table view per session
+  - Click any row in table view to expand it inline for editing
+  - A new plugin setting **Settings -> Features -> Time Tracking -> Time entry editor style** controls the default view mode (form or table)
+
 ## Fixed
 
 - (#768) Fixed calendar view appearing empty in week and day views due to invalid time configuration values
@@ -23,6 +30,13 @@ Example:
 ```
 
 -->
+
+## Added
+
+- Time entry editor now supports a compact **table view** in addition to the existing expanded form view
+  - A toggle button inside the modal lets you switch between form and table view per session
+  - Click any row in table view to expand it inline for editing
+  - A new plugin setting **Settings -> Features -> Time Tracking -> Time entry editor style** controls the default view mode (form or table)
 
 ## Fixed
 

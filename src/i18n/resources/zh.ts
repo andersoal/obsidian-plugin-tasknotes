@@ -188,10 +188,10 @@ export const zh: TranslationTree = {
 				customDays: "{count}天视图",
 			},
 			settings: {
-		header: {
-			documentation: "Documentation",
-			documentationUrl: "https://tasknotes.dev",
-		},
+				header: {
+					documentation: "Documentation",
+					documentationUrl: "https://tasknotes.dev",
+				},
 				groups: {
 					dateNavigation: "日期导航",
 					events: "事件",
@@ -571,6 +571,10 @@ export const zh: TranslationTree = {
 				autoStopDesc: "任务标记为完成时自动停止时间跟踪",
 				stopNotificationName: "时间跟踪停止通知",
 				stopNotificationDesc: "自动停止时间跟踪时显示通知",
+				editorStyleName: "Time entry editor style",
+				editorStyleDesc: "Default layout when opening the time entry editor for a task",
+				editorStyleForm: "Form (expanded — one form per entry)",
+				editorStyleTable: "Table (compact — all entries in rows)",
 			},
 			recurring: {
 				maintainOffsetName: "在重复任务中保持到期日期偏移",
@@ -2578,6 +2582,15 @@ export const zh: TranslationTree = {
 			saveFailed: "无法保存时间条目",
 			openFailed: "无法打开时间条目编辑器",
 			noTasksWithEntries: "没有任务有时间条目可供编辑",
+			switchToTable: "切换到表格视图",
+			switchToForm: "切换到表单视图",
+			tableHeaderDate: "日期",
+			tableHeaderStart: "开始",
+			tableHeaderEnd: "结束",
+			tableHeaderDuration: "持续时间",
+			tableHeaderDescription: "描述",
+			tableRunning: "运行中",
+			tableClickToEdit: "点击行展开编辑",
 			validation: {
 				missingStartTime: "需要开始时间",
 				endBeforeStart: "结束时间必须在开始时间之后",
