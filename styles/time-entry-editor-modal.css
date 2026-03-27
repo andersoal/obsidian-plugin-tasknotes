@@ -215,3 +215,108 @@
         width: 100%;
     }
 }
+
+/* =====================================================================
+   TOOLBAR (view toggle)
+   ===================================================================== */
+
+.time-entry-editor-modal__toolbar {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: var(--size-4-3);
+}
+
+.time-entry-editor-modal__view-toggle {
+    font-size: var(--font-ui-small);
+    padding: var(--size-4-1) var(--size-4-3);
+    border-radius: var(--radius-s);
+    background: var(--background-modifier-border);
+    color: var(--text-muted);
+    border: none;
+    cursor: var(--cursor, pointer);
+    transition: background 0.15s ease, color 0.15s ease;
+}
+
+.time-entry-editor-modal__view-toggle:hover {
+    background: var(--interactive-accent);
+    color: var(--text-on-accent);
+}
+
+/* =====================================================================
+   TABLE VIEW
+   ===================================================================== */
+
+.time-entry-editor-modal__table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: var(--font-ui-small);
+    table-layout: auto;
+}
+
+.time-entry-editor-modal__table thead th {
+    text-align: left;
+    padding: var(--size-4-1) var(--size-4-2);
+    font-weight: 600;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--background-modifier-border);
+    white-space: nowrap;
+}
+
+.time-entry-editor-modal__table-row {
+    cursor: pointer;
+    transition: background 0.15s ease;
+}
+
+.time-entry-editor-modal__table-row:hover {
+    background: var(--background-secondary);
+}
+
+.time-entry-editor-modal__table-row--expanded {
+    background: var(--background-secondary);
+    font-weight: 600;
+}
+
+.time-entry-editor-modal__table-cell {
+    padding: var(--size-4-2) var(--size-4-2);
+    border-bottom: 1px solid var(--background-modifier-border-hover);
+    vertical-align: middle;
+    color: var(--text-normal);
+}
+
+.time-entry-editor-modal__table-cell--action {
+    width: 32px;
+    text-align: center;
+}
+
+/* =====================================================================
+   INLINE EDIT ROW (table view expanded)
+   ===================================================================== */
+
+.time-entry-editor-modal__table-edit-row {
+    background: var(--background-primary-alt);
+}
+
+.time-entry-editor-modal__table-edit-row td {
+    padding: var(--size-4-3);
+    border-bottom: 2px solid var(--interactive-accent);
+}
+
+.time-entry-editor-modal__inline-form {
+    padding: 0;
+}
+
+.time-entry-editor-modal__inline-form .time-entry-editor-modal__time-container {
+    margin-top: 0;
+}
+
+/* =====================================================================
+   TABLE HINT
+   ===================================================================== */
+
+.time-entry-editor-modal__table-hint {
+    font-size: var(--font-ui-smaller);
+    color: var(--text-faint);
+    text-align: right;
+    padding: var(--size-4-1) 0;
+    margin-top: var(--size-4-1);
+}

@@ -543,6 +543,22 @@ export function renderFeaturesTab(
 					},
 				})
 			);
+
+			group.addSetting((setting) =>
+				configureDropdownSetting(setting, {
+					name: translate("settings.features.timeTracking.editorStyleName"),
+					desc: translate("settings.features.timeTracking.editorStyleDesc"),
+					options: [
+						{ value: "form", label: translate("settings.features.timeTracking.editorStyleForm") },
+						{ value: "table", label: translate("settings.features.timeTracking.editorStyleTable") },
+					],
+					getValue: () => plugin.settings.timeEntryEditorStyle,
+					setValue: async (value: string) => {
+						plugin.settings.timeEntryEditorStyle = value as "form" | "table";
+						save();
+					},
+				})
+			);
 		}
 	);
 
