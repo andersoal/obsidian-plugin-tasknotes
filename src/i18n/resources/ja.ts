@@ -2481,6 +2481,7 @@ export const ja: TranslationTree = {
 			buttons: {
 				archive: "アーカイブ",
 				unarchive: "アーカイブ解除",
+				editTimeEntries: "時間記録を編集",
 			},
 			notices: {
 				titleRequired: "タスクタイトルを入力してください",

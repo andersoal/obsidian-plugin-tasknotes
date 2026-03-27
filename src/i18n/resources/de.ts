@@ -2481,6 +2481,7 @@ export const de: TranslationTree = {
 			buttons: {
 				archive: "Archivieren",
 				unarchive: "Entarchivieren",
+				editTimeEntries: "Zeiteinträge bearbeiten",
 			},
 			notices: {
 				titleRequired: "Bitte gib einen Aufgabentitel ein",

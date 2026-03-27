@@ -2488,7 +2488,8 @@ export const pt: TranslationTree = {
 			},
 			buttons: {
 				archive: "Arquivar",
-				unarchive: "Desarquivar"
+				unarchive: "Desarquivar",
+				editTimeEntries: "Editar registros de tempo",
 			},
 			notices: {
 				titleRequired: "Por favor, insira um título para a tarefa",
