@@ -30,25 +30,3 @@ Example:
 ```
 
 -->
-
-## Added
-
-- Time entry editor now supports a compact **table view** in addition to the existing expanded form view
-  - A toggle button inside the modal lets you switch between form and table view per session
-  - Click any row in table view to expand it inline for editing
-  - A new plugin setting **Settings -> Features -> Time Tracking -> Time entry editor style** controls the default view mode (form or table)
-- Added an **Edit** button (pencil icon) next to the total tracked time in the **Task Edit Modal** to quickly manage your time entries without leaving the task editor
-
-## Fixed
-
-- Fixed documentation deployment CI failures caused by `docs-builder/src/js/main.js` being excluded by a broad `.gitignore` `main.js` rule
-  - Added a specific unignore rule so the docs site client script is tracked and available in GitHub Actions builds
-- Reduced long-running performance risk from calendar sync token persistence by avoiding full runtime settings side-effects during background sync writes
-- Prevented duplicate auto-stop time tracking listeners from accumulating when settings are reloaded or changed
-- Fixed a settings Integrations listener lifecycle issue that could accumulate calendar update callbacks while the settings UI is repeatedly opened/re-rendered
-- (#1630) Fixed TaskNote inline task cards ignoring centered "Readable line length" layout in Minimal theme by constraining and centering the widget in readable mode
-  - Thanks to @martin-forge for reporting
-- Consolidated documentation cleanup for accuracy and clarity across API, webhook, NLP, privacy, settings, and view docs (corrected outdated endpoint/behavior details, normalized current settings paths, and tightened non-release prose)
-- Fixed a broken docs cross-reference from Property Types Reference to Task Properties settings
-- Fixed docs site link generation so internal Markdown links resolve to route URLs instead of broken `.md` paths (for example `/views/default-base-templates/`)
-- Fixed docs release-note links by building all Markdown docs pages, including pages not listed directly in sidebar nav
