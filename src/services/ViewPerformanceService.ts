@@ -1,7 +1,10 @@
-/* eslint-disable @typescript-eslint/no-non-null-assertion */
+/* eslint-disable @typescript-eslint/no-non-null-assertion -- Performance observers are checked for support before callbacks run. */
 import { EventRef } from "obsidian";
-import TaskNotesPlugin from "../main";
+import type { ViewPerformanceServiceContext } from "../bootstrap/pluginServices";
 import { TaskInfo, EVENT_TASK_UPDATED } from "../types";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Services/ViewPerformanceService" });
 
 export interface ViewPerformanceConfig {
 	viewId: string;
@@ -21,7 +24,7 @@ export interface ViewUpdateHandler {
  * Provides change detection, debouncing, batching, and memory management
  */
 export class ViewPerformanceService {
-	private plugin: TaskNotesPlugin;
+	private plugin: ViewPerformanceServiceContext;
 
 	// Global task version cache shared across all views
 	private globalTaskVersionCache = new Map<string, string>();
@@ -36,9 +39,9 @@ export class ViewPerformanceService {
 
 	// Event coordination
 	private updateInProgress = new Set<string>();
-	private eventListener: EventRef | null = null;
+	private eventListener: unknown = null;
 
-	constructor(plugin: TaskNotesPlugin) {
+	constructor(plugin: ViewPerformanceServiceContext) {
 		this.plugin = plugin;
 		this.setupGlobalEventListener();
 	}
@@ -64,7 +67,7 @@ export class ViewPerformanceService {
 		// Clean up debounce timer
 		const timer = this.viewDebounceTimers.get(viewId);
 		if (timer) {
-			clearTimeout(timer);
+			window.clearTimeout(timer);
 			this.viewDebounceTimers.delete(viewId);
 		}
 
@@ -148,12 +151,12 @@ export class ViewPerformanceService {
 		// Clear existing timer
 		const existingTimer = this.viewDebounceTimers.get(viewId);
 		if (existingTimer) {
-			clearTimeout(existingTimer);
+			window.clearTimeout(existingTimer);
 		}
 
 		// Schedule debounced update
-		const timer = window.setTimeout(async () => {
-			await this.processPendingUpdatesForView(viewId);
+		const timer = window.setTimeout(() => {
+			void this.processPendingUpdatesForView(viewId);
 		}, config.debounceDelay);
 
 		this.viewDebounceTimers.set(viewId, timer);
@@ -188,9 +191,9 @@ export class ViewPerformanceService {
 				// Process selective updates in parallel for better performance
 				const updatePromises = pathsToUpdate.map((path) =>
 					handler.updateForTask(path, "update").catch((error) => {
-						console.error(
+						tasknotesLogger.error(
 							`[ViewPerformanceService] Error updating task ${path} in ${viewId}:`,
-							error
+							{ category: "persistence", operation: "updating-task", error: error }
 						);
 						// Don't rethrow - let other updates continue
 					})
@@ -198,9 +201,9 @@ export class ViewPerformanceService {
 				await Promise.all(updatePromises);
 			}
 		} catch (error) {
-			console.error(
+			tasknotesLogger.error(
 				`[ViewPerformanceService] Error processing updates for ${viewId}:`,
-				error
+				{ category: "validation", operation: "processing-updates", error: error }
 			);
 			// Fallback to full refresh
 			await handler.refresh();
@@ -266,7 +269,6 @@ export class ViewPerformanceService {
 			const allTaskPaths = this.plugin.cacheManager.getAllTaskPaths();
 			const existingPaths = new Set(allTaskPaths);
 
-			// eslint-disable-next-line @typescript-eslint/no-unused-vars
 			for (const taskPath of this.globalTaskVersionCache.keys()) {
 				if (!existingPaths.has(taskPath)) {
 					this.globalTaskVersionCache.delete(taskPath);
@@ -284,7 +286,11 @@ export class ViewPerformanceService {
 				this.lastGlobalRefreshTime = 0;
 			}
 		} catch (error) {
-			console.error("[ViewPerformanceService] Error during cache cleanup:", error);
+			tasknotesLogger.error("[ViewPerformanceService] Error during cache cleanup:", {
+				category: "stale-data",
+				operation: "cache-cleanup",
+				error: error,
+			});
 		}
 	}
 
@@ -299,7 +305,7 @@ export class ViewPerformanceService {
 	/**
 	 * Get performance statistics
 	 */
-	getStats(): Record<string, any> {
+	getStats(): Record<string, unknown> {
 		return {
 			registeredViews: Array.from(this.viewConfigs.keys()),
 			cacheSize: this.globalTaskVersionCache.size,
@@ -318,13 +324,13 @@ export class ViewPerformanceService {
 	destroy(): void {
 		// Clean up global event listener
 		if (this.eventListener) {
-			this.plugin.emitter.offref(this.eventListener);
+			this.plugin.emitter.offref(this.eventListener as EventRef);
 			this.eventListener = null;
 		}
 
 		// Clean up all timers
 		for (const timer of this.viewDebounceTimers.values()) {
-			clearTimeout(timer);
+			window.clearTimeout(timer);
 		}
 
 		// Clear all state
@@ -336,3 +342,5 @@ export class ViewPerformanceService {
 		this.globalTaskVersionCache.clear();
 	}
 }
+
+/* eslint-enable @typescript-eslint/no-non-null-assertion -- Re-enable after the performance service implementation. */

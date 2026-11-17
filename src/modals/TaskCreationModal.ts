@@ -1,706 +1,157 @@
-import {
-	App,
-	Notice,
-	setIcon,
-	AbstractInputSuggest,
-	setTooltip,
-	parseFrontMatterAliases,
-	TFile,
-} from "obsidian";
+import { displayError } from "../i18n/runtime";
+import { msg } from "@lingui/core/macro";
+import { App, Notice, setIcon, setTooltip, TFile } from "obsidian";
 import TaskNotesPlugin from "../main";
-import { TaskModal } from "./TaskModal";
-import { TaskInfo, TaskCreationData, TaskDependency } from "../types";
-import { getCurrentTimestamp } from "../utils/dateUtils";
-import { generateTaskFilename, FilenameContext } from "../utils/filenameGenerator";
-import { calculateDefaultDate, sanitizeTags } from "../utils/helpers";
+import { TaskModal, type TaskSubmitOptions } from "./TaskModal";
+import { TaskInfo } from "../types";
+import { sanitizeTags } from "../utils/helpers";
 import {
 	NaturalLanguageParser,
 	ParsedTaskData as NLParsedTaskData,
 } from "../services/NaturalLanguageParser";
-// StatusSuggestion kept for backward compatibility with old NLPSuggest
-export interface StatusSuggestion {
-	value: string;
-	label: string;
-	display: string;
-	type: "status";
-	toString(): string;
-}
 import { combineDateAndTime } from "../utils/dateUtils";
-import { splitListPreservingLinksAndQuotes } from "../utils/stringSplit";
-import { ProjectMetadataResolver, ProjectEntry } from "../utils/projectMetadataResolver";
-import { parseDisplayFieldsRow } from "../utils/projectAutosuggestDisplayFieldsParser";
-import { EmbeddableMarkdownEditor } from "../editor/EmbeddableMarkdownEditor";
-import { createNLPAutocomplete } from "../editor/NLPCodeMirrorAutocomplete";
 
+import type {
+	EmbeddableMarkdownEditor,
+	MarkdownEditorProps,
+} from "../editor/EmbeddableMarkdownEditor";
+import { createNLPAutocomplete } from "../editor/NLPCodeMirrorAutocomplete";
+import { createNLPHighlight } from "../editor/NLPHighlight";
+import { buildCreationBlockingUpdates, buildTaskCreationData } from "./taskCreationData";
+import {
+	buildTaskCreationFormState,
+	type TaskCreationPrepopulatedValues,
+} from "./taskCreationFormState";
+import { applyTaskCreationSubtaskAssignments } from "./taskCreationSubtasks";
+import { getTaskFilenameNotice } from "../utils/filenameGenerator";
+import type { TaskFormNaturalLanguageLayer } from "./taskFormModel";
+import { setTaskModalDetailsCollapsed } from "./taskModalLayout";
+import type { TaskModalProjectItem } from "./taskModalProjects";
+import { runTaskSaveFollowUps, type TaskSaveOutcome } from "./taskModalSave";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+
+import {
+	createLinkedAttachmentEntries,
+	getLinkedAttachmentReferences,
+	hasPendingAttachments,
+} from "./taskModalAttachments";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Modals/TaskCreationModal" });
+export type { StatusSuggestion } from "./taskCreationSuggest";
+
+const TASK_CREATION_FAILURE_PREFIX = "Failed to create task: ";
+const NLP_TAB_ORDER_SELECTOR = [
+	"button",
+	"a[href]",
+	"input",
+	"select",
+	"textarea",
+	"[tabindex]:not([tabindex='-1'])",
+	".tn-task-modal__markdown-editor--nlp",
+].join(", ");
+const NATIVE_FOCUSABLE_TAG_NAMES = new Set(["A", "BUTTON", "INPUT", "SELECT", "TEXTAREA"]);
+
+type PotentiallyDisabledElement = HTMLElement & { disabled?: boolean };
+
+function isFocusableModalElement(element: HTMLElement): boolean {
+	if ((element as PotentiallyDisabledElement).disabled) {
+		return false;
+	}
+
+	return element.tabIndex >= 0 || NATIVE_FOCUSABLE_TAG_NAMES.has(element.tagName);
+}
+
+export function getTaskCreationFailureNoticeMessage(error: unknown): string {
+	const rawMessage = error instanceof Error && error.message ? error.message : String(error);
+	return rawMessage.startsWith(TASK_CREATION_FAILURE_PREFIX)
+		? rawMessage.slice(TASK_CREATION_FAILURE_PREFIX.length)
+		: rawMessage;
+}
 
 export interface TaskCreationOptions {
-	prePopulatedValues?: Partial<TaskInfo>;
+	prePopulatedValues?: TaskCreationPrepopulatedValues;
 	onTaskCreated?: (task: TaskInfo) => void;
 	creationContext?: "manual-creation" | "modal-inline-creation"; // Folder behavior context
 }
 
-/**
- * Auto-suggestion provider for NLP textarea with @, #, and + triggers
- * @ = contexts, # = tags, + = wikilinks to vault files
- */
-interface ProjectSuggestion {
-	basename: string;
-	displayName: string;
-	type: "project";
-	toString(): string;
+type OpenTaskAfterCreationMode = TaskNotesPlugin["settings"]["openTaskAfterCreation"];
+type CreatedTaskOpenMode = Exclude<OpenTaskAfterCreationMode, "none">;
+
+export function shouldOpenCreatedTaskAfterSave(
+	mode: OpenTaskAfterCreationMode | undefined,
+	options: { createAnother?: boolean },
+	hasCreationCallback: boolean
+): mode is CreatedTaskOpenMode {
+	return (
+		(mode === "same-tab" || mode === "new-tab") &&
+		!options.createAnother &&
+		!hasCreationCallback
+	);
 }
 
-interface TagSuggestion {
-	value: string;
-	display: string;
-	type: "tag";
-	toString(): string;
+export async function openCreatedTaskFileAfterSave(
+	app: App,
+	file: TFile,
+	mode: CreatedTaskOpenMode
+): Promise<void> {
+	const leaf = mode === "new-tab" ? app.workspace.getLeaf("tab") : app.workspace.getLeaf(false);
+	await leaf.openFile(file);
 }
 
-interface ContextSuggestion {
-	value: string;
-	display: string;
-	type: "context";
-	toString(): string;
-}
-
-class NLPSuggest extends AbstractInputSuggest<
-	TagSuggestion | ContextSuggestion | ProjectSuggestion | StatusSuggestion
-> {
-	private plugin: TaskNotesPlugin;
-	private textarea: HTMLTextAreaElement;
-	private currentTrigger: "@" | "#" | "+" | "status" | null = null;
-	// Store app reference explicitly to avoid relying on plugin.app in tests and runtime
-	private obsidianApp: App;
-	// Cache ProjectMetadataResolver to avoid recreating it for each suggestion
-	private projectMetadataResolver: ProjectMetadataResolver | null = null;
-
-	constructor(app: App, textareaEl: HTMLTextAreaElement, plugin: TaskNotesPlugin) {
-		super(app, textareaEl as unknown as HTMLInputElement);
-		this.plugin = plugin;
-		this.textarea = textareaEl;
-		this.obsidianApp = app;
-	}
-
-	/**
-	 * Helper: Check if index is at a word boundary
-	 */
-	private isBoundary(textBeforeCursor: string, index: number): boolean {
-		if (index === -1) return false;
-		if (index === 0) return true;
-		const prev = textBeforeCursor[index - 1];
-		return !/\w/.test(prev);
-	}
-
-	/**
-	 * Find the most recent valid trigger before cursor
-	 */
-	private findActiveTrigger(textBeforeCursor: string): {
-		trigger: "@" | "#" | "+" | "status" | null;
-		triggerIndex: number;
-		queryAfterTrigger: string;
-	} {
-		const lastAtIndex = textBeforeCursor.lastIndexOf("@");
-		const lastHashIndex = textBeforeCursor.lastIndexOf("#");
-		const lastPlusIndex = textBeforeCursor.lastIndexOf("+");
-		const statusTrig = (this.plugin.settings.statusSuggestionTrigger || "").trim();
-		const lastStatusIndex = statusTrig ? textBeforeCursor.lastIndexOf(statusTrig) : -1;
-
-		// Determine most recent valid trigger by index
-		const candidates: Array<{ type: "@" | "#" | "+" | "status"; index: number }> = [
-			{ type: "@" as const, index: lastAtIndex },
-			{ type: "#" as const, index: lastHashIndex },
-			{ type: "+" as const, index: lastPlusIndex },
-			{ type: "status" as const, index: lastStatusIndex },
-		].filter((c) => this.isBoundary(textBeforeCursor, c.index));
-
-		if (candidates.length === 0) {
-			return { trigger: null, triggerIndex: -1, queryAfterTrigger: "" };
-		}
-
-		candidates.sort((a, b) => b.index - a.index);
-		const triggerIndex = candidates[0].index;
-		const trigger = candidates[0].type;
-
-		// Extract the query after the trigger (respect multi-char trigger for status)
-		const offset = trigger === "status" ? statusTrig?.length || 0 : 1;
-		const queryAfterTrigger = textBeforeCursor.slice(triggerIndex + offset);
-
-		return { trigger, triggerIndex, queryAfterTrigger };
-	}
-
-	/**
-	 * Check if the query context should end suggestion display
-	 */
-	private shouldEndSuggestionContext(
-		trigger: "@" | "#" | "+" | "status",
-		queryAfterTrigger: string
-	): boolean {
-		// If '+' trigger already has a completed wikilink (+[[...]]), do not suggest again
-		if (trigger === "+" && /^\[\[[^\]]*\]\]/.test(queryAfterTrigger)) {
-			return true;
-		}
-
-		// Check if there's a space in the query (which would end the suggestion context)
-		// For '+' (projects/wikilinks), allow spaces for multi-word fuzzy queries
-		if (
-			(trigger === "@" || trigger === "#" || trigger === "status") &&
-			(queryAfterTrigger.includes(" ") || queryAfterTrigger.includes("\n"))
-		) {
-			return true;
-		}
-
-		return false;
-	}
-
-	/**
-	 * Get context suggestions
-	 */
-	private getContextSuggestions(query: string): ContextSuggestion[] {
-		const contexts = this.plugin.cacheManager.getAllContexts();
-		return contexts
-			.filter((context) => context && typeof context === "string")
-			.filter((context) =>
-				context.toLowerCase().includes(query.toLowerCase())
-			)
-			.slice(0, 10)
-			.map((context) => ({
-				value: context,
-				display: context,
-				type: "context" as const,
-				toString() {
-					return this.value;
-				},
-			}));
-	}
-
-	/**
-	 * Get status suggestions
-	 */
-	private getStatusSuggestions(query: string): StatusSuggestion[] {
-		const parser = NaturalLanguageParser.fromPlugin(this.plugin);
-		return parser.getStatusSuggestions(query, 10).map(s => ({
-			...s,
-			type: "status" as const,
-			toString() {
-				return this.value;
-			},
-		}));
-	}
-
-	/**
-	 * Get tag suggestions
-	 */
-	private getTagSuggestions(query: string): TagSuggestion[] {
-		const tags = this.plugin.cacheManager.getAllTags();
-		return tags
-			.filter((tag) => tag && typeof tag === "string")
-			.filter((tag) => tag.toLowerCase().includes(query.toLowerCase()))
-			.slice(0, 10)
-			.map((tag) => ({
-				value: tag,
-				display: tag,
-				type: "tag" as const,
-				toString() {
-					return this.value;
-				},
-			}));
-	}
-
-	/**
-	 * Get or create the cached ProjectMetadataResolver
-	 */
-	private getProjectMetadataResolver(): ProjectMetadataResolver {
-		if (!this.projectMetadataResolver) {
-			const appRef: App | undefined =
-				(this as any).obsidianApp ?? (this as any).app ?? this.plugin?.app;
-			this.projectMetadataResolver = new ProjectMetadataResolver({
-				getFrontmatter: (entry) => {
-					const file = appRef?.vault.getAbstractFileByPath(entry.path);
-					const cache = file
-						? appRef?.metadataCache.getFileCache(file as any)
-						: undefined;
-					return cache?.frontmatter || {};
-				},
-			});
-		}
-		return this.projectMetadataResolver;
-	}
-
-	/**
-	 * Get project suggestions (file-based)
-	 */
-	private async getProjectSuggestions(query: string): Promise<ProjectSuggestion[]> {
-		// Use FileSuggestHelper for multi-word support with enhanced project autosuggest cards and |s flag support
-		const { FileSuggestHelper } = await import("../suggest/FileSuggestHelper");
-
-		// Apply excluded folders filter to FileSuggestHelper
-		const excluded = (this.plugin.settings.excludedFolders || "")
-			.split(",")
-			.map((s) => s.trim())
-			.filter(Boolean);
-
-		// Get suggestions using FileSuggestHelper with explicit project filter configuration
-		const list = await FileSuggestHelper.suggest(
-			this.plugin,
-			query,
-			20,
-			this.plugin.settings.projectAutosuggest
-		);
-
-		// Filter out excluded folders
-		const appRef: App | undefined =
-			(this as any).obsidianApp ?? (this as any).app ?? this.plugin?.app;
-		const filteredList = list.filter((item) => {
-			const file = appRef?.vault
-				.getMarkdownFiles()
-				.find((f) => f.basename === item.insertText);
-			if (!file) return true;
-			return !excluded.some((folder) => file.path.startsWith(folder));
-		});
-
-		try {
-			// Use cached resolver instead of creating a new one
-			const resolver = this.getProjectMetadataResolver();
-
-			const rowConfigs = (this.plugin.settings?.projectAutosuggest?.rows ?? []).slice(0, 3);
-
-			return filteredList.map((item) => {
-				const file = appRef?.vault
-					.getMarkdownFiles()
-					.find((f) => f.basename === item.insertText);
-				if (!file) {
-					return {
-						basename: item.insertText,
-						displayName: item.displayText,
-						type: "project" as const,
-						toString() {
-							return this.basename;
-						},
-					};
-				}
-
-				const cache = appRef?.metadataCache.getFileCache(file);
-				const frontmatter = cache?.frontmatter || {};
-				const mapped = this.plugin.fieldMapper.mapFromFrontmatter(
-					frontmatter,
-					file.path,
-					this.plugin.settings.storeTitleInFilename
-				);
-
-				const title = typeof mapped.title === "string" ? mapped.title : "";
-				const aliasesFm = parseFrontMatterAliases(frontmatter) || [];
-				const aliases = Array.isArray(aliasesFm)
-					? (aliasesFm.filter((a) => typeof a === "string") as string[])
-					: [];
-
-				const fileData = {
-					basename: file.basename,
-					name: file.name,
-					path: file.path,
-					parent: file.parent?.path || "",
-					title,
-					aliases,
-					frontmatter: frontmatter,
-				};
-
-				const displayName = this.generateProjectDisplayName(rowConfigs, fileData, resolver, file.basename);
-
-				return {
-					basename: item.insertText,
-					displayName: displayName,
-					type: "project" as const,
-					entry: {
-						basename: fileData.basename,
-						name: fileData.name,
-						path: fileData.path,
-						parent: fileData.parent,
-						title: fileData.title,
-						aliases: fileData.aliases,
-						frontmatter: fileData.frontmatter,
-					},
-					toString() {
-						return this.basename;
-					},
-				} as ProjectSuggestion;
-			});
-		} catch (err) {
-			console.error(
-				"Enhanced project autosuggest failed, falling back to basic suggestions",
-				err
-			);
-			return filteredList.map((item) => ({
-				basename: item.insertText,
-				displayName: item.displayText,
-				type: "project" as const,
-				toString() {
-					return this.basename;
-				},
-			}));
-		}
-	}
-
-	/**
-	 * Generate enhanced display name for project suggestions
-	 */
-	private generateProjectDisplayName(
-		rows: string[],
-		item: any,
-		resolver: ProjectMetadataResolver,
-		fallback: string
-	): string {
-		const lines: string[] = [];
-		for (const row of rows) {
-			try {
-				const tokens = parseDisplayFieldsRow(row);
-				const parts: string[] = [];
-				for (const token of tokens) {
-					if (token.property.startsWith("literal:")) {
-						parts.push(token.property.slice(8));
-						continue;
-					}
-					const value = resolver.resolve(token.property, item) || "";
-					if (!value) continue;
-					if (token.showName) {
-						const label = token.displayName ?? token.property;
-						parts.push(`${label}: ${value}`);
-					} else {
-						parts.push(value);
-					}
-				}
-				const line = parts.join(" ");
-				if (line.trim()) lines.push(line);
-			} catch {
-				// Skip invalid rows
-			}
-		}
-		return lines.join(" | ") || fallback;
-	}
-
-	protected async getSuggestions(
-		query: string
-	): Promise<(TagSuggestion | ContextSuggestion | ProjectSuggestion | StatusSuggestion)[]> {
-		// Get cursor position and text around it
-		const cursorPos = this.textarea.selectionStart;
-		const textBeforeCursor = this.textarea.value.slice(0, cursorPos);
-
-		// Find the active trigger
-		const { trigger, triggerIndex, queryAfterTrigger } = this.findActiveTrigger(textBeforeCursor);
-
-		if (!trigger || triggerIndex === -1) {
-			this.currentTrigger = null;
-			return [];
-		}
-
-		// Check if we should end the suggestion context
-		if (this.shouldEndSuggestionContext(trigger, queryAfterTrigger)) {
-			this.currentTrigger = null;
-			return [];
-		}
-
-		this.currentTrigger = trigger;
-
-		// Get suggestions based on trigger type
-		switch (trigger) {
-			case "@":
-				return this.getContextSuggestions(queryAfterTrigger);
-			case "status":
-				return this.getStatusSuggestions(queryAfterTrigger);
-			case "#":
-				return this.getTagSuggestions(queryAfterTrigger);
-			case "+":
-				return await this.getProjectSuggestions(queryAfterTrigger);
-			default:
-				return [];
-		}
-	}
-
-	public renderSuggestion(
-		suggestion: TagSuggestion | ContextSuggestion | ProjectSuggestion | StatusSuggestion,
-		el: HTMLElement
-	): void {
-		// Add ARIA attributes for accessibility
-		el.setAttribute("role", "option");
-		// Get display text - ProjectSuggestion uses displayName, others use display
-		const displayText = suggestion.type === "project"
-			? (suggestion as ProjectSuggestion).displayName
-			: (suggestion as TagSuggestion | ContextSuggestion | StatusSuggestion).display;
-		el.setAttribute("aria-label", `${suggestion.type}: ${displayText}`);
-
-		const icon = el.createSpan("nlp-suggest-icon");
-		icon.textContent =
-			this.currentTrigger === "status"
-				? this.plugin.settings.statusSuggestionTrigger || ""
-				: this.currentTrigger || "";
-		icon.setAttribute("aria-hidden", "true");
-
-		const text = el.createSpan("nlp-suggest-text");
-
-		// Helper: highlight all occurrences (multi-word)
-		const highlightOccurrences = (container: HTMLElement, query: string) => {
-			if (!query) return;
-			const words = query.toLowerCase().split(/\s+/).filter(Boolean);
-			if (!words.length) return;
-			const walk = (node: Node) => {
-				if (node.nodeType === Node.TEXT_NODE) {
-					const original = node.nodeValue || "";
-					const lower = original.toLowerCase();
-					const matches: Array<{ start: number; end: number }> = [];
-					for (const w of words) {
-						let idx = lower.indexOf(w);
-						while (idx !== -1) {
-							matches.push({ start: idx, end: idx + w.length });
-							idx = lower.indexOf(w, idx + 1);
-						}
-					}
-					matches.sort((a, b) => a.start - b.start);
-					const filtered: typeof matches = [];
-					for (const m of matches) {
-						if (!filtered.length || m.start >= filtered[filtered.length - 1].end)
-							filtered.push(m);
-					}
-					if (!filtered.length) return;
-					const frag = document.createDocumentFragment();
-					let last = 0;
-					for (const m of filtered) {
-						if (m.start > last)
-							frag.appendChild(
-								document.createTextNode(original.slice(last, m.start))
-							);
-						const mark = document.createElement("mark");
-						mark.textContent = original.slice(m.start, m.end);
-						frag.appendChild(mark);
-						last = m.end;
-					}
-					if (last < original.length)
-						frag.appendChild(document.createTextNode(original.slice(last)));
-					node.parentNode?.replaceChild(frag, node);
-				} else if (
-					node.nodeType === Node.ELEMENT_NODE &&
-					(node as Element).tagName !== "MARK"
-				) {
-					const children = Array.from(node.childNodes);
-					for (const c of children) walk(c);
-				}
-			};
-			walk(container);
-		};
-
-		// Determine active +query to highlight
-		let activeQuery = "";
-		if (this.currentTrigger === "+") {
-			const cursorPos = this.textarea.selectionStart;
-			const before = this.textarea.value.slice(0, cursorPos);
-			const lastPlus = before.lastIndexOf("+");
-			if (lastPlus !== -1) {
-				const after = before.slice(lastPlus + 1);
-				if (after && !after.includes("\n")) activeQuery = after.trim();
-			}
-		}
-
-		if (suggestion.type === "project") {
-			// Multi-line card: first line = filename, extra lines from config
-			const filenameRow = text.createDiv({
-				cls: "nlp-suggest-project__filename",
-				text: suggestion.basename,
-			});
-			if (activeQuery) highlightOccurrences(filenameRow, activeQuery);
-
-			const cfg = (this.plugin.settings?.projectAutosuggest?.rows ?? []).slice(0, 3);
-			if (Array.isArray(cfg) && cfg.length > 0 && (suggestion as any).entry) {
-				// Use cached resolver for rendering too
-				const resolver = this.getProjectMetadataResolver();
-				for (let i = 0; i < Math.min(cfg.length, 3); i++) {
-					const row = cfg[i];
-					if (!row) continue;
-					try {
-						const tokens = parseDisplayFieldsRow(row);
-						const metaRow = text.createDiv({ cls: "nlp-suggest-project__meta" });
-						const ALWAYS = new Set(["title", "aliases", "file.basename"]);
-						let appended = false;
-						for (const t of tokens) {
-							if (t.property.startsWith("literal:")) {
-								const lit = t.property.slice(8);
-								if (lit) {
-									if (metaRow.childNodes.length)
-										metaRow.appendChild(document.createTextNode(" "));
-									metaRow.appendChild(document.createTextNode(lit));
-									appended = true;
-								}
-								continue;
-							}
-							const value = resolver.resolve(t.property, (suggestion as any).entry);
-							if (!value) continue;
-							if (metaRow.childNodes.length)
-								metaRow.appendChild(document.createTextNode(" "));
-							if (t.showName) {
-								const labelSpan = document.createElement("span");
-								labelSpan.className = "nlp-suggest-project__meta-label";
-								labelSpan.textContent = `${t.displayName ?? t.property}:`;
-								metaRow.appendChild(labelSpan);
-								metaRow.appendChild(document.createTextNode(" "));
-							}
-							const valueSpan = document.createElement("span");
-							valueSpan.className = "nlp-suggest-project__meta-value";
-							valueSpan.textContent = value;
-							metaRow.appendChild(valueSpan);
-							appended = true;
-							const searchable =
-								(t as any).searchable === true || ALWAYS.has(t.property);
-							if (activeQuery && searchable)
-								highlightOccurrences(valueSpan, activeQuery);
-						}
-						if (!appended || metaRow.textContent?.trim().length === 0) metaRow.remove();
-					} catch {
-						/* ignore row parse errors */
-					}
-				}
-			}
-		} else if (suggestion.type === "status") {
-			text.textContent = suggestion.display;
-		} else {
-			text.textContent = suggestion.display;
-		}
-	}
-
-	public selectSuggestion(
-		suggestion: TagSuggestion | ContextSuggestion | ProjectSuggestion | StatusSuggestion
-	): void {
-		if (!this.currentTrigger) return;
-
-		const cursorPos = this.textarea.selectionStart;
-		const textBeforeCursor = this.textarea.value.slice(0, cursorPos);
-		const textAfterCursor = this.textarea.value.slice(cursorPos);
-
-		// Find the last trigger position (handle custom status trigger length)
-		let lastTriggerIndex = -1;
-		const statusTrig = (this.plugin.settings.statusSuggestionTrigger || "").trim();
-		if (this.currentTrigger === "@") {
-			lastTriggerIndex = textBeforeCursor.lastIndexOf("@");
-		} else if (this.currentTrigger === "#") {
-			lastTriggerIndex = textBeforeCursor.lastIndexOf("#");
-		} else if (this.currentTrigger === "+") {
-			lastTriggerIndex = textBeforeCursor.lastIndexOf("+");
-		} else if (this.currentTrigger === "status" && statusTrig) {
-			lastTriggerIndex = textBeforeCursor.lastIndexOf(statusTrig);
-		}
-
-		if (lastTriggerIndex === -1) return;
-
-		// Get the actual suggestion text to insert
-		const suggestionText =
-			suggestion.type === "project" ? suggestion.basename : suggestion.value;
-
-		// Replace the trigger and partial text with the full suggestion
-		const beforeTrigger = textBeforeCursor.slice(0, lastTriggerIndex);
-		let replacement = "";
-
-		if (this.currentTrigger === "+") {
-			// For project (+) trigger, wrap in wikilink syntax but keep the + sign
-			replacement = "+[[" + suggestionText + "]]";
-		} else if (this.currentTrigger === "status") {
-			// For status: insert the label text (like other suggestions)
-			replacement = suggestion.type === "status" ? suggestion.label : suggestionText;
-		} else {
-			// For @ and #, keep the trigger and the suggestion
-			replacement = this.currentTrigger + suggestionText;
-		}
-
-		const newText = beforeTrigger + replacement + (replacement ? " " : "") + textAfterCursor;
-
-		this.textarea.value = newText;
-
-		// Set cursor position after the inserted suggestion
-		const newCursorPos = beforeTrigger.length + replacement.length + (replacement ? 1 : 0);
-		this.textarea.setSelectionRange(newCursorPos, newCursorPos);
-
-		// Trigger input event to update preview
-		this.textarea.dispatchEvent(new Event("input", { bubbles: true }));
-		this.textarea.focus();
-	}
+function createEmbeddableMarkdownEditor(
+	app: App,
+	container: HTMLElement,
+	options: Partial<MarkdownEditorProps>
+): EmbeddableMarkdownEditor {
+	// Lazy-load because the editor module resolves Obsidian internals during evaluation.
+	/* eslint-disable @typescript-eslint/no-require-imports -- Modal editor is lazy-loaded to avoid evaluating Obsidian internals during import. */
+	const editorModule =
+		require("../editor/EmbeddableMarkdownEditor") as typeof import("../editor/EmbeddableMarkdownEditor");
+	/* eslint-enable @typescript-eslint/no-require-imports -- Re-enable after the isolated lazy import. */
+	return new editorModule.EmbeddableMarkdownEditor(app, container, options);
 }
 
 export class TaskCreationModal extends TaskModal {
+	protected readonly mode = "create";
 	private options: TaskCreationOptions;
 	private nlParser: NaturalLanguageParser;
-	private nlInput: HTMLTextAreaElement; // Legacy - keeping for compatibility
+	private nlContainer: HTMLElement | null = null;
 	private nlMarkdownEditor: EmbeddableMarkdownEditor | null = null;
-	private nlPreviewContainer: HTMLElement;
-	private nlButtonContainer: HTMLElement;
-	private nlpSuggest: NLPSuggest | null = null; // Will be replaced with CodeMirror autocomplete
+	private nlEditorFailed = false;
+	private nlProjectInput = "";
+	private nlProjectItems: TaskModalProjectItem[] = [];
 
-	// Track event listeners for cleanup
-	private eventListeners: Array<{
-		element: HTMLElement | HTMLTextAreaElement;
-		event: string;
-		handler: EventListener;
-	}> = [];
-
-	constructor(
-		app: App,
-		plugin: TaskNotesPlugin,
-		options: TaskCreationOptions = {}
-	) {
+	constructor(app: App, plugin: TaskNotesPlugin, options: TaskCreationOptions = {}) {
 		super(app, plugin);
 		this.options = options;
 		this.nlParser = NaturalLanguageParser.fromPlugin(plugin);
 	}
 
 	getModalTitle(): string {
-		return this.t("modals.taskCreation.title");
+		return this.t(msg({ message: "Create task", context: "modals.taskCreation.title" }));
 	}
 
-	protected isCreationMode(): boolean {
-		return true;
+	private usesNaturalLanguage(): boolean {
+		return this.plugin.settings.enableNaturalLanguageInput && !this.nlEditorFailed;
 	}
 
-	/**
-	 * Add an event listener and track it for cleanup
-	 */
-	private addTrackedEventListener(
-		element: HTMLElement | HTMLTextAreaElement,
-		event: string,
-		handler: EventListener
-	): void {
-		element.addEventListener(event, handler);
-		this.eventListeners.push({ element, event, handler });
+	protected showsTitleInDetails(): boolean {
+		return this.usesNaturalLanguage();
 	}
 
-	/**
-	 * Remove all tracked event listeners
-	 */
-	private removeAllEventListeners(): void {
-		for (const { element, event, handler } of this.eventListeners) {
-			element.removeEventListener(event, handler);
-		}
-		this.eventListeners = [];
+	protected getTitleErrorAnchor(): HTMLElement | null {
+		return this.nlContainer ?? super.getTitleErrorAnchor();
 	}
 
-	/**
-	 * Override to use NLP input when enabled, otherwise fall back to title input
-	 */
+	/** Without natural language the title input is the primary field, with everything visible. */
 	protected createPrimaryInput(container: HTMLElement): void {
-		if (this.plugin.settings.enableNaturalLanguageInput) {
+		if (this.usesNaturalLanguage()) {
 			this.createNaturalLanguageInput(container);
-		} else {
-			// Fall back to regular title input
-			this.createTitleInput(container);
-			// When NLP is disabled, start with the modal expanded
+		}
+		if (!this.usesNaturalLanguage()) {
+			super.createPrimaryInput(container);
 			this.isExpanded = true;
 			this.containerEl.addClass("expanded");
-		}
-	}
-
-	/**
-	 * Override to re-render projects list after modal content is created
-	 */
-	protected createAdditionalSections(container: HTMLElement): void {
-		// Re-render projects list if pre-populated values were applied or defaults are set
-		if (
-			(this.options.prePopulatedValues && this.options.prePopulatedValues.projects) ||
-			this.selectedProjectItems.length > 0
-		) {
-			this.renderProjectsList();
 		}
 	}
 
@@ -708,16 +159,12 @@ export class TaskCreationModal extends TaskModal {
 		const nlContainer = container.createDiv("nl-input-container");
 
 		// Create markdown editor container
-		const editorContainer = nlContainer.createDiv("nl-markdown-editor");
+		const editorContainer = nlContainer.createDiv(
+			"tn-task-modal__markdown-editor tn-task-modal__markdown-editor--nlp"
+		);
 		editorContainer.setAttribute("role", "textbox");
-		editorContainer.setAttribute("aria-label", this.t("modals.taskCreation.nlPlaceholder"));
+		editorContainer.setAttribute("aria-label", this.t(msg({ message: "Buy groceries tomorrow at 3pm @home #errands", context: "modals.taskCreation.nlPlaceholder" })));
 		editorContainer.setAttribute("aria-multiline", "true");
-
-		// Preview container
-		this.nlPreviewContainer = nlContainer.createDiv("nl-preview-container");
-		this.nlPreviewContainer.setAttribute("role", "status");
-		this.nlPreviewContainer.setAttribute("aria-live", "polite");
-		this.nlPreviewContainer.setAttribute("aria-label", "Task preview");
 
 		try {
 			// Create NLP autocomplete extension for @, #, +, status triggers
@@ -725,37 +172,40 @@ export class TaskCreationModal extends TaskModal {
 			const nlpAutocomplete = createNLPAutocomplete(this.plugin);
 
 			// Create embeddable markdown editor with autocomplete
-			this.nlMarkdownEditor = new EmbeddableMarkdownEditor(this.app, editorContainer, {
+			this.nlMarkdownEditor = createEmbeddableMarkdownEditor(this.app, editorContainer, {
 				value: "",
-				placeholder: this.t("modals.taskCreation.nlPlaceholder"),
+				placeholder: this.t(msg({ message: "Buy groceries tomorrow at 3pm @home #errands", context: "modals.taskCreation.nlPlaceholder" })),
 				cls: "nlp-editor",
-				extensions: nlpAutocomplete, // Add autocomplete extensions (array)
+				extensions: [
+					...nlpAutocomplete,
+					createNLPHighlight((text) => this.nlParser.parseInputWithSpans(text).spans),
+				],
 				enterVimInsertMode: true, // Auto-enter insert mode when vim is enabled (#1410)
-				onChange: (value) => {
-					// Update preview as user types
-					if (value.trim()) {
-						this.updateNaturalLanguagePreview(value.trim());
-					} else {
-						this.clearNaturalLanguagePreview();
-					}
+				onChange: () => {
+					this.syncNaturalLanguageInput();
 				},
-				onSubmit: () => {
+				onSubmit: (_editor, shift) => {
 					// Ctrl+Enter - save the task
-					this.handleSave();
+					void this.handleSubmitShortcut(shift);
 				},
 				onEscape: () => {
 					// ESC - close the modal (only when not in vim insert mode)
 					// Vim mode will handle its own ESC to exit insert mode
 					this.close();
 				},
-				onTab: () => {
+				onTab: (_editor, shift) => {
+					if (shift) {
+						return this.focusPreviousNaturalLanguageField(editorContainer);
+					}
 					// Tab - jump to title input (expand form if needed)
 					if (!this.isExpanded) {
 						this.expandModal();
 					}
 					// Focus title input
-					setTimeout(() => {
-						const titleInput = this.modalEl.querySelector(".title-input-detailed") as HTMLInputElement;
+					window.setTimeout(() => {
+						const titleInput = this.modalEl.querySelector(
+							".title-input-detailed"
+						) as HTMLInputElement;
 						if (titleInput) {
 							titleInput.focus();
 						}
@@ -763,142 +213,98 @@ export class TaskCreationModal extends TaskModal {
 					return true; // Prevent default tab behavior
 				},
 				onEnter: (editor, mod, shift) => {
-					if (shift) {
-						// Shift+Enter - allow newline
-						return false;
-					}
 					if (mod) {
 						// Ctrl/Cmd+Enter - save (already handled by onSubmit)
 						return true;
 					}
-					// Normal Enter - allow new line
-					return false;
-				},
-			});
-
-			// Focus the editor after a short delay and reset scroll position
-			setTimeout(() => {
-				if (this.nlMarkdownEditor) {
-					const cm = this.nlMarkdownEditor.editor?.cm;
-					if (cm) {
-						cm.focus();
-						// Reset scroll to top to prevent auto-scroll down
-						cm.scrollDOM.scrollTop = 0;
+					if (shift) {
+						// Shift+Enter - allow newline
+						return false;
 					}
-				}
-			}, 100);
-		} catch (error) {
-			console.error("Failed to create NLP markdown editor:", error);
-			// Fallback to textarea if editor creation fails
-			this.nlInput = editorContainer.createEl("textarea", {
-				cls: "nl-input",
-				attr: {
-					placeholder: this.t("modals.taskCreation.nlPlaceholder"),
-					rows: "3",
+					if (!this.plugin.settings.nlpEnterToSubmit) {
+						// Normal Enter - allow new line
+						return false;
+					}
+					if (editor.hasSelectableCompletion) {
+						// Enter belongs to the visible suggestion. If it opened too recently
+						// to accept, swallow the key so it neither saves nor adds a newline.
+						editor.acceptCompletion();
+						return true;
+					}
+					// Enter saves when enabled; Shift+Enter (above) still inserts a newline
+					void this.handleSubmitShortcut(false);
+					return true;
 				},
 			});
-
-			// Event listeners for fallback - track them for cleanup
-			const inputHandler = () => {
-				const input = this.nlInput.value.trim();
-				if (input) {
-					this.updateNaturalLanguagePreview(input);
-				} else {
-					this.clearNaturalLanguagePreview();
-				}
-			};
-			this.addTrackedEventListener(this.nlInput, "input", inputHandler);
-
-			const keydownHandler = (e: Event) => {
-				const input = this.nlInput.value.trim();
-				if (!input) return;
-
-				const keyEvent = e as KeyboardEvent;
-				if (keyEvent.key === "Enter" && (keyEvent.ctrlKey || keyEvent.metaKey)) {
-					keyEvent.preventDefault();
-					this.handleSave();
-				} else if (keyEvent.key === "Tab" && keyEvent.shiftKey) {
-					keyEvent.preventDefault();
-					this.parseAndFillForm(input);
-				}
-			};
-			this.addTrackedEventListener(this.nlInput, "keydown", keydownHandler);
-
-			// Initialize auto-suggestion for fallback
-			this.nlpSuggest = new NLPSuggest(this.app, this.nlInput, this.plugin);
-
-			setTimeout(() => {
-				this.nlInput.focus();
-			}, 100);
-		}
-	}
-
-	private updateNaturalLanguagePreview(input: string): void {
-		if (!this.nlPreviewContainer) return;
-
-		const parsed = this.nlParser.parseInput(input);
-		const previewData = this.nlParser.getPreviewData(parsed);
-
-		if (previewData.length > 0 && parsed.title) {
-			this.nlPreviewContainer.empty();
-			this.nlPreviewContainer.style.display = "block";
-
-			previewData.forEach((item) => {
-				const previewItem = this.nlPreviewContainer.createDiv("nl-preview-item");
-				previewItem.textContent = item.text;
+			this.nlContainer = nlContainer;
+		} catch (error) {
+			tasknotesLogger.error("Failed to create NLP markdown editor:", {
+				category: "persistence",
+				operation: "create-nlp-markdown-editor",
+				error: error,
 			});
-		} else {
-			this.clearNaturalLanguagePreview();
+			nlContainer.remove();
+			this.nlEditorFailed = true;
 		}
 	}
 
-	private clearNaturalLanguagePreview(): void {
-		if (this.nlPreviewContainer) {
-			this.nlPreviewContainer.empty();
-			this.nlPreviewContainer.style.display = "none";
+	private focusPreviousNaturalLanguageField(editorContainer: HTMLElement): boolean {
+		const root = this.modalEl.contains(editorContainer) ? this.modalEl : this.contentEl;
+		const orderedElements = Array.from(
+			root.querySelectorAll<HTMLElement>(NLP_TAB_ORDER_SELECTOR)
+		);
+		const currentIndex = orderedElements.findIndex(
+			(element) => element === editorContainer || editorContainer.contains(element)
+		);
+
+		if (currentIndex <= 0) {
+			return true;
 		}
+
+		const previousElement = orderedElements
+			.slice(0, currentIndex)
+			.reverse()
+			.find(isFocusableModalElement);
+
+		if (previousElement) {
+			window.setTimeout(() => {
+				previousElement.focus();
+			}, 50);
+		}
+
+		return true;
 	}
 
-	/**
-	 * Get the current NLP input value from either markdown editor or fallback textarea
-	 */
+	protected focusTitleInput(): void {
+		if (!this.usesNaturalLanguage()) {
+			super.focusTitleInput();
+			return;
+		}
+
+		this.scheduleInitialFocus(() => {
+			const cm = this.nlMarkdownEditor?.editor?.cm;
+			if (cm) {
+				cm.focus();
+				cm.scrollDOM.scrollTop = 0;
+			}
+		});
+	}
+
 	private getNLPInputValue(): string {
-		if (this.nlMarkdownEditor) {
-			return this.nlMarkdownEditor.value;
-		} else if (this.nlInput) {
-			return this.nlInput.value;
-		}
-		return "";
+		return this.nlMarkdownEditor?.value ?? "";
 	}
 
 	protected createActionBar(container: HTMLElement): void {
-		this.actionBar = container.createDiv("action-bar");
+		this.actionBar = container.createDiv("tn-task-modal__action-bar");
+		this.createCoreActionIcons(this.actionBar);
 
-		// NLP-specific icons (only if NLP is enabled)
-		if (this.plugin.settings.enableNaturalLanguageInput) {
-			// Fill form icon
-			this.createActionIcon(
-				this.actionBar,
-				"wand",
-				this.t("modals.taskCreation.actions.fillFromNaturalLanguage"),
-				(icon, event) => {
-					const input = this.getNLPInputValue().trim();
-					if (input) {
-						this.parseAndFillForm(input);
-					}
-				}
-			);
-
-			// Expand/collapse icon
-			this.createActionIcon(
+		if (this.usesNaturalLanguage()) {
+			const toggle = this.createActionIcon(
 				this.actionBar,
 				this.isExpanded ? "chevron-up" : "chevron-down",
-				this.isExpanded
-					? this.t("modals.taskCreation.actions.hideDetailedOptions")
-					: this.t("modals.taskCreation.actions.showDetailedOptions"),
-				(icon, event) => {
+				this.getDetailedFormToggleLabel(),
+				(icon) => {
 					this.toggleDetailedForm();
-					// Update icon and tooltip
 					const iconEl = icon.querySelector(".icon");
 					if (iconEl) {
 						setIcon(
@@ -906,513 +312,380 @@ export class TaskCreationModal extends TaskModal {
 							this.isExpanded ? "chevron-up" : "chevron-down"
 						);
 					}
-					setTooltip(
-						icon,
-						this.isExpanded
-							? this.t("modals.taskCreation.actions.hideDetailedOptions")
-							: this.t("modals.taskCreation.actions.showDetailedOptions"),
-						{ placement: "top" }
-					);
+					setTooltip(icon, this.getDetailedFormToggleLabel(), { placement: "top" });
 				}
 			);
-
-			// Add separator
-			const separator = this.actionBar.createDiv("action-separator");
-			separator.style.width = "1px";
-			separator.style.height = "24px";
-			separator.style.backgroundColor = "var(--background-modifier-border)";
-			separator.style.margin = "0 var(--size-4-2)";
+			toggle.addClass("tn-task-modal__details-toggle");
 		}
 
-		// Due date icon
-		this.createActionIcon(
-			this.actionBar,
-			"calendar",
-			this.t("modals.task.actions.due"),
-			(icon, event) => {
-				this.showDateContextMenu(event, "due");
-			},
-			"due-date"
-		);
-
-		// Scheduled date icon
-		this.createActionIcon(
-			this.actionBar,
-			"calendar-clock",
-			this.t("modals.task.actions.scheduled"),
-			(icon, event) => {
-				this.showDateContextMenu(event, "scheduled");
-			},
-			"scheduled-date"
-		);
-
-		// Status icon
-		this.createActionIcon(
-			this.actionBar,
-			"dot-square",
-			this.t("modals.task.actions.status"),
-			(icon, event) => {
-				this.showStatusContextMenu(event);
-			},
-			"status"
-		);
-
-		// Priority icon
-		this.createActionIcon(
-			this.actionBar,
-			"star",
-			this.t("modals.task.actions.priority"),
-			(icon, event) => {
-				this.showPriorityContextMenu(event);
-			},
-			"priority"
-		);
-
-		// Recurrence icon
-		this.createActionIcon(
-			this.actionBar,
-			"refresh-ccw",
-			this.t("modals.task.actions.recurrence"),
-			(icon, event) => {
-				this.showRecurrenceContextMenu(event);
-			},
-			"recurrence"
-		);
-
-		// Reminder icon
-		this.createActionIcon(
-			this.actionBar,
-			"bell",
-			this.t("modals.task.actions.reminders"),
-			(icon, event) => {
-				this.showReminderContextMenu(event);
-			},
-			"reminders"
-		);
-
-		// Update icon states based on current values
 		this.updateIconStates();
 	}
 
-	private parseAndFillForm(input: string): void {
-		const parsed = this.nlParser.parseInput(input);
-		this.applyParsedData(parsed);
-
-		// Expand the form to show filled fields
-		if (!this.isExpanded) {
-			this.expandModal();
-		}
+	private getDetailedFormToggleLabel(): string {
+		return this.isExpanded
+			? this.t(msg({ message: "Hide detailed options", context: "modals.taskCreation.actions.hideDetailedOptions" }))
+			: this.t(msg({ message: "Show detailed options", context: "modals.taskCreation.actions.showDetailedOptions" }));
 	}
 
-	private applyParsedData(parsed: NLParsedTaskData): void {
-		if (parsed.title) this.title = parsed.title;
-		if (parsed.status) this.status = parsed.status;
-		if (parsed.priority) this.priority = parsed.priority;
+	/** Keep the form in step with the text: each change replaces what the last parse set. */
+	private syncNaturalLanguageInput(): void {
+		const input = this.getNLPInputValue().trim();
+		const parsed = input ? this.nlParser.parseInputForModal(input) : null;
+		this.syncNaturalLanguageProjects(parsed?.projects ?? []);
+		this.form.applyNaturalLanguage(parsed ? this.buildNaturalLanguageLayer(parsed) : {});
+	}
 
-		// Handle due date with time
+	private buildNaturalLanguageLayer(parsed: NLParsedTaskData): TaskFormNaturalLanguageLayer {
+		const layer: TaskFormNaturalLanguageLayer = {};
+
+		if (parsed.title) layer.title = parsed.title;
+		if (parsed.status) layer.status = parsed.status;
+		if (parsed.priority) layer.priority = parsed.priority;
 		if (parsed.dueDate) {
-			this.dueDate = parsed.dueTime
+			layer.dueDate = parsed.dueTime
 				? combineDateAndTime(parsed.dueDate, parsed.dueTime)
 				: parsed.dueDate;
 		}
-
-		// Handle scheduled date with time
 		if (parsed.scheduledDate) {
-			this.scheduledDate = parsed.scheduledTime
+			layer.scheduledDate = parsed.scheduledTime
 				? combineDateAndTime(parsed.scheduledDate, parsed.scheduledTime)
 				: parsed.scheduledDate;
 		}
-
-		if (parsed.contexts && parsed.contexts.length > 0)
-			this.contexts = parsed.contexts.join(", ");
-		// Projects will be handled in the form input update section below
-		if (parsed.tags && parsed.tags.length > 0) this.tags = sanitizeTags(parsed.tags.join(", "));
-		if (parsed.details) this.details = parsed.details;
-		if (parsed.recurrence) this.recurrenceRule = parsed.recurrence;
-		if (parsed.estimate !== undefined) {
-			this.timeEstimate = parsed.estimate > 0 ? parsed.estimate : 0;
-			if (this.timeEstimateInput) {
-				this.timeEstimateInput.value =
-					this.timeEstimate > 0 ? this.timeEstimate.toString() : "";
-			}
+		if (parsed.contexts && parsed.contexts.length > 0) {
+			layer.contexts = parsed.contexts.join(", ");
 		}
-
-		// Update form inputs if they exist
-		if (this.titleInput) this.titleInput.value = this.title;
-		if (this.detailsInput) this.detailsInput.value = this.details;
-		if (this.detailsMarkdownEditor) this.detailsMarkdownEditor.setValue(this.details);
-		if (this.contextsInput) this.contextsInput.value = this.contexts;
-		if (this.tagsInput) this.tagsInput.value = this.tags;
-
-		// Handle projects differently - they use file selection, not text input
-		if (parsed.projects && parsed.projects.length > 0) {
-			this.initializeProjectsFromStrings(parsed.projects);
-			this.renderProjectsList();
+		if (parsed.tags && parsed.tags.length > 0) {
+			layer.tags = sanitizeTags(parsed.tags.join(", "));
 		}
+		if (parsed.details) layer.details = parsed.details;
+		if (parsed.recurrence) layer.recurrenceRule = parsed.recurrence;
+		if (parsed.estimate !== undefined) layer.timeEstimate = Math.max(parsed.estimate, 0);
 
-		// Handle user-defined fields
 		if (parsed.userFields) {
-			console.debug("[TaskCreationModal] applyParsedData - parsed.userFields:", parsed.userFields);
-			console.debug("[TaskCreationModal] applyParsedData - available user field definitions:", this.plugin.settings.userFields);
-
+			layer.userFields = {};
 			for (const [fieldId, value] of Object.entries(parsed.userFields)) {
-				// Find the user field definition
 				const userField = this.plugin.settings.userFields?.find((f) => f.id === fieldId);
-				console.debug(`[TaskCreationModal] Looking for field ${fieldId}, found:`, userField);
-
-				if (userField) {
-					// Store in userFields using the frontmatter key
-					if (Array.isArray(value)) {
-						this.userFields[userField.key] = value.join(", ");
-					} else {
-						this.userFields[userField.key] = value;
-					}
-					console.debug(`[TaskCreationModal] Applied user field ${userField.displayName} (key: ${userField.key}): ${value}`);
-					console.debug(`[TaskCreationModal] Current this.userFields:`, this.userFields);
-				} else {
-					console.warn(`[TaskCreationModal] No user field definition found for field ID: ${fieldId}`);
-				}
+				if (userField) layer.userFields[userField.key] = value;
 			}
-		} else {
-			console.debug("[TaskCreationModal] applyParsedData - NO parsed.userFields");
 		}
 
-		// Update icon states
-		this.updateIconStates();
+		return layer;
+	}
+
+	/** Projects are chosen as files rather than held in a text field, so they sync separately. */
+	private syncNaturalLanguageProjects(projects: string[]): void {
+		const projectInput = projects.join("\n");
+		if (projectInput === this.nlProjectInput) return;
+		this.nlProjectInput = projectInput;
+
+		const manualItems = this.selectedProjectItems.filter(
+			(item) => !this.nlProjectItems.includes(item)
+		);
+		this.selectedProjectItems = manualItems;
+		this.addProjectsFromStrings(projects);
+		this.nlProjectItems = this.selectedProjectItems.filter(
+			(item) => !manualItems.includes(item)
+		);
+		this.renderProjectsList();
 	}
 
 	private toggleDetailedForm(): void {
-		if (this.isExpanded) {
-			// Collapse
-			this.isExpanded = false;
-			this.detailsContainer.style.display = "none";
-			this.containerEl.removeClass("expanded");
-		} else {
-			// Expand
+		if (!this.isExpanded) {
 			this.expandModal();
+			return;
 		}
+
+		this.isExpanded = false;
+		setTaskModalDetailsCollapsed(
+			{ detailsContainer: this.detailsContainer, splitRightColumn: this.splitRightColumn },
+			true
+		);
+		this.containerEl.removeClass("expanded");
 	}
 
 	async initializeFormData(): Promise<void> {
-		// Initialize with default values from settings
-		this.priority = this.plugin.settings.defaultTaskPriority;
-		this.status = this.plugin.settings.defaultTaskStatus;
+		const formState = buildTaskCreationFormState({
+			defaultPriority: this.plugin.settings.defaultTaskPriority,
+			defaultStatus: this.plugin.settings.defaultTaskStatus,
+			taskCreationDefaults: this.plugin.settings.taskCreationDefaults,
+			taskTag: this.plugin.settings.taskTag,
+			userFields: this.plugin.settings.userFields,
+			prePopulatedValues: this.options.prePopulatedValues,
+		});
 
-		// Apply task creation defaults
-		const defaults = this.plugin.settings.taskCreationDefaults;
+		this.form.values.title = formState.title;
+		this.form.values.dueDate = formState.dueDate;
+		this.form.values.scheduledDate = formState.scheduledDate;
+		this.form.values.priority = formState.priority;
+		this.form.values.status = formState.status;
+		this.form.values.contexts = formState.contexts;
+		this.form.values.tags = formState.tags;
+		this.form.values.timeEstimate = formState.timeEstimate;
+		this.form.values.recurrenceRule = formState.recurrenceRule;
+		this.form.values.recurrenceAnchor = formState.recurrenceAnchor;
+		this.form.values.reminders = formState.reminders;
+		this.form.values.userFields = formState.userFields;
 
-		// Apply default due date
-		this.dueDate = calculateDefaultDate(defaults.defaultDueDate);
-
-		// Apply default scheduled date based on user settings
-		this.scheduledDate = calculateDefaultDate(defaults.defaultScheduledDate);
-
-		// Apply default contexts, tags, and projects
-		this.contexts = defaults.defaultContexts || "";
-		this.tags = defaults.defaultTags || "";
-
-		// Apply default projects
-		if (defaults.defaultProjects) {
-			const projectStrings = splitListPreservingLinksAndQuotes(defaults.defaultProjects);
-			if (projectStrings.length > 0) {
-				this.initializeProjectsFromStrings(projectStrings);
-			}
+		if (formState.projectStrings.length > 0) {
+			this.initializeProjectsFromStrings(formState.projectStrings);
 		}
 
-		// Apply default time estimate
-		if (defaults.defaultTimeEstimate && defaults.defaultTimeEstimate > 0) {
-			this.timeEstimate = defaults.defaultTimeEstimate;
-		}
+		this.attachmentEntries = createLinkedAttachmentEntries(
+			this.options.prePopulatedValues?.attachments,
+			""
+		);
 
-		// Apply default reminders
-		if (defaults.defaultReminders && defaults.defaultReminders.length > 0) {
-			// Import the conversion function
-			const { convertDefaultRemindersToReminders } = await import("../utils/settingsUtils");
-			this.reminders = convertDefaultRemindersToReminders(defaults.defaultReminders);
-		}
+		this.form.values.details = this.normalizeDetails(this.form.values.details);
+		this.originalDetails = this.form.values.details;
 
-		// Apply default values for user-defined fields
-		if (this.plugin.settings.userFields) {
-			for (const field of this.plugin.settings.userFields) {
-				if (field.defaultValue !== undefined) {
-					// For date fields, convert preset values (today, tomorrow, next-week) to actual dates
-					if (field.type === "date" && typeof field.defaultValue === "string") {
-						const datePreset = field.defaultValue as "none" | "today" | "tomorrow" | "next-week";
-						const calculatedDate = calculateDefaultDate(datePreset);
-						if (calculatedDate) {
-							this.userFields[field.key] = calculatedDate;
-						}
-					} else {
-						this.userFields[field.key] = field.defaultValue;
-					}
-				}
-			}
-		}
-
-		// Apply pre-populated values if provided (overrides defaults)
-		if (this.options.prePopulatedValues) {
-			this.applyPrePopulatedValues(this.options.prePopulatedValues);
-		}
-
-		this.details = this.normalizeDetails(this.details);
-		this.originalDetails = this.details;
+		// A prefilled title has to be visible next to the empty natural language field.
+		this.isExpanded = Boolean(this.form.values.title || this.form.values.details);
 	}
 
-	private applyPrePopulatedValues(values: Partial<TaskInfo>): void {
-		if (values.title !== undefined) this.title = values.title;
-		if (values.due !== undefined) this.dueDate = values.due;
-		if (values.scheduled !== undefined) this.scheduledDate = values.scheduled;
-		if (values.priority !== undefined) this.priority = values.priority;
-		if (values.status !== undefined) this.status = values.status;
-		if (values.contexts !== undefined) {
-			this.contexts = values.contexts.join(", ");
-		}
-		if (values.projects !== undefined) {
-			// Filter out null, undefined, or empty strings before checking if we have valid projects
-			const validProjects = values.projects.filter(
-				(p) => p && typeof p === "string" && p.trim() !== ""
-			);
-			if (validProjects.length > 0) {
-				this.initializeProjectsFromStrings(values.projects);
-			}
-			this.renderProjectsList();
-		}
-		if (values.tags !== undefined) {
-			this.tags = sanitizeTags(
-				values.tags.filter((tag) => tag !== this.plugin.settings.taskTag).join(", ")
-			);
-		}
-		if (values.timeEstimate !== undefined) this.timeEstimate = values.timeEstimate;
-		if (values.recurrence !== undefined && typeof values.recurrence === "string") {
-			this.recurrenceRule = values.recurrence;
-		}
-		if (values.recurrence_anchor !== undefined) {
-			this.recurrenceAnchor = values.recurrence_anchor;
-		}
+	protected hasUnsavedChanges(): boolean {
+		return (
+			this.form.isDirty() ||
+			this.getNLPInputValue().trim().length > 0 ||
+			this.blockingItems.length > 0 ||
+			this.blockedByItems.length > 0 ||
+			this.selectedSubtaskFiles.length > 0 ||
+			hasPendingAttachments(this.attachmentEntries)
+		);
 	}
 
-	async handleSave(): Promise<void> {
-		// If NLP is enabled and there's content in the NL field, parse it first
-		if (this.plugin.settings.enableNaturalLanguageInput) {
-			const nlContent = this.getNLPInputValue().trim();
-			if (nlContent && !this.title.trim()) {
-				// Only auto-parse if no title has been manually entered
-				const parsed = this.nlParser.parseInput(nlContent);
-				this.applyParsedData(parsed);
-			}
+	async handleSave(options: TaskSubmitOptions = {}): Promise<TaskSaveOutcome> {
+		// A title cleared by hand falls back to the natural language text.
+		if (!this.form.values.title.trim()) {
+			this.form.releaseField("title");
+			this.syncNaturalLanguageInput();
 		}
 
 		if (!this.validateForm()) {
-			new Notice(this.t("modals.taskCreation.notices.titleRequired"));
+			return { status: "failed" };
+		}
+
+		let result: Awaited<ReturnType<TaskNotesPlugin["taskService"]["createTask"]>>;
+		try {
+			// Disable defaults since they were already applied to form fields in initializeFormData()
+			result = await this.plugin.taskService.createTask(this.buildTaskData(), {
+				applyDefaults: false,
+			});
+		} catch (error) {
+			tasknotesLogger.error("Failed to create task:", {
+				category: "persistence",
+				operation: "create-task",
+				error: error,
+			});
+			const message = getTaskCreationFailureNoticeMessage(error);
+			new Notice(this.t(msg({ message: "Failed to create task: {message}", context: "modals.taskCreation.notices.failure" }), { message: displayError(message) }));
+			return { status: "failed" };
+		}
+
+		// The task exists from here on: a failed step is reported, never retried by saving again.
+		let createdTask = result.taskInfo;
+		this.showTaskCreatedNotice(createdTask, result.file);
+
+		const reportFollowUpFailure = (error: unknown): void => {
+			tasknotesLogger.error("Failed to finish creating task:", {
+				category: "persistence",
+				operation: "finish-task-creation",
+				error: error,
+			});
+			new Notice(
+				this.t(msg({ message: "Task created, but a follow-up step failed: {message}", context: "modals.taskCreation.notices.followUpFailure" }), {
+					message: displayError(error instanceof Error ? error.message : String(error)),
+				})
+			);
+		};
+
+		const outcome = await runTaskSaveFollowUps([
+			{
+				// Disk files are copied only now that the task exists, next to its note.
+				run: async () => {
+					if (!hasPendingAttachments(this.attachmentEntries)) return;
+					const imported = await this.importPendingAttachments(createdTask.path);
+					try {
+						createdTask = await this.plugin.taskService.updateTask(createdTask, {
+							attachments: imported.references,
+						});
+					} catch (error) {
+						await imported.rollback();
+						throw error;
+					}
+				},
+				onError: (error) => {
+					tasknotesLogger.error("Failed to import task attachments:", {
+						category: "persistence",
+						operation: "import-task-attachments",
+						error: error,
+					});
+					new Notice(
+						this.t(msg({ message: "Task created, but some attachments could not be imported: {message}", context: "modals.taskCreation.notices.attachmentImportFailure" }), {
+							message: displayError(error instanceof Error ? error.message : String(error)),
+						})
+					);
+				},
+			},
+			{
+				run: async () => {
+					createdTask = await this.applyBlockingItems(createdTask);
+				},
+				onError: reportFollowUpFailure,
+			},
+			{
+				run: async () => {
+					if (this.selectedSubtaskFiles.length > 0) {
+						await this.applySubtaskAssignments(createdTask);
+					}
+				},
+				onError: reportFollowUpFailure,
+			},
+			{
+				run: async () => {
+					this.options.onTaskCreated?.(createdTask);
+				},
+				onError: reportFollowUpFailure,
+			},
+		]);
+
+		await this.openCreatedTaskIfConfigured(result.file, options);
+		return outcome;
+	}
+
+	protected afterSubmit(options: TaskSubmitOptions): void {
+		if (options.createAnother) {
+			window.setTimeout(() => {
+				new TaskCreationModal(this.app, this.plugin, this.options).open();
+			}, 0);
+		}
+	}
+
+	private showTaskCreatedNotice(createdTask: TaskInfo, file: TFile): void {
+		const filenameNotice = getTaskFilenameNotice(
+			this.plugin.settings,
+			createdTask.title,
+			file.basename
+		);
+		if (filenameNotice === "shortened") {
+			new Notice(
+				this.t(msg({ message: "Task \"{title}\" created successfully (filename shortened due to length)", context: "modals.taskCreation.notices.successShortened" }), {
+					title: createdTask.title,
+				})
+			);
+		} else if (filenameNotice === "sanitized") {
+			new Notice(
+				this.t(msg({ message: "Task \"{title}\" created as file \"{filename}\". Filenames cannot contain some characters, so the full title is kept in the title property.", context: "modals.taskCreation.notices.successFilenameSanitized" }), {
+					title: createdTask.title,
+					filename: file.basename,
+				})
+			);
+		} else {
+			new Notice(
+				this.t(msg({ message: "Task \"{title}\" created successfully", context: "modals.taskCreation.notices.success" }), { title: createdTask.title })
+			);
+		}
+	}
+
+	private async applyBlockingItems(createdTask: TaskInfo): Promise<TaskInfo> {
+		if (this.blockingItems.length === 0) return createdTask;
+
+		const blockingUpdates = buildCreationBlockingUpdates(this.blockingItems);
+		if (blockingUpdates.unresolved.length > 0) {
+			new Notice(
+				this.t(msg({ message: "Could not resolve: {entries}", context: "modals.taskCreation.notices.blockingUnresolved" }), {
+					entries: blockingUpdates.unresolved.join(", "),
+				})
+			);
+		}
+		if (blockingUpdates.added.length === 0) return createdTask;
+
+		await this.plugin.taskService.updateBlockingRelationships(
+			createdTask,
+			blockingUpdates.added,
+			[],
+			blockingUpdates.raw
+		);
+		return (await this.plugin.cacheManager.getTaskInfo(createdTask.path)) ?? createdTask;
+	}
+
+	private async openCreatedTaskIfConfigured(
+		file: TFile,
+		options: { createAnother?: boolean }
+	): Promise<void> {
+		const mode = this.plugin.settings.openTaskAfterCreation ?? "none";
+		if (!shouldOpenCreatedTaskAfterSave(mode, options, Boolean(this.options.onTaskCreated))) {
 			return;
 		}
 
 		try {
-			const taskData = this.buildTaskData();
-			// Disable defaults since they were already applied to form fields in initializeFormData()
-			const result = await this.plugin.taskService.createTask(taskData, { applyDefaults: false });
-			let createdTask = result.taskInfo;
-
-			// Check if filename was changed due to length constraints
-			const expectedFilename = result.taskInfo.title.replace(/[<>:"/\\|?*]/g, "").trim();
-			const actualFilename = result.file.basename;
-
-			if (actualFilename.startsWith("task-") && actualFilename !== expectedFilename) {
-				new Notice(
-					this.t("modals.taskCreation.notices.successShortened", {
-						title: createdTask.title,
-					})
-				);
-			} else {
-				new Notice(
-					this.t("modals.taskCreation.notices.success", { title: createdTask.title })
-				);
-			}
-
-			if (this.blockingItems.length > 0) {
-				const addedPaths: string[] = [];
-				const rawMap: Record<string, TaskDependency> = {};
-				const unresolved: string[] = [];
-
-				this.blockingItems.forEach((item) => {
-					if (item.path) {
-						if (!addedPaths.includes(item.path)) {
-							addedPaths.push(item.path);
-							rawMap[item.path] = { ...item.dependency };
-						}
-					} else {
-						unresolved.push(item.dependency.uid);
-					}
-				});
-
-				if (addedPaths.length > 0) {
-					await this.plugin.taskService.updateBlockingRelationships(
-						createdTask,
-						addedPaths,
-						[],
-						rawMap
-					);
-					const refreshed = await this.plugin.cacheManager.getTaskInfo(createdTask.path);
-					if (refreshed) {
-						createdTask = refreshed;
-					}
-				}
-
-				if (unresolved.length > 0) {
-					new Notice(
-						this.t("modals.taskCreation.notices.blockingUnresolved", {
-							entries: unresolved.join(", "),
-						})
-					);
-				}
-
-				this.blockingItems = [];
-			}
-
-			// Handle subtask assignments
-			if (this.selectedSubtaskFiles.length > 0) {
-				await this.applySubtaskAssignments(createdTask);
-			}
-
-			if (this.options.onTaskCreated) {
-				this.options.onTaskCreated(createdTask);
-			}
-
-			this.close();
+			await openCreatedTaskFileAfterSave(this.app, file, mode);
 		} catch (error) {
-			console.error("Failed to create task:", error);
-			const message = error instanceof Error && error.message ? error.message : String(error);
-			new Notice(this.t("modals.taskCreation.notices.failure", { message }));
+			tasknotesLogger.error("Failed to open created task note:", {
+				category: "persistence",
+				operation: "open-created-task-note",
+				error: error,
+			});
+			new Notice(this.t(msg({ message: "Task created, but the task note could not be opened.", context: "modals.taskCreation.notices.openCreatedTaskFailure" })));
 		}
 	}
 
 	private buildTaskData(): Partial<TaskInfo> {
-		const now = getCurrentTimestamp();
-
-		// Parse contexts, projects, and tags
-		const contextList = this.contexts
-			.split(",")
-			.map((c) => c.trim())
-			.filter((c) => c.length > 0);
-
-		const projectList = splitListPreservingLinksAndQuotes(this.projects);
-		const tagList = sanitizeTags(this.tags)
-			.split(",")
-			.map((t) => t.trim())
-			.filter((t) => t.length > 0);
-
-		// Add the task tag if using tag-based identification and it's not already present
-		if (
-			this.plugin.settings.taskIdentificationMethod === 'tag' &&
-			this.plugin.settings.taskTag &&
-			!tagList.includes(this.plugin.settings.taskTag)
-		) {
-			tagList.push(this.plugin.settings.taskTag);
+		const taskData = buildTaskCreationData({
+			title: this.form.values.title,
+			dueDate: this.form.values.dueDate,
+			scheduledDate: this.form.values.scheduledDate,
+			priority: this.form.values.priority,
+			status: this.form.values.status,
+			contexts: this.form.values.contexts,
+			projects: this.form.values.projects,
+			tags: this.form.values.tags,
+			timeEstimate: this.form.values.timeEstimate,
+			recurrenceRule: this.form.values.recurrenceRule,
+			recurrenceAnchor: this.form.values.recurrenceAnchor,
+			reminders: this.form.values.reminders,
+			blockedByItems: this.blockedByItems,
+			details: this.form.values.details,
+			userFields: this.form.values.userFields,
+			creationContext: this.options.creationContext,
+			taskIdentificationMethod: this.plugin.settings.taskIdentificationMethod,
+			taskTag: this.plugin.settings.taskTag,
+			normalizeDetails: (value) => this.normalizeDetails(value),
+		});
+		const attachments = getLinkedAttachmentReferences(this.attachmentEntries);
+		if (attachments.length > 0) {
+			taskData.attachments = attachments;
 		}
-
-		const taskData: TaskCreationData = {
-			title: this.title.trim(),
-			due: this.dueDate || undefined,
-			scheduled: this.scheduledDate || undefined,
-			priority: this.priority,
-			status: this.status,
-			contexts: contextList.length > 0 ? contextList : undefined,
-			projects: projectList.length > 0 ? projectList : undefined,
-			tags: tagList.length > 0 ? tagList : undefined,
-			timeEstimate: this.timeEstimate > 0 ? this.timeEstimate : undefined,
-			recurrence: this.recurrenceRule || undefined,
-			recurrence_anchor: this.recurrenceRule ? this.recurrenceAnchor : undefined,
-			reminders: this.reminders.length > 0 ? this.reminders : undefined,
-			// Use provided creationContext or default to manual-creation for folder logic
-			// "manual-creation" = Create New Task command -> uses default tasksFolder
-			// "modal-inline-creation" = Create New Inline Task command -> uses inlineTaskConvertFolder
-			creationContext: this.options.creationContext || "manual-creation",
-			dateCreated: now,
-			dateModified: now,
-			// Add user fields as custom frontmatter properties
-			customFrontmatter: this.buildCustomFrontmatter(),
-		};
-
-		const blockedDependencies = this.blockedByItems.map((item) => ({
-			...item.dependency,
-		}));
-		if (blockedDependencies.length > 0) {
-			taskData.blockedBy = blockedDependencies;
-		}
-
-		// Add details if provided
-		const normalizedDetails = this.normalizeDetails(this.details).trimEnd();
-		if (normalizedDetails.length > 0) {
-			taskData.details = normalizedDetails;
+		const prePopulatedCustomFrontmatter = this.options.prePopulatedValues?.customFrontmatter;
+		if (prePopulatedCustomFrontmatter) {
+			taskData.customFrontmatter = {
+				...prePopulatedCustomFrontmatter,
+				...taskData.customFrontmatter,
+			};
 		}
 
 		return taskData;
-	}
-
-	private buildCustomFrontmatter(): Record<string, any> {
-		const customFrontmatter: Record<string, any> = {};
-
-		console.debug("[TaskCreationModal] Building custom frontmatter from userFields:", this.userFields);
-
-		// Add user field values to frontmatter
-		for (const [fieldKey, fieldValue] of Object.entries(this.userFields)) {
-			if (fieldValue !== null && fieldValue !== undefined && fieldValue !== "") {
-				customFrontmatter[fieldKey] = fieldValue;
-				console.debug(`[TaskCreationModal] Adding to frontmatter: ${fieldKey} = ${fieldValue}`);
-			}
-		}
-
-		console.debug("[TaskCreationModal] Final custom frontmatter:", customFrontmatter);
-		return customFrontmatter;
-	}
-
-	private generateFilename(taskData: TaskCreationData): string {
-		const context: FilenameContext = {
-			title: taskData.title || "",
-			status: taskData.status || "open",
-			priority: taskData.priority || "normal",
-			dueDate: taskData.due,
-			scheduledDate: taskData.scheduled,
-		};
-
-		return generateTaskFilename(context, this.plugin.settings);
-	}
-
-	// Override to prevent creating duplicate title input when NLP is enabled
-	protected createTitleInput(container: HTMLElement): void {
-		// Only create title input if NLP is disabled
-		if (!this.plugin.settings.enableNaturalLanguageInput) {
-			super.createTitleInput(container);
-		}
 	}
 
 	protected async applySubtaskAssignments(createdTask: TaskInfo): Promise<void> {
 		const currentTaskFile = this.app.vault.getAbstractFileByPath(createdTask.path);
 		if (!(currentTaskFile instanceof TFile)) return;
 
-		for (const subtaskFile of this.selectedSubtaskFiles) {
-			try {
-				const subtaskInfo = await this.plugin.cacheManager.getTaskInfo(subtaskFile.path);
-				if (!subtaskInfo) continue;
-
-				const projectReference = this.buildProjectReference(currentTaskFile, subtaskFile.path);
-				const legacyReference = `[[${currentTaskFile.basename}]]`;
-				const currentProjects = Array.isArray(subtaskInfo.projects) ? subtaskInfo.projects : [];
-
-				if (
-					currentProjects.includes(projectReference) ||
-					currentProjects.includes(legacyReference)
-				) {
-					continue;
-				}
-
-				const sanitizedProjects = currentProjects.filter((entry) => entry !== legacyReference);
-				const updatedProjects = [...sanitizedProjects, projectReference];
-				await this.plugin.updateTaskProperty(subtaskInfo, "projects", updatedProjects);
-			} catch (error) {
-				console.error("Failed to assign subtask:", error);
-			}
-		}
+		await applyTaskCreationSubtaskAssignments({
+			currentTaskFile,
+			subtaskFiles: this.selectedSubtaskFiles,
+			getTaskInfo: (path) => this.plugin.cacheManager.getTaskInfo(path),
+			buildProjectReference: (targetFile, sourcePath) =>
+				this.buildProjectReference(targetFile, sourcePath),
+			updateTaskProjects: (subtaskInfo, projects) =>
+				this.plugin.updateTaskProperty(subtaskInfo, "projects", projects),
+			onError: (error) => {
+				tasknotesLogger.error("Failed to assign subtask:", {
+					category: "persistence",
+					operation: "assign-subtask",
+					error: error,
+				});
+			},
+		});
 	}
 
 	onClose(): void {
@@ -1421,17 +694,6 @@ export class TaskCreationModal extends TaskModal {
 			this.nlMarkdownEditor.destroy();
 			this.nlMarkdownEditor = null;
 		}
-
-		// Clean up NLP suggest
-		if (this.nlpSuggest) {
-			// NLPSuggest extends AbstractInputSuggest which has a close method
-			this.nlpSuggest.close();
-			this.nlpSuggest = null;
-		}
-
-		// Remove all tracked event listeners
-		this.removeAllEventListeners();
-
 		super.onClose();
 	}
 }

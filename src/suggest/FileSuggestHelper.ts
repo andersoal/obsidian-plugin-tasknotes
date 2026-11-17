@@ -1,13 +1,18 @@
+import { uiText } from "../i18n/runtime";
+import { msg } from "@lingui/core/macro";
 import type TaskNotesPlugin from "../main";
-import { parseFrontMatterAliases } from "obsidian";
+import { parseFrontMatterAliases, type TFile } from "obsidian";
 import { scoreMultiword } from "../utils/fuzzyMatch";
 import { parseDisplayFieldsRow } from "../utils/projectAutosuggestDisplayFieldsParser";
 import { getProjectPropertyFilter, matchesProjectProperty } from "../utils/projectFilterUtils";
 import { FilterUtils } from "../utils/FilterUtils";
+import { isPathInExcludedFolder, parseExcludedFolders } from "../utils/pathExclusions";
+import { collectCacheTags } from "../utils/tagExtraction";
 
 export interface FileSuggestionItem {
-	insertText: string; // usually basename
+	insertText: string; // link text to insert inside [[...]]
 	displayText: string; // "basename [title: ... | aliases: ...]"
+	path: string;
 	score: number;
 }
 
@@ -23,18 +28,101 @@ export interface FileFilterConfig {
 	propertyValue?: string;
 }
 
+function getSuggestableFiles(plugin: TaskNotesPlugin): TFile[] {
+	const vault = plugin?.app?.vault;
+	if (typeof vault?.getFiles === "function") {
+		return vault.getFiles();
+	}
+	if (typeof vault?.getMarkdownFiles === "function") {
+		return vault.getMarkdownFiles();
+	}
+	return [];
+}
+
+function getFileInsertText(plugin: TaskNotesPlugin, file: TFile): string {
+	if (file.extension === "md") {
+		const linktext = plugin.app.metadataCache.fileToLinktext?.(file, "", true);
+		if (typeof linktext === "string" && linktext.trim()) {
+			return linktext;
+		}
+		return file.basename;
+	}
+	return file.name || file.path.split("/").pop() || file.basename;
+}
+
+function normalizeFolderPath(folder: string): string {
+	return folder.trim().replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+$/, "");
+}
+
+function resolveRelativeFolderPath(folder: string, activeFolder = ""): string {
+	const segments = normalizeFolderPath(activeFolder).split("/").filter(Boolean);
+	for (const part of folder.replace(/\\/g, "/").split("/")) {
+		if (!part || part === ".") continue;
+		if (part === "..") {
+			segments.pop();
+		} else {
+			segments.push(part);
+		}
+	}
+	return segments.join("/");
+}
+
+function resolveIncludeFolder(folder: string, activeFolder?: string): string {
+	const normalized = normalizeFolderPath(folder);
+	if (
+		normalized === "." ||
+		normalized === ".." ||
+		normalized.startsWith("./") ||
+		normalized.startsWith("../")
+	) {
+		return resolveRelativeFolderPath(normalized, activeFolder);
+	}
+	return normalized;
+}
+
+export function getActiveFolderPath(plugin: TaskNotesPlugin): string | undefined {
+	const activeFile = plugin?.app?.workspace?.getActiveFile?.();
+	if (activeFile?.parent?.path !== undefined) {
+		return activeFile.parent.path;
+	}
+	if (typeof activeFile?.path === "string") {
+		return activeFile.path.split("/").slice(0, -1).join("/");
+	}
+	return undefined;
+}
+
+export function resolveIncludeFolders(
+	includeFolders: readonly string[],
+	activeFolder?: string
+): string[] {
+	return includeFolders
+		.filter((folder) => folder.trim().length > 0)
+		.map((folder) => resolveIncludeFolder(folder, activeFolder));
+}
+
+export function isPathInIncludedFolders(
+	path: string,
+	includeFolders: readonly string[],
+	activeFolder?: string
+): boolean {
+	const resolvedFolders = resolveIncludeFolders(includeFolders, activeFolder);
+	return resolvedFolders.some(
+		(folder) => folder === "" || path === folder || path.startsWith(`${folder}/`)
+	);
+}
+
 export const FileSuggestHelper = {
 	async suggest(
 		plugin: TaskNotesPlugin,
 		query: string,
 		limit = 20,
-		filterConfig?: FileFilterConfig
+		filterConfig?: FileFilterConfig,
+		activeFolder = getActiveFolderPath(plugin)
 	): Promise<FileSuggestionItem[]> {
 		const run = async () => {
-			const files = plugin?.app?.vault?.getMarkdownFiles
-				? plugin.app.vault.getMarkdownFiles()
-				: [];
+			const files = getSuggestableFiles(plugin);
 			const items: FileSuggestionItem[] = [];
+			const excludedFolders = parseExcludedFolders(plugin.settings?.excludedFolders);
 
 			// Collect additional searchable properties from settings rows (|s flag)
 			const rows: string[] = (plugin.settings?.projectAutosuggest?.rows ?? []).slice(0, 3);
@@ -43,7 +131,7 @@ export const FileSuggestHelper = {
 				try {
 					const tokens = parseDisplayFieldsRow(row);
 					for (const t of tokens) {
-						if ((t as any).searchable && !t.property.startsWith("literal:")) {
+						if (t.searchable && !t.property.startsWith("literal:")) {
 							extraProps.add(t.property);
 						}
 					}
@@ -59,22 +147,19 @@ export const FileSuggestHelper = {
 			const propertyFilter = getProjectPropertyFilter(filterConfig);
 
 			for (const file of files) {
+				if (isPathInExcludedFolder(file.path, excludedFolders)) {
+					continue;
+				}
+
 				const cache = plugin.app.metadataCache.getFileCache(file);
 
 				// Apply tag filtering if configured
 				if (requiredTags.length > 0) {
-					// Get tags from both native tag detection and frontmatter
-					const nativeTags = cache?.tags?.map((t) => t.tag.replace("#", "")) || [];
-					const frontmatterTags = cache?.frontmatter?.tags || [];
-					const allTags = [
-						...nativeTags,
-						...(Array.isArray(frontmatterTags)
-							? frontmatterTags
-							: [frontmatterTags].filter(Boolean)),
-					];
-
 					// Check if file has ANY of the required tags using hierarchical matching with proper exclusion handling
-					const hasRequiredTag = FilterUtils.matchesTagConditions(allTags, requiredTags);
+					const hasRequiredTag = FilterUtils.matchesTagConditions(
+						collectCacheTags(cache),
+						requiredTags
+					);
 					if (!hasRequiredTag) {
 						continue; // Skip this file
 					}
@@ -82,11 +167,7 @@ export const FileSuggestHelper = {
 
 				// Apply folder filtering if configured
 				if (includeFolders.length > 0) {
-					const isInIncludedFolder = includeFolders.some(
-						(folder) =>
-							file.path.startsWith(folder) || file.path.startsWith(folder + "/")
-					);
-					if (!isInIncludedFolder) {
+					if (!isPathInIncludedFolders(file.path, includeFolders, activeFolder)) {
 						continue; // Skip this file
 					}
 				}
@@ -116,12 +197,24 @@ export const FileSuggestHelper = {
 
 				// Compute score: keep best among fields to rank the file
 				let bestScore = 0;
-				bestScore = Math.max(bestScore, scoreMultiword(query, basename) + 15); // basename weight
-				if (title) bestScore = Math.max(bestScore, scoreMultiword(query, title) + 5);
+				const hasQuery = qLower.length > 0;
+				const basenameScore = hasQuery ? scoreMultiword(query, basename) : 1;
+				if (basenameScore > 0) {
+					bestScore = Math.max(bestScore, basenameScore + 15); // basename weight
+				}
+				if (title) {
+					const titleScore = scoreMultiword(query, title);
+					if (titleScore > 0) {
+						bestScore = Math.max(bestScore, titleScore + 5);
+					}
+				}
 				if (Array.isArray(aliases)) {
 					for (const a of aliases) {
 						if (typeof a === "string") {
-							bestScore = Math.max(bestScore, scoreMultiword(query, a));
+							const aliasScore = scoreMultiword(query, a);
+							if (aliasScore > 0) {
+								bestScore = Math.max(bestScore, aliasScore);
+							}
 						}
 					}
 				}
@@ -134,7 +227,7 @@ export const FileSuggestHelper = {
 						if (prop === "file.path") {
 							val = file.path;
 						} else if (prop === "file.parent") {
-							val = (file.parent?.path || "") as string;
+							val = file.parent?.path || "";
 						} else if (prop === "file.basename") {
 							val = basename; // already default, but harmless
 						} else if (prop === "title") {
@@ -145,7 +238,7 @@ export const FileSuggestHelper = {
 								: [];
 							val = aList.join(" ");
 						} else {
-							const raw = (fm as any)[prop];
+							const raw = (fm as Record<string, unknown>)[prop];
 							if (raw != null) {
 								if (Array.isArray(raw))
 									val = raw.filter((x) => typeof x === "string").join(" ");
@@ -169,22 +262,27 @@ export const FileSuggestHelper = {
 				if (bestScore > 0) {
 					// Build display
 					const extras: string[] = [];
-					if (title && title !== basename) extras.push(`title: ${title}`);
+					if (title && title !== basename) extras.push(uiText(msg({ message: "title: {title}", context: "suggest/FileSuggestHelper: suggest.run display" }), { title: title }));
 					const aliasList = Array.isArray(aliases)
 						? aliases.filter((a) => typeof a === "string")
 						: [];
-					if (aliasList.length) extras.push(`aliases: ${aliasList.join(", ")}`);
+					if (aliasList.length) extras.push(uiText(msg({ message: "aliases: {value1}", context: "suggest/FileSuggestHelper: suggest.run display" }), { value1: aliasList.join(", ") }));
 					const display = extras.length
 						? `${basename} [${extras.join(" | ")}]`
 						: basename;
 
-					items.push({ insertText: basename, displayText: display, score: bestScore });
+					items.push({
+						insertText: getFileInsertText(plugin, file),
+						displayText: display,
+						path: file.path,
+						score: bestScore,
+					});
 				}
 			}
 
 			// Sort and cap
 			items.sort((a, b) => b.score - a.score);
-			// Deduplicate by insertText (basename)
+			// Deduplicate by resolved link text so ambiguous basenames remain selectable.
 			const out: FileSuggestionItem[] = [];
 			const seen = new Set<string>();
 			for (const it of items) {
@@ -204,12 +302,14 @@ export const FileSuggestHelper = {
 		return new Promise<FileSuggestionItem[]>((resolve) => {
 			const anyPlugin = plugin as unknown as { __fileSuggestTimer?: number };
 			if (anyPlugin.__fileSuggestTimer) {
-				clearTimeout(anyPlugin.__fileSuggestTimer);
+				window.clearTimeout(anyPlugin.__fileSuggestTimer);
 			}
-			anyPlugin.__fileSuggestTimer = setTimeout(async () => {
-				const results = await run();
-				resolve(results);
-			}, debounceMs) as unknown as number;
+			anyPlugin.__fileSuggestTimer = window.setTimeout(() => {
+				void (async () => {
+					const results = await run();
+					resolve(results);
+				})();
+			}, debounceMs);
 		});
 	},
 };

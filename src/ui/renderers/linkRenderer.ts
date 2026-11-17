@@ -1,8 +1,19 @@
-/* eslint-disable @typescript-eslint/no-non-null-assertion */
+import { uiData } from "../../i18n/dataText";
+import type { MessageDescriptor } from "@lingui/core";
+import { msg } from "@lingui/core/macro";
+/* eslint-disable @typescript-eslint/no-non-null-assertion -- Renderer utilities check created elements before attaching interactions. */
 // Link and tag rendering utilities for UI components
 
 import { App, TFile, Notice } from "obsidian";
-import { parseLinkToPath } from "../../utils/linkUtils";
+import {
+	parseLinkTarget,
+	parseLinkToPath,
+	parseMarkdownLinkTarget,
+	parseWikilinkTarget,
+} from "../../utils/linkUtils";
+import { createTaskNotesLogger } from "../../utils/tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Ui/Renderers/LinkRenderer" });
 
 export type LinkNavigateHandler = (
 	normalizedPath: string,
@@ -11,6 +22,7 @@ export type LinkNavigateHandler = (
 
 /** Minimal services required to render internal links (DI-friendly) */
 export interface LinkServices {
+	translate: (key: MessageDescriptor, params?: Record<string, string | number>) => string;
 	metadataCache: App["metadataCache"];
 	workspace: App["workspace"];
 	/**
@@ -30,9 +42,22 @@ interface HoverLinkEvent {
 	sourcePath: string;
 }
 
-// Enhanced regex to handle more link types including autolinks and reference-style links
+// Enhanced regex to handle more link types including autolinks, bare URLs, and reference-style links
 const LINK_REGEX =
-	/\[\[([^[\]]+)\]\]|\[([^\]]+)\]\(([^)]+)\)|<(https?:\/\/[^\s>]+)>|\[([^\]]+)\]\s*\[([^\]]*)\]/g;
+	/\[\[([^[\]]+)\]\]|\[([^\]]+)\]\(([^)]+)\)|<(https?:\/\/[^\s>]+)>|(https?:\/\/[^\s<>()]+[^\s<>().,;:!?])|\[([^\]]+)\]\s*\[([^\]]*)\]/g;
+const EXTERNAL_URI_SCHEME_REGEX = /^[a-z][a-z0-9+.-]*:/i;
+
+function appendExternalLink(container: HTMLElement, href: string, displayText: string): void {
+	const a = container.createEl("a", {
+		text: displayText,
+		attr: { href, target: "_blank", rel: "noopener" },
+	});
+	a.classList.add("external-link");
+}
+
+function isExternalHref(href: string): boolean {
+	return EXTERNAL_URI_SCHEME_REGEX.test(href);
+}
 
 /** Enhanced internal link creation with better error handling and accessibility */
 export function appendInternalLink(
@@ -45,6 +70,8 @@ export function appendInternalLink(
 		hoverSource?: string;
 		showErrorNotices?: boolean;
 		onPrimaryNavigate?: LinkNavigateHandler;
+		/** Heading or block subpath to navigate to (e.g. "#Heading", "#^block"). */
+		subpath?: string;
 	} = {}
 ): void {
 	const {
@@ -55,7 +82,30 @@ export function appendInternalLink(
 	} = options;
 
 	const sourcePath = deps.sourcePath ?? "";
-	const normalizedPath = parseLinkToPath(filePath);
+	const parsedTarget = parseLinkTarget(filePath);
+	const subpath = options.subpath ?? parsedTarget.subpath;
+	// A link with only a subpath ("#^block") points into the source note itself.
+	const normalizedPath = parsedTarget.subpath ? parsedTarget.path : parseLinkToPath(filePath);
+	const linkText = `${normalizedPath}${subpath}`;
+
+	const resolveLinkedFile = () => {
+		if (!normalizedPath) {
+			return sourcePath ? deps.metadataCache.getFirstLinkpathDest(sourcePath, "") : null;
+		}
+		return (
+			deps.metadataCache.getFirstLinkpathDest(normalizedPath, sourcePath) ||
+			deps.metadataCache.getFirstLinkpathDest(normalizedPath, "")
+		);
+	};
+
+	const openLinkedFile = async (file: TFile, newLeaf: boolean): Promise<void> => {
+		const leaf = deps.workspace.getLeaf(newLeaf);
+		if (subpath) {
+			await leaf.openFile(file, { eState: { subpath } });
+		} else {
+			await leaf.openFile(file);
+		}
+	};
 
 	const linkEl = container.createEl("a", {
 		cls: cssClass,
@@ -67,54 +117,68 @@ export function appendInternalLink(
 		},
 	});
 
-	linkEl.addEventListener("click", async (e) => {
+	linkEl.addEventListener("click", (e) => {
 		e.preventDefault();
 		e.stopPropagation();
-		try {
-			if (e.ctrlKey || e.metaKey) {
-				// Ctrl/Cmd+Click opens in new tab
-				deps.workspace.openLinkText(normalizedPath, sourcePath, true);
-				return;
-			}
-
-			if (onPrimaryNavigate) {
-				const handled = await onPrimaryNavigate(normalizedPath, e);
-				if (handled !== false) {
+		void (async () => {
+			try {
+				if (e.ctrlKey || e.metaKey) {
+					// Ctrl/Cmd+Click opens in new tab
+					void deps.workspace.openLinkText(linkText, sourcePath, true);
 					return;
 				}
-			}
 
-			const file =
-				deps.metadataCache.getFirstLinkpathDest(normalizedPath, sourcePath) ||
-				deps.metadataCache.getFirstLinkpathDest(normalizedPath, "");
-			if (file instanceof TFile) {
-				await deps.workspace.getLeaf(false).openFile(file);
-			} else if (showErrorNotices) {
-				new Notice(`Note "${displayText}" not found`);
+				if (onPrimaryNavigate) {
+					const handled = await onPrimaryNavigate(normalizedPath, e);
+					if (handled !== false) {
+						return;
+					}
+				}
+
+				const file = resolveLinkedFile();
+				if (file instanceof TFile) {
+					await openLinkedFile(file, false);
+				} else if (showErrorNotices) {
+					new Notice(
+						deps.translate(msg({ message: "Note “{title}” not found", context: "notices.interface.noteMissing" }), { title: displayText })
+					);
+				}
+			} catch (error) {
+				tasknotesLogger.error("[TaskNotes] Error opening internal link:", {
+					category: "internal",
+					operation: "opening-internal-link",
+					details: { filePath },
+					error: error,
+				});
+				if (showErrorNotices) {
+					new Notice(
+						deps.translate(msg({ message: "Failed to open note “{title}”", context: "notices.interface.noteOpenFailed" }), { title: displayText })
+					);
+				}
 			}
-		} catch (error) {
-			console.error("[TaskNotes] Error opening internal link:", { filePath, error });
-			if (showErrorNotices) {
-				new Notice(`Failed to open note "${displayText}"`);
-			}
-		}
+		})();
 	});
 
 	// Middle-click opens in new tab
-	linkEl.addEventListener("auxclick", async (e) => {
+	linkEl.addEventListener("auxclick", (e) => {
 		if (e.button === 1) {
 			e.preventDefault();
 			e.stopPropagation();
-			try {
-				const file =
-					deps.metadataCache.getFirstLinkpathDest(normalizedPath, sourcePath) ||
-					deps.metadataCache.getFirstLinkpathDest(normalizedPath, "");
-				if (file instanceof TFile) {
-					deps.workspace.openLinkText(normalizedPath, sourcePath, true);
+			void (async () => {
+				try {
+					const file = resolveLinkedFile();
+					if (file instanceof TFile) {
+						await openLinkedFile(file, true);
+					}
+				} catch (error) {
+					tasknotesLogger.error("[TaskNotes] Error opening internal link:", {
+						category: "internal",
+						operation: "opening-internal-link",
+						details: { filePath },
+						error: error,
+					});
 				}
-			} catch (error) {
-				console.error("[TaskNotes] Error opening internal link:", { filePath, error });
-			}
+			})();
 		}
 	});
 
@@ -126,16 +190,14 @@ export function appendInternalLink(
 	});
 
 	linkEl.addEventListener("mouseover", (event) => {
-		const file =
-			deps.metadataCache.getFirstLinkpathDest(normalizedPath, sourcePath) ||
-			deps.metadataCache.getFirstLinkpathDest(normalizedPath, "");
+		const file = resolveLinkedFile();
 		if (file instanceof TFile) {
 			const hoverEvent: HoverLinkEvent = {
-				event: event as MouseEvent,
+				event: event,
 				source: hoverSource,
 				hoverParent: container,
 				targetEl: linkEl,
-				linktext: normalizedPath,
+				linktext: linkText,
 				sourcePath: sourcePath || file.path,
 			};
 			deps.workspace.trigger("hover-link", hoverEvent);
@@ -146,7 +208,7 @@ export function appendInternalLink(
 /** Render a text string, converting WikiLinks and Markdown links */
 export interface RenderLinksOptions {
 	renderPlain?: (container: HTMLElement, text: string, deps: LinkServices) => void;
-	onTagClick?: (tag: string, event: MouseEvent) => void | Promise<void>;
+	onTagClick?: (tag: string, event: MouseEvent | KeyboardEvent) => void | Promise<void>;
 }
 
 export function renderTextWithLinks(
@@ -160,35 +222,39 @@ export function renderTextWithLinks(
 
 	// First, handle wikilinks and markdown links
 	while ((match = LINK_REGEX.exec(text)) !== null) {
-		const [full, wikiInner, mdText, mdHref] = match as any;
+		const [full, wikiInner, mdText, mdHref, autolinkHref, bareHref] = match;
 		const start = match.index;
 
 		if (start > lastIndex) {
-			container.appendChild(document.createTextNode(text.slice(lastIndex, start)));
+			container.appendChild(activeDocument.createTextNode(text.slice(lastIndex, start)));
 		}
 
 		if (wikiInner) {
 			const content = wikiInner;
-			let filePath = content;
 			let displayText = content;
 			if (content.includes("|")) {
-				const [fp, alias] = content.split("|");
-				filePath = fp;
-				displayText = alias;
+				displayText = content.split("|")[1];
 			}
-			appendInternalLink(container, filePath, displayText, deps);
+			const target = parseWikilinkTarget(content);
+			appendInternalLink(container, target.path, uiData(displayText, "Resolved vault/Markdown link alias or filename; preserve user-authored link data"), deps, {
+				subpath: target.subpath,
+			});
 		} else if (mdText && mdHref) {
 			const href = String(mdHref).trim();
 			const disp = String(mdText).trim();
-			if (/^[a-z]+:\/\//i.test(href)) {
-				const a = container.createEl("a", {
-					text: disp,
-					attr: { href, target: "_blank", rel: "noopener" },
-				});
-				a.classList.add("external-link");
+			if (isExternalHref(href)) {
+				appendExternalLink(container, href, uiData(disp, "Resolved vault/Markdown link alias or filename; preserve user-authored link data"));
 			} else {
-				appendInternalLink(container, href, disp, deps);
+				const target = parseMarkdownLinkTarget(href);
+				appendInternalLink(container, target.path, uiData(disp, "Resolved vault/Markdown link alias or filename; preserve user-authored link data"), deps, {
+					subpath: target.subpath,
+				});
 			}
+		} else if (autolinkHref || bareHref) {
+			const href = String(autolinkHref || bareHref);
+			appendExternalLink(container, href, uiData(href, "Resolved vault/Markdown link alias or filename; preserve user-authored link data"));
+		} else {
+			container.appendChild(activeDocument.createTextNode(full));
 		}
 
 		lastIndex = start + full.length;
@@ -209,13 +275,13 @@ export function renderTextWithLinks(
 			// Add text before the tag
 			if (tagStart > tagLastIndex) {
 				container.appendChild(
-					document.createTextNode(remainingText.slice(tagLastIndex, tagStart))
+					activeDocument.createTextNode(remainingText.slice(tagLastIndex, tagStart))
 				);
 			}
 
 			// Add the prefix (space or start of string)
 			if (prefix) {
-				container.appendChild(document.createTextNode(prefix));
+				container.appendChild(activeDocument.createTextNode(prefix));
 			}
 
 			// Create clickable tag
@@ -226,19 +292,21 @@ export function renderTextWithLinks(
 					href: tag,
 					role: "button",
 					tabindex: "0",
+					"data-tn-click-exclude": "true",
 				},
 			});
 
 			tagEl.addEventListener("click", (e) => {
 				e.preventDefault();
 				e.stopPropagation();
-				options.onTagClick!(tag, e as MouseEvent);
+				void options.onTagClick!(tag, e);
 			});
 
 			tagEl.addEventListener("keydown", (e) => {
 				if (e.key === "Enter" || e.key === " ") {
 					e.preventDefault();
-					options.onTagClick!(tag, e as any);
+					e.stopPropagation();
+					void options.onTagClick!(tag, e);
 				}
 			});
 
@@ -247,11 +315,11 @@ export function renderTextWithLinks(
 
 		// Add any remaining text after the last tag
 		if (tagLastIndex < remainingText.length) {
-			container.appendChild(document.createTextNode(remainingText.slice(tagLastIndex)));
+			container.appendChild(activeDocument.createTextNode(remainingText.slice(tagLastIndex)));
 		}
 	} else if (remainingText) {
 		// No tag handling, just add the remaining text
-		container.appendChild(document.createTextNode(remainingText));
+		container.appendChild(activeDocument.createTextNode(remainingText));
 	}
 }
 
@@ -267,13 +335,13 @@ export function renderValueWithLinks(
 	}
 	if (Array.isArray(value)) {
 		value.forEach((item, idx) => {
-			if (idx > 0) container.appendChild(document.createTextNode(", "));
+			if (idx > 0) container.appendChild(activeDocument.createTextNode(", "));
 			if (typeof item === "string") renderTextWithLinks(container, item, deps);
-			else container.appendChild(document.createTextNode(String(item)));
+			else container.appendChild(activeDocument.createTextNode(String(item)));
 		});
 		return;
 	}
-	container.appendChild(document.createTextNode(String(value)));
+	container.appendChild(activeDocument.createTextNode(String(value)));
 }
 
 /**
@@ -305,15 +373,16 @@ function isMarkdownLink(text: string): boolean {
 /**
  * Parse a markdown link to extract display text and file path
  */
-function parseMarkdownLink(text: string): { displayText: string; filePath: string } | null {
+function parseMarkdownLink(
+	text: string
+): { displayText: string; filePath: string; subpath: string } | null {
 	const match = text.match(/^\[([^\]]*)\]\(([^)]+)\)$/);
 	if (!match) return null;
 
 	const displayText = match[1].trim();
-	const rawPath = match[2].trim();
-	const filePath = parseLinkToPath(rawPath);
+	const target = parseMarkdownLinkTarget(match[2]);
 
-	return { displayText, filePath };
+	return { displayText, filePath: target.path, subpath: target.subpath };
 }
 
 function resolveProjectDisplayText(
@@ -369,32 +438,31 @@ export function renderProjectLinks(
 
 	validProjects.forEach((project, index) => {
 		if (index > 0) {
-			container.appendChild(document.createTextNode(", "));
+			container.appendChild(activeDocument.createTextNode(", "));
 		}
 
 		// Add + prefix for projects
-		container.appendChild(document.createTextNode("+"));
+		container.appendChild(activeDocument.createTextNode("+"));
 
 		if (isWikilink(project)) {
 			// Parse the wikilink to separate path and display text
 			const linkContent = project.slice(2, -2);
-			let filePath = linkContent;
+			const target = parseWikilinkTarget(linkContent);
 			let displayText = linkContent;
 
 			// Handle alias syntax: [[path|alias]]
 			// Note: parseLinktext() doesn't preserve alias info, so we parse manually
 			if (linkContent.includes("|")) {
-				const parts = linkContent.split("|");
-				filePath = parts[0].trim();
-				displayText = parts[1].trim();
+				displayText = linkContent.split("|")[1].trim();
 			}
 
-			const resolvedText = resolveProjectDisplayText(filePath, displayText, deps);
-			appendInternalLink(container, filePath, resolvedText, deps, {
+			const resolvedText = resolveProjectDisplayText(target.path, displayText, deps);
+			appendInternalLink(container, target.path, uiData(resolvedText, "Resolved vault/Markdown link alias or filename; preserve user-authored link data"), deps, {
 				cssClass: "task-card__project-link internal-link",
 				hoverSource: "tasknotes-project-link",
 				showErrorNotices: true,
 				onPrimaryNavigate: options.onPrimaryNavigate,
+				subpath: target.subpath,
 			});
 		} else if (isMarkdownLink(project)) {
 			// Parse markdown link: [text](path)
@@ -405,19 +473,20 @@ export function renderProjectLinks(
 					parsed.displayText,
 					deps
 				);
-				appendInternalLink(container, parsed.filePath, resolvedText, deps, {
+				appendInternalLink(container, parsed.filePath, uiData(resolvedText, "Resolved vault/Markdown link alias or filename; preserve user-authored link data"), deps, {
 					cssClass: "task-card__project-link internal-link",
 					hoverSource: "tasknotes-project-link",
 					showErrorNotices: true,
 					onPrimaryNavigate: options.onPrimaryNavigate,
+					subpath: parsed.subpath,
 				});
 			} else {
 				// Fallback to plain text if parsing fails
-				container.appendChild(document.createTextNode(project));
+				container.appendChild(activeDocument.createTextNode(project));
 			}
 		} else {
 			// Plain text project
-			container.appendChild(document.createTextNode(project));
+			container.appendChild(activeDocument.createTextNode(project));
 		}
 	});
 }
@@ -443,17 +512,19 @@ export function renderArrayWithLinks(
 
 	validItems.forEach((item, index) => {
 		if (index > 0) {
-			container.appendChild(document.createTextNode(separator));
+			container.appendChild(activeDocument.createTextNode(separator));
 		}
 
 		if (prefix) {
-			container.appendChild(document.createTextNode(prefix));
+			container.appendChild(activeDocument.createTextNode(prefix));
 		}
 
 		renderTextWithLinks(container, item, deps, {
 			renderPlain: (container, text) => {
-				container.createEl("span", { text, cls: cssClass });
+				container.createSpan({ text, cls: cssClass });
 			},
 		});
 	});
 }
+
+/* eslint-enable @typescript-eslint/no-non-null-assertion -- Re-enable after the link renderer implementation. */

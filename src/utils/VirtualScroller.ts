@@ -1,3 +1,6 @@
+import { createTaskNotesLogger } from "./tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Utils/VirtualScroller" });
 /**
  * Simple virtual scrolling implementation for large lists
  *
@@ -22,6 +25,11 @@ export interface VirtualScrollerOptions<T> {
 	renderItem: (item: T, index: number) => HTMLElement;
 	/** Optional function to get unique key for item */
 	getItemKey?: (item: T, index: number) => string;
+	/**
+	 * Called on scroll (RAF-throttled) with the current scrollTop.
+	 * Fires even when the visible item range does not change — useful for sticky headers.
+	 */
+	onScroll?: (scrollTop: number) => void;
 }
 
 export interface VirtualScrollState {
@@ -35,6 +43,35 @@ export interface VirtualScrollState {
 	offsetY: number;
 }
 
+export interface VirtualScrollerReorderOptions {
+	/** Stable keys for the items being moved, in the order they should be inserted. */
+	movedKeys: readonly string[];
+	/** Stable key for the item that receives the moved items. */
+	targetKey: string;
+	/** Whether to insert moved items before or after the target item. */
+	position: "before" | "after";
+}
+
+export interface VirtualScrollerInvalidateOptions {
+	/** Clear cached heights for invalidated items before rerendering them. */
+	invalidateHeights?: boolean;
+}
+
+export interface VirtualScrollerInsertOptions<T> {
+	/** Items to insert, in render order. */
+	items: readonly T[];
+	/** Stable key for the item that receives the inserted items. Omit to append. */
+	targetKey?: string;
+	/** Whether to insert before/after the target item, or append to the end. */
+	position?: "before" | "after" | "end";
+}
+
+type VirtualScrollerItemEntry<T> = {
+	item: T;
+	key: string;
+	height?: number;
+};
+
 export class VirtualScroller<T> {
 	private container: HTMLElement;
 	private scrollContainer: HTMLElement;
@@ -46,6 +83,7 @@ export class VirtualScroller<T> {
 	private overscan: number;
 	private renderItem: (item: T, index: number) => HTMLElement;
 	private getItemKey: (item: T, index: number) => string;
+	private onScroll: ((scrollTop: number) => void) | null;
 
 	private state: VirtualScrollState = {
 		startIndex: 0,
@@ -64,6 +102,7 @@ export class VirtualScroller<T> {
 	private resizeObserver: ResizeObserver | null = null;
 	private measurementRAF: number | null = null;
 	private pendingMeasurements = new Set<number>();
+	private invalidatedKeys = new Set<string>();
 
 	constructor(options: VirtualScrollerOptions<T>) {
 		this.container = options.container;
@@ -72,6 +111,7 @@ export class VirtualScroller<T> {
 		this.overscan = options.overscan ?? 5;
 		this.renderItem = options.renderItem;
 		this.getItemKey = options.getItemKey ?? ((item, index) => String(index));
+		this.onScroll = options.onScroll ?? null;
 
 		this.setupDOM();
 		this.attachScrollListener();
@@ -91,31 +131,23 @@ export class VirtualScroller<T> {
 		this.container.empty();
 
 		// Container should just be relative, parent handles overflow
-		this.container.style.position = 'relative';
+		this.container.classList.remove("tn-static-margin-top-12px-91e0f558");
+		this.container.classList.add("tn-virtual-scroller", "tn-static-position-relative-d461c96d");
 
 		// Create spacer to maintain scroll height
 		this.spacer = this.container.createDiv({
-			cls: 'virtual-scroller__spacer',
+			cls: "virtual-scroller__spacer",
 		});
-		this.spacer.style.cssText = `
-			position: absolute;
-			top: 0;
-			left: 0;
-			right: 0;
-			pointer-events: none;
-		`;
 		this.updateSpacerHeight();
 
 		// Create content container for rendered items
 		this.contentContainer = this.container.createDiv({
-			cls: 'virtual-scroller__content',
+			cls: "virtual-scroller__content",
 		});
-		this.contentContainer.style.cssText = `
-			position: relative;
-		`;
 
 		// Find the actual scrolling container by walking up the DOM
 		this.scrollContainer = this.findScrollContainer(this.container);
+		this.updateSpacerHeight();
 	}
 
 	/**
@@ -128,13 +160,8 @@ export class VirtualScroller<T> {
 
 		// Temporarily render sample items for measurement
 		const tempContainer = this.contentContainer.createDiv({
-			cls: 'virtual-scroller__sample',
+			cls: "virtual-scroller__sample",
 		});
-		tempContainer.style.cssText = `
-			position: absolute;
-			visibility: hidden;
-			pointer-events: none;
-		`;
 
 		for (let i = 0; i < sampleSize; i++) {
 			const element = this.renderItem(this.items[i], i);
@@ -168,7 +195,7 @@ export class VirtualScroller<T> {
 			const style = window.getComputedStyle(current);
 			const overflowY = style.overflowY;
 
-			if (overflowY === 'scroll' || overflowY === 'auto') {
+			if (overflowY === "scroll" || overflowY === "auto") {
 				return current;
 			}
 
@@ -179,8 +206,20 @@ export class VirtualScroller<T> {
 		return element;
 	}
 
+	private getContainerBottomPadding(): number {
+		const view = this.container.ownerDocument.defaultView;
+		const paddingBottom = view?.getComputedStyle(this.container).paddingBottom ?? "";
+		const parsedPadding = Number.parseFloat(paddingBottom);
+		return Number.isFinite(parsedPadding) ? parsedPadding : 0;
+	}
+
 	private updateSpacerHeight(): void {
-		this.spacer.style.height = `${this.totalHeight}px`;
+		const height = `${this.totalHeight + this.getContainerBottomPadding()}px`;
+		this.spacer.style.height = height;
+		if (this.scrollContainer && this.scrollContainer !== this.container) {
+			// Transforms and the absolute spacer do not size the sticky boundary.
+			this.container.style.minHeight = height;
+		}
 	}
 
 	/**
@@ -235,6 +274,122 @@ export class VirtualScroller<T> {
 		this.updateSpacerHeight();
 	}
 
+	private getItemEntries(): VirtualScrollerItemEntry<T>[] {
+		return this.items.map((item, index) => ({
+			item,
+			key: this.getItemKey(item, index),
+			height: this.itemHeights.get(index),
+		}));
+	}
+
+	private hasUniqueStableKeys(entries: readonly VirtualScrollerItemEntry<T>[]): boolean {
+		const seen = new Set<string>();
+		for (const entry of entries) {
+			if (seen.has(entry.key)) {
+				return false;
+			}
+			seen.add(entry.key);
+		}
+		return true;
+	}
+
+	private applyItemEntries(entries: readonly VirtualScrollerItemEntry<T>[]): void {
+		this.items = entries.map((entry) => entry.item);
+		this.state.totalItems = this.items.length;
+
+		const nextHeights = new Map<number, number>();
+		entries.forEach((entry, index) => {
+			if (entry.height !== undefined) {
+				nextHeights.set(index, entry.height);
+			}
+		});
+		this.itemHeights = nextHeights;
+		this.pendingMeasurements.clear();
+		this.rebuildPositionCache();
+	}
+
+	private forceVisibleRangeUpdate(): void {
+		this.state.startIndex = -1;
+		this.state.endIndex = -1;
+		this.updateVisibleRange();
+	}
+
+	private getUniqueCurrentEntries(): VirtualScrollerItemEntry<T>[] | null {
+		const currentEntries = this.getItemEntries();
+		return this.hasUniqueStableKeys(currentEntries) ? currentEntries : null;
+	}
+
+	private buildEntriesAfterRemoval(
+		keys: readonly string[]
+	): VirtualScrollerItemEntry<T>[] | null {
+		const keySet = new Set(keys);
+		if (keys.length === 0 || keySet.size !== keys.length) {
+			return null;
+		}
+
+		const currentEntries = this.getUniqueCurrentEntries();
+		if (!currentEntries) {
+			return null;
+		}
+
+		const currentKeys = new Set(currentEntries.map((entry) => entry.key));
+		if (!keys.every((key) => currentKeys.has(key))) {
+			return null;
+		}
+
+		const nextEntries = currentEntries.filter((entry) => !keySet.has(entry.key));
+		const keysRemainStable = nextEntries.every(
+			(entry, index) => this.getItemKey(entry.item, index) === entry.key
+		);
+		return keysRemainStable ? nextEntries : null;
+	}
+
+	private buildEntriesAfterInsertion(
+		options: VirtualScrollerInsertOptions<T>
+	): VirtualScrollerItemEntry<T>[] | null {
+		if (options.items.length === 0) {
+			return null;
+		}
+
+		const currentEntries = this.getUniqueCurrentEntries();
+		if (!currentEntries) {
+			return null;
+		}
+
+		const position = options.position ?? "end";
+		if (position !== "end" && !options.targetKey) {
+			return null;
+		}
+
+		let insertAt = currentEntries.length;
+		if (position !== "end") {
+			const targetIndex = currentEntries.findIndex((entry) => entry.key === options.targetKey);
+			if (targetIndex === -1) {
+				return null;
+			}
+			insertAt = position === "before" ? targetIndex : targetIndex + 1;
+		}
+
+		const insertedEntries = options.items.map((item, index) => ({
+			item,
+			key: this.getItemKey(item, insertAt + index),
+		}));
+		const nextEntries = [
+			...currentEntries.slice(0, insertAt),
+			...insertedEntries,
+			...currentEntries.slice(insertAt),
+		];
+
+		if (!this.hasUniqueStableKeys(nextEntries)) {
+			return null;
+		}
+
+		const keysRemainStable = nextEntries.every(
+			(entry, index) => this.getItemKey(entry.item, index) === entry.key
+		);
+		return keysRemainStable ? nextEntries : null;
+	}
+
 	/**
 	 * Setup ResizeObserver to detect height changes in rendered items
 	 */
@@ -243,7 +398,7 @@ export class VirtualScroller<T> {
 			// Collect indices that need remeasurement
 			for (const entry of entries) {
 				const element = entry.target as HTMLElement;
-				const index = parseInt(element.dataset.virtualIndex || '-1', 10);
+				const index = parseInt(element.dataset.virtualIndex || "-1", 10);
 
 				if (index >= 0 && index < this.items.length) {
 					this.pendingMeasurements.add(index);
@@ -252,7 +407,7 @@ export class VirtualScroller<T> {
 
 			// Debounce the actual measurement update
 			if (this.measurementRAF === null) {
-				this.measurementRAF = requestAnimationFrame(() => {
+				this.measurementRAF = window.requestAnimationFrame(() => {
 					this.processPendingMeasurements();
 					this.measurementRAF = null;
 				});
@@ -297,11 +452,11 @@ export class VirtualScroller<T> {
 	 * Measure all currently rendered items
 	 */
 	private measureRenderedItems(): void {
-		const elements = this.contentContainer.querySelectorAll('[data-virtual-index]');
+		const elements = this.contentContainer.querySelectorAll("[data-virtual-index]");
 		let heightsChanged = false;
 
 		for (const element of elements) {
-			const index = parseInt((element as HTMLElement).dataset.virtualIndex || '-1', 10);
+			const index = parseInt((element as HTMLElement).dataset.virtualIndex || "-1", 10);
 			if (index >= 0 && index < this.items.length) {
 				const newHeight = element.getBoundingClientRect().height;
 				const oldHeight = this.itemHeights.get(index);
@@ -319,7 +474,7 @@ export class VirtualScroller<T> {
 	}
 
 	private attachScrollListener(): void {
-		this.scrollContainer.addEventListener('scroll', this.handleScroll);
+		this.scrollContainer.addEventListener("scroll", this.handleScroll);
 	}
 
 	private handleScroll = (): void => {
@@ -328,14 +483,15 @@ export class VirtualScroller<T> {
 			return;
 		}
 
-		this.scrollRAF = requestAnimationFrame(() => {
+		this.scrollRAF = window.requestAnimationFrame(() => {
 			this.updateVisibleRange();
+			this.onScroll?.(this.scrollContainer.scrollTop);
 			this.scrollRAF = null;
 		});
 	};
 
 	private updateVisibleRange(): void {
-		const scrollTop = this.scrollContainer.scrollTop;
+		const scrollTop = this.getScrollTop();
 		let containerHeight = this.scrollContainer.clientHeight;
 
 		// If container height is 0, try to get a better estimate
@@ -346,7 +502,11 @@ export class VirtualScroller<T> {
 		if (containerHeight === 0) {
 			// Fall back to window height as last resort
 			containerHeight = window.innerHeight;
-			console.warn('[VirtualScroller] Using window height as fallback:', containerHeight);
+			tasknotesLogger.warn("[VirtualScroller] Using window height as fallback:", {
+				category: "configuration",
+				operation: "using-window-height-as-fallback",
+				details: { value: containerHeight },
+			});
 		}
 
 		// Use binary search to find visible range based on actual positions
@@ -411,6 +571,15 @@ export class VirtualScroller<T> {
 
 			let element = this.renderedElements.get(key);
 
+			if (element && this.invalidatedKeys.has(key)) {
+				if (this.resizeObserver) {
+					this.resizeObserver.unobserve(element);
+				}
+				element.remove();
+				this.renderedElements.delete(key);
+				element = undefined;
+			}
+
 			if (!element) {
 				// Create new element
 				element = this.renderItem(item, i);
@@ -428,6 +597,7 @@ export class VirtualScroller<T> {
 				// Update index for existing element
 				element.dataset.virtualIndex = String(i);
 			}
+			this.invalidatedKeys.delete(key);
 
 			// Only manipulate DOM if element is not in correct position
 			if (previousElement) {
@@ -454,11 +624,12 @@ export class VirtualScroller<T> {
 				}
 				element.remove();
 				this.renderedElements.delete(key);
+				this.invalidatedKeys.delete(key);
 			}
 		}
 
 		// Schedule measurement after render
-		requestAnimationFrame(() => {
+		window.requestAnimationFrame(() => {
 			this.measureRenderedItems();
 		});
 	}
@@ -505,9 +676,153 @@ export class VirtualScroller<T> {
 	}
 
 	/**
+	 * Return a shallow copy of the current items in render order.
+	 */
+	getItems(): readonly T[] {
+		return [...this.items];
+	}
+
+	/**
+	 * Reorder existing items by stable item key without clearing rendered DOM.
+	 * Returns false if the move cannot be represented safely with the current keys.
+	 */
+	reorderItems(options: VirtualScrollerReorderOptions): boolean {
+		const movedKeys = [...options.movedKeys];
+		const movedKeySet = new Set(movedKeys);
+		if (
+			movedKeys.length === 0 ||
+			movedKeySet.size !== movedKeys.length ||
+			movedKeySet.has(options.targetKey)
+		) {
+			return false;
+		}
+
+		const currentEntries = this.getItemEntries();
+		if (!this.hasUniqueStableKeys(currentEntries)) {
+			return false;
+		}
+
+		const entriesByKey = new Map(currentEntries.map((entry) => [entry.key, entry]));
+		if (!entriesByKey.has(options.targetKey)) {
+			return false;
+		}
+		if (!movedKeys.every((key) => entriesByKey.has(key))) {
+			return false;
+		}
+
+		const remainingEntries = currentEntries.filter((entry) => !movedKeySet.has(entry.key));
+		const targetIndex = remainingEntries.findIndex((entry) => entry.key === options.targetKey);
+		if (targetIndex === -1) {
+			return false;
+		}
+
+		const movingEntries: VirtualScrollerItemEntry<T>[] = [];
+		for (const key of movedKeys) {
+			const entry = entriesByKey.get(key);
+			if (!entry) {
+				return false;
+			}
+			movingEntries.push(entry);
+		}
+		const insertAt = options.position === "before" ? targetIndex : targetIndex + 1;
+		const nextEntries = [
+			...remainingEntries.slice(0, insertAt),
+			...movingEntries,
+			...remainingEntries.slice(insertAt),
+		];
+
+		const keysRemainStable = nextEntries.every(
+			(entry, index) => this.getItemKey(entry.item, index) === entry.key
+		);
+		if (!keysRemainStable) {
+			return false;
+		}
+
+		const currentScrollTop = this.scrollContainer.scrollTop;
+		this.applyItemEntries(nextEntries);
+		this.scrollContainer.scrollTop = currentScrollTop;
+		this.forceVisibleRangeUpdate();
+		return true;
+	}
+
+	canRemoveItems(keys: readonly string[]): boolean {
+		return this.buildEntriesAfterRemoval(keys) !== null;
+	}
+
+	removeItems(keys: readonly string[]): boolean {
+		const nextEntries = this.buildEntriesAfterRemoval(keys);
+		if (!nextEntries) {
+			return false;
+		}
+
+		const currentScrollTop = this.scrollContainer.scrollTop;
+		for (const key of keys) {
+			const element = this.renderedElements.get(key);
+			if (element) {
+				if (this.resizeObserver) {
+					this.resizeObserver.unobserve(element);
+				}
+				element.remove();
+				this.renderedElements.delete(key);
+			}
+			this.invalidatedKeys.delete(key);
+		}
+
+		this.applyItemEntries(nextEntries);
+		this.scrollContainer.scrollTop = currentScrollTop;
+		this.forceVisibleRangeUpdate();
+		return true;
+	}
+
+	canInsertItems(options: VirtualScrollerInsertOptions<T>): boolean {
+		return this.buildEntriesAfterInsertion(options) !== null;
+	}
+
+	insertItems(options: VirtualScrollerInsertOptions<T>): boolean {
+		const nextEntries = this.buildEntriesAfterInsertion(options);
+		if (!nextEntries) {
+			return false;
+		}
+
+		const currentScrollTop = this.scrollContainer.scrollTop;
+		this.applyItemEntries(nextEntries);
+		this.scrollContainer.scrollTop = currentScrollTop;
+		this.forceVisibleRangeUpdate();
+		return true;
+	}
+
+	/**
+	 * Re-render currently visible items by key without rebuilding the whole scroller.
+	 */
+	invalidateItems(keys: readonly string[], options: VirtualScrollerInvalidateOptions = {}): void {
+		if (keys.length === 0) {
+			return;
+		}
+
+		const keySet = new Set(keys);
+		if (options.invalidateHeights) {
+			for (const key of keySet) {
+				const element = this.renderedElements.get(key);
+				if (!element) continue;
+
+				const index = parseInt(element.dataset.virtualIndex || "-1", 10);
+				if (index >= 0) {
+					this.itemHeights.delete(index);
+				}
+			}
+			this.rebuildPositionCache();
+		}
+
+		for (const key of keySet) {
+			this.invalidatedKeys.add(key);
+		}
+		this.forceVisibleRangeUpdate();
+	}
+
+	/**
 	 * Scroll to a specific item index
 	 */
-	scrollToIndex(index: number, behavior: ScrollBehavior = 'smooth'): void {
+	scrollToIndex(index: number, behavior: ScrollBehavior = "smooth"): void {
 		const targetScroll = this.getItemPosition(index);
 		this.scrollContainer.scrollTo({
 			top: targetScroll,
@@ -519,9 +834,17 @@ export class VirtualScroller<T> {
 	 * Force recalculation of visible range (useful after container resize)
 	 */
 	recalculate(): void {
+		// Bases may attach an embedded view only after its first render.
+		const scrollContainer = this.findScrollContainer(this.container);
+		if (scrollContainer !== this.scrollContainer) {
+			this.scrollContainer.removeEventListener("scroll", this.handleScroll);
+			this.scrollContainer = scrollContainer;
+			this.attachScrollListener();
+		}
 		// Force a fresh calculation by resetting state
 		this.state.startIndex = -1;
 		this.state.endIndex = -1;
+		this.updateSpacerHeight();
 		this.updateVisibleRange();
 	}
 
@@ -529,23 +852,7 @@ export class VirtualScroller<T> {
 	 * Invalidate a specific item by key, forcing it to re-render
 	 */
 	invalidateItem(key: string): void {
-		const element = this.renderedElements.get(key);
-		if (element) {
-			// Get the index from the element
-			const index = parseInt(element.dataset.virtualIndex || '-1', 10);
-
-			// Clear height measurement for this index
-			if (index >= 0) {
-				this.itemHeights.delete(index);
-			}
-
-			// Remove from cache - will be recreated on next render
-			this.renderedElements.delete(key);
-			element.remove();
-		}
-		// Rebuild position cache and force re-render
-		this.rebuildPositionCache();
-		this.updateVisibleRange();
+		this.invalidateItems([key], { invalidateHeights: true });
 	}
 
 	/**
@@ -567,24 +874,50 @@ export class VirtualScroller<T> {
 	}
 
 	/**
+	 * Top offset of an item within the virtual list (pixels from content start).
+	 */
+	getItemOffset(index: number): number {
+		return this.getItemPosition(index);
+	}
+
+	/**
+	 * Measured or estimated height of an item at the given index.
+	 */
+	getMeasuredItemHeight(index: number): number {
+		return this.getItemHeight(index);
+	}
+
+	/**
+	 * Current scroll offset of the scroll container.
+	 */
+	getScrollTop(): number {
+		if (this.container === this.scrollContainer) return this.scrollContainer.scrollTop;
+		// Embedded lists begin below the note's scroll origin.
+		return this.scrollContainer.getBoundingClientRect().top + this.scrollContainer.clientTop -
+			this.container.getBoundingClientRect().top;
+	}
+
+	/**
 	 * Clean up event listeners
 	 */
 	destroy(): void {
 		if (this.scrollRAF !== null) {
-			cancelAnimationFrame(this.scrollRAF);
+			window.cancelAnimationFrame(this.scrollRAF);
 		}
 		if (this.measurementRAF !== null) {
-			cancelAnimationFrame(this.measurementRAF);
+			window.cancelAnimationFrame(this.measurementRAF);
 		}
 		if (this.resizeObserver) {
 			this.resizeObserver.disconnect();
 			this.resizeObserver = null;
 		}
-		this.scrollContainer.removeEventListener('scroll', this.handleScroll);
+		this.scrollContainer.removeEventListener("scroll", this.handleScroll);
+		if (this.scrollContainer !== this.container) this.container.style.removeProperty("min-height");
 		this.renderedElements.clear();
 		this.contentContainer.empty();
 		this.itemHeights.clear();
 		this.positionCache = [];
 		this.pendingMeasurements.clear();
+		this.invalidatedKeys.clear();
 	}
 }

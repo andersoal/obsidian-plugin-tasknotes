@@ -1,7 +1,15 @@
-import { Editor, MarkdownView, Notice, Platform, addIcon } from "obsidian";
+import type { MessageDescriptor } from "@lingui/core";
+import { msg } from "@lingui/core/macro";
+import { MarkdownView, Platform, addIcon, setTooltip } from "obsidian";
 import { EditorView } from "@codemirror/view";
 import type TaskNotesPlugin from "../main";
-import { EVENT_DATA_CHANGED, EVENT_TASK_UPDATED, POMODORO_STATS_VIEW_TYPE, POMODORO_VIEW_TYPE, STATS_VIEW_TYPE, TaskInfo } from "../types";
+import {
+	EVENT_TASK_UPDATED,
+	POMODORO_STATS_VIEW_TYPE,
+	POMODORO_VIEW_TYPE,
+	STATS_VIEW_TYPE,
+	TaskInfo,
+} from "../types";
 import { RequestDeduplicator, PredictivePrefetcher } from "../utils/RequestDeduplicator";
 import { DOMReconciler, UIStateManager } from "../utils/DOMReconciler";
 import { FieldMapper } from "../services/FieldMapper";
@@ -17,8 +25,8 @@ import { ProjectSubtasksService } from "../services/ProjectSubtasksService";
 import { ExpandedProjectsService } from "../services/ExpandedProjectsService";
 import { AutoArchiveService } from "../services/AutoArchiveService";
 import { DragDropManager } from "../utils/DragDropManager";
-import { StatusBarService } from "../services/StatusBarService";
-import { NotificationService } from "../services/NotificationService";
+import { StatusBarService } from "../ui/StatusBarService";
+import { NotificationService } from "../ui/NotificationService";
 import { ViewPerformanceService } from "../services/ViewPerformanceService";
 import { PomodoroView } from "../views/PomodoroView";
 import { PomodoroStatsView } from "../views/PomodoroStatsView";
@@ -43,8 +51,49 @@ import { MicrosoftCalendarService } from "../services/MicrosoftCalendarService";
 import { CalendarProviderRegistry } from "../services/CalendarProvider";
 import { PomodoroService } from "../services/PomodoroService";
 import { AutoExportService } from "../services/AutoExportService";
+import { TaskFileLifecycleReconciliationService } from "../services/TaskFileLifecycleReconciliationService";
+import { TaskNotesAPI } from "../api/TaskNotesAPI";
+import { isCalendarIntegrationDisabledOnMobile } from "../utils/calendarIntegration";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+import { TASKNOTES_RUNTIME_LIFECYCLE_RAW_EVENTS } from "../api/runtime-api";
+import { showNotice } from "../ui/notifications";
+import { EVENT_USER_NOTICE, type UserNoticePayload } from "../core/userNotices";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Bootstrap/PluginBootstrap" });
+
+const TASKNOTES_BASES_VIEW_TYPES = [
+	"tasknotesTaskList",
+	"tasknotesKanban",
+	"tasknotesCalendar",
+	"tasknotesMiniCalendar",
+];
+
+type EnabledBasesPlugin = {
+	registrations?: Record<string, unknown>;
+};
+
+type InternalPluginManagerWithBases = {
+	getEnabledPluginById?: (id: string) => EnabledBasesPlugin | null;
+};
+
+type AppWithInternalPlugins = {
+	internalPlugins?: InternalPluginManagerWithBases;
+};
 
 type FileDeletedEventData = { path: string; prevCache?: unknown };
+type FileUpdatedEventData = { path: string; file?: unknown; updatedTask?: TaskInfo };
+
+type EditorWithCodeMirror = {
+	cm?: unknown;
+};
+
+function getCodeMirrorEditor(editor: unknown): unknown {
+	if (!editor || typeof editor !== "object") {
+		return undefined;
+	}
+
+	return (editor as unknown as EditorWithCodeMirror).cm ?? null;
+}
 
 export function registerTaskNotesIcon(): void {
 	addIcon(
@@ -63,7 +112,14 @@ export function registerTaskNotesIcon(): void {
 }
 
 export async function initializeCoreServices(plugin: TaskNotesPlugin): Promise<void> {
-	plugin.fieldMapper = new FieldMapper(plugin.settings.fieldMapping);
+	plugin.api = new TaskNotesAPI(plugin);
+
+	plugin.fieldMapper = new FieldMapper(
+		plugin.settings.fieldMapping,
+		plugin.settings.userFields ?? [],
+		plugin.settings.customStatuses,
+		plugin.settings.customPriorities
+	);
 	plugin.statusManager = new StatusManager(
 		plugin.settings.customStatuses,
 		plugin.settings.defaultTaskStatus
@@ -77,6 +133,11 @@ export async function initializeCoreServices(plugin: TaskNotesPlugin): Promise<v
 
 	plugin.cacheManager = new TaskManager(plugin.app, plugin.settings, plugin.fieldMapper);
 	plugin.emitter = plugin.cacheManager;
+	plugin.registerEvent(
+		plugin.emitter.on(EVENT_USER_NOTICE, (payload: UserNoticePayload) => {
+			showNotice(payload.message, payload.timeout);
+		})
+	);
 
 	plugin.dependencyCache = new DependencyCache(
 		plugin.app,
@@ -119,45 +180,58 @@ export async function initializeCoreServices(plugin: TaskNotesPlugin): Promise<v
 }
 
 export function registerRibbonIcons(plugin: TaskNotesPlugin): void {
-	plugin.addRibbonIcon("calendar-days", plugin.i18n.translate("commands.openCalendarView"), async () => {
+	const ribbons: { element: HTMLElement; key: MessageDescriptor }[] = [];
+	const addRibbon = (
+		icon: string,
+		key: MessageDescriptor,
+		callback: (event: MouseEvent) => void | Promise<void>
+	) => {
+		const element = plugin.addRibbonIcon(icon, plugin.i18n.translate(key), callback);
+		ribbons.push({ element, key });
+	};
+	const refresh = () => {
+		for (const { element, key } of ribbons) {
+			setTooltip(element, plugin.i18n.translate(key), { placement: "right" });
+		}
+	};
+	const listener = plugin.i18n.on("locale-changed", refresh);
+	plugin.register(() => plugin.i18n.offref(listener));
+
+	addRibbon("calendar-days", msg({ message: "Open mini calendar view", context: "commands.openCalendarView" }), async () => {
 		await plugin.activateCalendarView();
 	});
 
-	plugin.addRibbonIcon("calendar", plugin.i18n.translate("commands.openAdvancedCalendarView"), async () => {
+	addRibbon("calendar", msg({ message: "Open calendar view", context: "commands.openAdvancedCalendarView" }), async () => {
 		await plugin.openBasesFileForCommand("open-advanced-calendar-view");
 	});
 
-	plugin.addRibbonIcon("check-square", plugin.i18n.translate("commands.openTasksView"), async () => {
+	addRibbon("check-square", msg({ message: "Open tasks view", context: "commands.openTasksView" }), async () => {
 		await plugin.openBasesFileForCommand("open-tasks-view");
 	});
 
-	plugin.addRibbonIcon("list", plugin.i18n.translate("commands.openAgendaView"), async () => {
+	addRibbon("list", msg({ message: "Open agenda view", context: "commands.openAgendaView" }), async () => {
 		await plugin.openBasesFileForCommand("open-agenda-view");
 	});
 
-	plugin.addRibbonIcon("columns-3", plugin.i18n.translate("commands.openKanbanView"), async () => {
+	addRibbon("columns-3", msg({ message: "Open Kanban board", context: "commands.openKanbanView" }), async () => {
 		await plugin.openBasesFileForCommand("open-kanban-view");
 	});
 
-	plugin.addRibbonIcon("timer", plugin.i18n.translate("commands.openPomodoroView"), async () => {
+	addRibbon("timer", msg({ message: "Open Pomodoro timer", context: "commands.openPomodoroView" }), async () => {
 		await plugin.activatePomodoroView();
 	});
 
-	plugin.addRibbonIcon(
-		"bar-chart-3",
-		plugin.i18n.translate("commands.openPomodoroStats"),
-		async () => {
-			await plugin.activatePomodoroStatsView();
-		}
-	);
+	addRibbon("bar-chart-3", msg({ message: "Open Pomodoro statistics", context: "commands.openPomodoroStats" }), async () => {
+		await plugin.activatePomodoroStatsView();
+	});
 
-	plugin.addRibbonIcon("tasknotes-simple", plugin.i18n.translate("commands.createNewTask"), () => {
+	addRibbon("tasknotes-simple", msg({ message: "Create new task", context: "commands.createNewTask" }), () => {
 		plugin.openTaskCreationModal();
 	});
 }
 
 export function initializeCalendarProviders(plugin: TaskNotesPlugin): void {
-	plugin.oauthService = new OAuthService(plugin);
+	plugin.oauthService = new OAuthService(plugin, plugin.oauthSecretStore);
 	plugin.googleCalendarService = new GoogleCalendarService(plugin, plugin.oauthService);
 	plugin.microsoftCalendarService = new MicrosoftCalendarService(plugin, plugin.oauthService);
 	plugin.calendarProviderRegistry = new CalendarProviderRegistry();
@@ -166,17 +240,85 @@ export function initializeCalendarProviders(plugin: TaskNotesPlugin): void {
 }
 
 export async function registerBasesIntegration(plugin: TaskNotesPlugin): Promise<void> {
-	if (!plugin.settings?.enableBases || plugin.basesRegistered) {
+	if (!plugin.settings?.enableBases) {
+		clearBasesRegistrationRetry(plugin);
 		return;
 	}
 
+	if (plugin.basesRegistered && areTaskNotesBasesViewsRegistered(plugin)) {
+		clearBasesRegistrationRetry(plugin);
+		return;
+	}
+
+	plugin.basesRegistered = false;
+
 	try {
 		const { registerBasesTaskList } = await import("../bases/registration");
-		await registerBasesTaskList(plugin);
-		plugin.basesRegistered = true;
+		const registered = await registerBasesTaskList(plugin);
+		plugin.basesRegistered = registered;
+		if (registered) {
+			clearBasesRegistrationRetry(plugin);
+			return;
+		}
 	} catch (error) {
-		console.debug("[TaskNotes][Bases] Registration failed:", error);
+		tasknotesLogger.debug("[TaskNotes][Bases] Registration failed:", {
+			category: "internal",
+			operation: "registration",
+			error: error,
+		});
 	}
+
+	scheduleBasesRegistrationRetry(plugin);
+}
+
+function getEnabledBasesPlugin(plugin: TaskNotesPlugin): EnabledBasesPlugin | null {
+	return (
+		(plugin.app as unknown as AppWithInternalPlugins).internalPlugins?.getEnabledPluginById?.(
+			"bases"
+		) ?? null
+	);
+}
+
+function areTaskNotesBasesViewsRegistered(plugin: TaskNotesPlugin): boolean {
+	const registrations = getEnabledBasesPlugin(plugin)?.registrations;
+	return (
+		!!registrations &&
+		TASKNOTES_BASES_VIEW_TYPES.every((viewType) => Boolean(registrations[viewType]))
+	);
+}
+
+function clearBasesRegistrationRetry(plugin: TaskNotesPlugin): void {
+	if (plugin.basesRegistrationRetryIntervalId === null) {
+		return;
+	}
+
+	window.clearInterval(plugin.basesRegistrationRetryIntervalId);
+	plugin.basesRegistrationRetryIntervalId = null;
+}
+
+function scheduleBasesRegistrationRetry(plugin: TaskNotesPlugin): void {
+	if (
+		!plugin.settings?.enableBases ||
+		plugin.basesRegistrationRetryIntervalId !== null ||
+		areTaskNotesBasesViewsRegistered(plugin)
+	) {
+		return;
+	}
+
+	plugin.basesRegistrationRetryIntervalId = window.setInterval(() => {
+		if (plugin.basesRegistered && areTaskNotesBasesViewsRegistered(plugin)) {
+			clearBasesRegistrationRetry(plugin);
+			return;
+		}
+
+		if (!getEnabledBasesPlugin(plugin)) {
+			return;
+		}
+
+		void registerBasesIntegration(plugin);
+	}, 5000);
+
+	plugin.register(() => clearBasesRegistrationRetry(plugin));
 }
 
 export async function initializeHTTPAPI(plugin: TaskNotesPlugin): Promise<void> {
@@ -197,10 +339,18 @@ export async function initializeHTTPAPI(plugin: TaskNotesPlugin): Promise<void> 
 		plugin.taskService.setWebhookNotifier(plugin.apiService);
 		plugin.pomodoroService.setWebhookNotifier(plugin.apiService);
 		await plugin.apiService.start();
-		new Notice(`TaskNotes API started on port ${plugin.apiService.getPort()}`);
+		showNotice(
+			plugin.i18n.translate(msg({ message: "TaskNotes API started on port {port}", context: "notices.interface.apiStarted" }), {
+				port: plugin.apiService.getPort(),
+			})
+		);
 	} catch (error) {
-		console.error("Failed to initialize HTTP API:", error);
-		new Notice("Failed to start TaskNotes API server. Check console for details.");
+		tasknotesLogger.error("Failed to initialize HTTP API:", {
+			category: "provider",
+			operation: "initialize-http-api",
+			error: error,
+		});
+		showNotice(plugin.i18n.translate(msg({ message: "Failed to start TaskNotes API server. Check console for details.", context: "notices.interface.apiFailed" })));
 	}
 }
 
@@ -214,6 +364,7 @@ export async function initializeAfterLayoutReady(plugin: TaskNotesPlugin): Promi
 		if (plugin.settings.autoCreateDefaultBasesFiles) {
 			await plugin.ensureBasesViewFiles();
 		}
+		await plugin.ensureStarterNote();
 
 		plugin.injectCustomStyles();
 		registerActiveViews(plugin);
@@ -229,8 +380,15 @@ export async function initializeAfterLayoutReady(plugin: TaskNotesPlugin): Promi
 		plugin.setupDateChangeDetection();
 		initializeServicesLazily(plugin);
 		await registerBasesIntegration(plugin);
+		plugin.emitter.trigger(TASKNOTES_RUNTIME_LIFECYCLE_RAW_EVENTS["layout.ready"], {
+			timestamp: new Date().toISOString(),
+		});
 	} catch (error) {
-		console.error("Error during post-layout initialization:", error);
+		tasknotesLogger.error("Error during post-layout initialization:", {
+			category: "internal",
+			operation: "post-layout-initialization",
+			error: error,
+		});
 	}
 }
 
@@ -253,116 +411,220 @@ function registerEditorIntegrations(plugin: TaskNotesPlugin): void {
 	plugin.registerMarkdownPostProcessor(createReadingModeTaskLinkProcessor(plugin));
 }
 
+/**
+ * Runs one lazy initialization step, logging its failure so that the steps
+ * after it still run.
+ */
+async function runLazyInitStep(
+	operation: string,
+	step: () => void | Promise<void>
+): Promise<void> {
+	try {
+		await step();
+	} catch (error) {
+		tasknotesLogger.error("Error during lazy service initialization:", {
+			category: "internal",
+			operation: `lazy-service-initialization:${operation}`,
+			error: error,
+		});
+	}
+}
+
 export function initializeServicesLazily(plugin: TaskNotesPlugin): void {
-	setTimeout(async () => {
-		try {
-			plugin.pomodoroService = new PomodoroService(plugin);
-			await plugin.pomodoroService.initialize();
-			await plugin.icsSubscriptionService.initialize();
-
-			plugin.autoExportService = new AutoExportService(plugin);
-			plugin.autoExportService.start();
-
-			plugin.googleCalendarService.on("data-changed", () => {
-				plugin.notifyDataChanged(undefined, false, true);
-			});
-			await plugin.googleCalendarService.initialize();
-
-			plugin.taskCalendarSyncService = new (await import("../services/TaskCalendarSyncService"))
-				.TaskCalendarSyncService(plugin, plugin.googleCalendarService);
-
-			plugin.registerEvent(
-				plugin.emitter.on("file-deleted", (data: FileDeletedEventData) => {
-					if (!plugin.taskCalendarSyncService?.isEnabled()) {
-						return;
-					}
-
-					const eventIdKey = plugin.fieldMapper.toUserField("googleCalendarEventId");
-					const prevCache = data.prevCache as { frontmatter?: Record<string, unknown> } | undefined;
-					const eventId = prevCache?.frontmatter?.[eventIdKey];
-
-					if (typeof eventId === "string" && eventId.length > 0) {
-						plugin.taskCalendarSyncService
-							.deleteTaskFromCalendarByPath(data.path, eventId)
-							.catch((error) => {
-								console.warn(
-									"Failed to delete task from Google Calendar on file deletion:",
-									error
-								);
-							});
-					}
-				})
-			);
-
-			plugin.microsoftCalendarService.on("data-changed", () => {
-				plugin.notifyDataChanged(undefined, false, true);
-			});
-			await plugin.microsoftCalendarService.initialize();
-
-			await initializeHTTPAPI(plugin);
-
-			const { TaskLinkDetectionService } = await import("../services/TaskLinkDetectionService");
-			plugin.taskLinkDetectionService = new TaskLinkDetectionService(plugin);
-
-			const { InstantTaskConvertService } = await import(
-				"../services/InstantTaskConvertService"
-			);
-			plugin.instantTaskConvertService = new InstantTaskConvertService(
-				plugin,
-				plugin.statusManager,
-				plugin.priorityManager
-			);
-
-			const { createInstantConvertButtons } = await import("../editor/InstantConvertButtons");
-			plugin.registerEditorExtension(createInstantConvertButtons(plugin));
-
-			plugin.taskUpdateListenerForEditor = plugin.emitter.on(
-				EVENT_TASK_UPDATED,
-				(data: { path?: string; updatedTask?: TaskInfo }) => {
-					plugin.app.workspace.iterateRootLeaves((leaf) => {
-						if (leaf.view && leaf.view.getViewType() === "markdown") {
-							const editor = (leaf.view as MarkdownView).editor;
-							if (editor && (editor as Editor & { cm?: EditorView }).cm) {
-								const taskPath = data?.path || data?.updatedTask?.path;
-								dispatchTaskUpdate((editor as Editor & { cm: EditorView }).cm, taskPath);
-							}
-						}
-					});
+	window.setTimeout(() => {
+		void (async () => {
+			await runLazyInitStep("pomodoro", async () => {
+				if (!plugin.pomodoroService) {
+					plugin.pomodoroService = new PomodoroService(plugin);
+					await plugin.pomodoroService.initialize();
 				}
-			);
+			});
 
-			plugin.registerEvent(
-				plugin.app.workspace.on("active-leaf-change", (leaf) => {
-					setTimeout(() => {
-						if (leaf && leaf.view && leaf.view.getViewType() === "markdown") {
-							const editor = (leaf.view as MarkdownView).editor;
-							if (editor && (editor as Editor & { cm?: EditorView }).cm) {
-								dispatchTaskUpdate((editor as Editor & { cm: EditorView }).cm);
+			await runLazyInitStep("auto-export", () => {
+				plugin.autoExportService = new AutoExportService(plugin);
+				plugin.autoExportService.start();
+			});
+
+			if (!isCalendarIntegrationDisabledOnMobile(plugin.settings)) {
+				await runLazyInitStep("ics-subscriptions", () =>
+					plugin.icsSubscriptionService.initialize()
+				);
+
+				await runLazyInitStep("google-calendar", async () => {
+					plugin.googleCalendarService.on("data-changed", () => {
+						plugin.notifyDataChanged(undefined, false, true);
+					});
+					await plugin.googleCalendarService.initialize();
+
+					plugin.taskCalendarSyncService = new (
+						await import("../services/TaskCalendarSyncService")
+					).TaskCalendarSyncService(plugin, plugin.googleCalendarService);
+					await plugin.taskCalendarSyncService.initializeExternalFileReconciliation();
+					plugin.taskCalendarSyncService.timeblocks.initialize();
+					plugin.taskCalendarSyncService.timeblocks.registerVaultEvents();
+					plugin.taskCalendarSyncService.startRecoveryQueueProcessor();
+				});
+
+				await runLazyInitStep("google-calendar-task-events", () => {
+					plugin.registerEvent(
+						plugin.emitter.on("file-updated", (data: FileUpdatedEventData) => {
+							if (!plugin.taskCalendarSyncService || !data?.path) {
+								return;
 							}
-						}
-					}, 50);
-				})
-			);
 
-			plugin.registerEvent(
-				plugin.app.workspace.on("layout-change", () => {
-					setTimeout(() => {
-						const activeView = plugin.app.workspace.getActiveViewOfType(MarkdownView);
-						if (activeView) {
-							const editor = activeView.editor;
-							if (editor && (editor as Editor & { cm?: EditorView }).cm) {
-								dispatchTaskUpdate((editor as Editor & { cm: EditorView }).cm);
+							plugin.taskCalendarSyncService
+								.handleExternalTaskFileUpdated(data.path, data.updatedTask)
+								.catch((error) => {
+									tasknotesLogger.warn(
+										"Failed to reconcile externally updated task with Google Calendar:",
+										{
+											category: "provider",
+											operation: "reconcile-external-task-file-update",
+											error: error,
+										}
+									);
+								});
+						})
+					);
+
+					plugin.registerEvent(
+						plugin.emitter.on("file-deleted", (data: FileDeletedEventData) => {
+							if (!plugin.taskCalendarSyncService) {
+								return;
 							}
-						}
-					}, 100);
-				})
-			);
 
-			plugin.setupStatusBarEventListeners();
-			plugin.setupTimeTrackingEventListeners();
-			await plugin.checkForVersionUpdate();
-		} catch (error) {
-			console.error("Error during lazy service initialization:", error);
-		}
+							const eventIdKey =
+								plugin.fieldMapper.toUserField("googleCalendarEventId");
+							const exceptionEventIdKey = plugin.fieldMapper.toUserField(
+								"googleCalendarExceptionEventId"
+							);
+							const prevCache = data.prevCache as
+								| { frontmatter?: Record<string, unknown> }
+								| undefined;
+							const eventId = prevCache?.frontmatter?.[eventIdKey];
+							const exceptionEventId = prevCache?.frontmatter?.[exceptionEventIdKey];
+
+							if (
+								(typeof eventId === "string" && eventId.length > 0) ||
+								(typeof exceptionEventId === "string" &&
+									exceptionEventId.length > 0)
+							) {
+								plugin.taskCalendarSyncService
+									.deleteTaskFromCalendarByPath(
+										data.path,
+										typeof eventId === "string" ? eventId : undefined,
+										typeof exceptionEventId === "string"
+											? exceptionEventId
+											: undefined
+									)
+									.catch((error) => {
+										tasknotesLogger.warn(
+											"Failed to delete task from Google Calendar on file deletion:",
+											{
+												category: "provider",
+												operation:
+													"delete-task-google-calendar-on-file-deletion",
+												error: error,
+											}
+										);
+									});
+							}
+						})
+					);
+				});
+
+				await runLazyInitStep("microsoft-calendar", async () => {
+					plugin.microsoftCalendarService.on("data-changed", () => {
+						plugin.notifyDataChanged(undefined, false, true);
+					});
+					await plugin.microsoftCalendarService.initialize();
+				});
+			}
+
+			await runLazyInitStep("task-file-lifecycle-reconciliation", async () => {
+				plugin.taskFileLifecycleReconciliationService =
+					new TaskFileLifecycleReconciliationService(plugin);
+				await plugin.taskFileLifecycleReconciliationService.initialize();
+			});
+
+			await runLazyInitStep("http-api", () => initializeHTTPAPI(plugin));
+
+			await runLazyInitStep("editor-services", async () => {
+				const { TaskLinkDetectionService } = await import(
+					"../services/TaskLinkDetectionService"
+				);
+				plugin.taskLinkDetectionService = new TaskLinkDetectionService(plugin);
+
+				const { InstantTaskConvertService } = await import(
+					"../services/InstantTaskConvertService"
+				);
+				plugin.instantTaskConvertService = new InstantTaskConvertService(
+					plugin,
+					plugin.statusManager,
+					plugin.priorityManager
+				);
+
+				const { createInstantConvertButtons } = await import(
+					"../editor/InstantConvertButtons"
+				);
+				plugin.registerEditorExtension(createInstantConvertButtons(plugin));
+
+				plugin.taskUpdateListenerForEditor = plugin.emitter.on(
+					EVENT_TASK_UPDATED,
+					(data: { path?: string; updatedTask?: TaskInfo }) => {
+						plugin.app.workspace.iterateRootLeaves((leaf) => {
+							if (leaf.view && leaf.view.getViewType() === "markdown") {
+								const editor = (leaf.view as MarkdownView).editor;
+								const cm = getCodeMirrorEditor(editor);
+								if (cm) {
+									const taskPath = data?.path || data?.updatedTask?.path;
+									dispatchTaskUpdate(cm as EditorView, taskPath);
+								}
+							}
+						});
+					}
+				);
+
+				plugin.registerEvent(
+					plugin.app.workspace.on("active-leaf-change", (leaf) => {
+						window.setTimeout(() => {
+							if (leaf && leaf.view && leaf.view.getViewType() === "markdown") {
+								const editor = (leaf.view as MarkdownView).editor;
+								const cm = getCodeMirrorEditor(editor);
+								if (cm) {
+									dispatchTaskUpdate(cm as EditorView);
+								}
+							}
+						}, 50);
+					})
+				);
+
+				plugin.registerEvent(
+					plugin.app.workspace.on("layout-change", () => {
+						window.setTimeout(() => {
+							const activeView =
+								plugin.app.workspace.getActiveViewOfType(MarkdownView);
+							if (activeView) {
+								const editor = activeView.editor;
+								const cm = getCodeMirrorEditor(editor);
+								if (cm) {
+									dispatchTaskUpdate(cm as EditorView);
+								}
+							}
+						}, 100);
+					})
+				);
+			});
+
+			await runLazyInitStep("event-listeners", () => {
+				plugin.setupStatusBarEventListeners();
+				plugin.setupTimeTrackingEventListeners();
+			});
+
+			await runLazyInitStep("version-check", async () => {
+				await plugin.checkForVersionUpdate();
+				void plugin.checkForNewReleaseOnStartup();
+			});
+		})();
 	}, 10);
 }

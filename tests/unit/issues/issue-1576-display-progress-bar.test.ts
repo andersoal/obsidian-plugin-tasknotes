@@ -1,8 +1,6 @@
 import { createTaskCard, updateTaskCard } from "../../../src/ui/TaskCard";
 import { TaskFactory } from "../../helpers/mock-factories";
-import { App, MockObsidian } from "../../__mocks__/obsidian";
-
-jest.mock("obsidian");
+import { App, MockObsidian } from "../../helpers/obsidian-runtime";
 
 jest.mock("../../../src/utils/helpers", () => ({
 	calculateTotalTimeSpent: jest.fn(() => 0),
@@ -11,6 +9,7 @@ jest.mock("../../../src/utils/helpers", () => ({
 	getRecurringTaskCompletionText: jest.fn(() => "Not completed for this date"),
 	getRecurrenceDisplayText: jest.fn(() => "Daily"),
 	filterEmptyProjects: jest.fn((projects) => projects?.filter((p: string) => p && p.trim()) || []),
+	sanitizeForCssClass: jest.fn((value: string) => value.toLowerCase().replace(/\s+/g, "-")),
 }));
 
 jest.mock("../../../src/utils/dateUtils", () => ({
@@ -200,7 +199,7 @@ describe("Issue #1576 - Display Progress Bar on task cards", () => {
 		expect((card.querySelector(".task-card__progress-fill") as HTMLElement).style.width).toBe("100%");
 	});
 
-	it("treats non-x task markers as incomplete", () => {
+	it("treats non-cancelled non-x task markers as incomplete", () => {
 		const task = TaskFactory.createTask({
 			path: "tasks/custom-marker-task.md",
 			title: "Custom marker",
@@ -210,7 +209,7 @@ describe("Issue #1576 - Display Progress Bar on task cards", () => {
 		app.metadataCache.setCache(task.path, {
 			frontmatter: { title: task.title },
 			listItems: [
-				listItem("-", -1, 10), // not completed
+				listItem("/", -1, 10), // not completed
 				listItem("x", -1, 11), // completed
 			],
 		});
@@ -218,5 +217,25 @@ describe("Issue #1576 - Display Progress Bar on task cards", () => {
 		const card = createTaskCard(task, plugin, ["checklistProgress"]);
 		expect(card.querySelector(".task-card__progress-label")?.textContent).toBe("1/2");
 		expect((card.querySelector(".task-card__progress-fill") as HTMLElement).style.width).toBe("50%");
+	});
+
+	it("excludes cancelled task markers from checklist progress", () => {
+		const task = TaskFactory.createTask({
+			path: "tasks/cancelled-marker-task.md",
+			title: "Cancelled marker",
+		});
+
+		MockObsidian.createTestFile(task.path, "# Cancelled marker");
+		app.metadataCache.setCache(task.path, {
+			frontmatter: { title: task.title },
+			listItems: [
+				listItem("x", -1, 10),
+				listItem("-", -1, 11),
+			],
+		});
+
+		const card = createTaskCard(task, plugin, ["checklistProgress"]);
+		expect(card.querySelector(".task-card__progress-label")?.textContent).toBe("1/1");
+		expect((card.querySelector(".task-card__progress-fill") as HTMLElement).style.width).toBe("100%");
 	});
 });

@@ -1,9 +1,11 @@
-/* eslint-disable no-console */
 import { FilterQuery, ViewFilterState, ViewPreferences, SavedView } from "../types";
 import { EventEmitter } from "../utils/EventEmitter";
 import { FilterUtils } from "../utils/FilterUtils";
 import { App } from "obsidian";
 import type TaskNotesPlugin from "../main";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Services/ViewStateManager" });
 
 /**
  * Manages view-specific state like filter preferences across the application
@@ -53,8 +55,12 @@ export class ViewStateManager extends EventEmitter {
 			!Array.isArray(state.children) ||
 			typeof state.conjunction !== "string"
 		) {
-			console.warn(
-				`ViewStateManager: Ignoring old format filter state for ${viewType}, will use default`
+			tasknotesLogger.warn(
+				`ViewStateManager: Ignoring old format filter state for ${viewType}, will use default`,
+				{
+					category: "validation",
+					operation: "viewstatemanager-ignoring-old-format-filter-state",
+				}
 			);
 			// Clear the old format data
 			delete this.filterState[viewType];
@@ -98,14 +104,19 @@ export class ViewStateManager extends EventEmitter {
 	/**
 	 * Get view preferences for a specific view
 	 */
-	getViewPreferences<T = any>(viewType: string): T | undefined {
-		return this.viewPreferences[viewType];
+	getViewPreferences<T extends object = Record<string, unknown>>(
+		viewType: string
+	): T | undefined {
+		return this.viewPreferences[viewType] as T | undefined;
 	}
 
 	/**
 	 * Set view preferences for a specific view
 	 */
-	setViewPreferences<T = any>(viewType: string, preferences: T): void {
+	setViewPreferences<T extends object = Record<string, unknown>>(
+		viewType: string,
+		preferences: T
+	): void {
 		this.viewPreferences[viewType] = { ...preferences };
 		this.savePreferencesToStorage();
 		this.emit("view-preferences-changed", { viewType, preferences });
@@ -139,7 +150,11 @@ export class ViewStateManager extends EventEmitter {
 				this.filterState = JSON.parse(stored);
 			}
 		} catch (error) {
-			console.warn("Failed to load view filter state from storage:", error);
+			tasknotesLogger.warn("Failed to load view filter state from storage:", {
+				category: "persistence",
+				operation: "load-view-filter-state-storage",
+				error: error,
+			});
 			this.filterState = {};
 		}
 	}
@@ -151,7 +166,11 @@ export class ViewStateManager extends EventEmitter {
 		try {
 			this.app.saveLocalStorage(this.storageKey, JSON.stringify(this.filterState));
 		} catch (error) {
-			console.warn("Failed to save view filter state to storage:", error);
+			tasknotesLogger.warn("Failed to save view filter state to storage:", {
+				category: "persistence",
+				operation: "save-view-filter-state-storage",
+				error: error,
+			});
 		}
 	}
 
@@ -165,7 +184,11 @@ export class ViewStateManager extends EventEmitter {
 				this.viewPreferences = JSON.parse(stored);
 			}
 		} catch (error) {
-			console.warn("Failed to load view preferences from storage:", error);
+			tasknotesLogger.warn("Failed to load view preferences from storage:", {
+				category: "configuration",
+				operation: "load-view-preferences-storage",
+				error: error,
+			});
 			this.viewPreferences = {};
 		}
 	}
@@ -180,7 +203,11 @@ export class ViewStateManager extends EventEmitter {
 				JSON.stringify(this.viewPreferences)
 			);
 		} catch (error) {
-			console.warn("Failed to save view preferences to storage:", error);
+			tasknotesLogger.warn("Failed to save view preferences to storage:", {
+				category: "configuration",
+				operation: "save-view-preferences-storage",
+				error: error,
+			});
 		}
 	}
 
@@ -224,7 +251,7 @@ export class ViewStateManager extends EventEmitter {
 		};
 
 		this.savedViews.push(view);
-		this.saveSavedViewsToPluginData();
+		void this.saveSavedViewsToPluginData();
 		this.emit("saved-views-changed", this.getSavedViews());
 
 		return view;
@@ -253,7 +280,7 @@ export class ViewStateManager extends EventEmitter {
 			...clonedUpdates,
 		};
 
-		this.saveSavedViewsToPluginData();
+		void this.saveSavedViewsToPluginData();
 		this.emit("saved-views-changed", this.getSavedViews());
 	}
 
@@ -267,7 +294,7 @@ export class ViewStateManager extends EventEmitter {
 		}
 
 		this.savedViews.splice(viewIndex, 1);
-		this.saveSavedViewsToPluginData();
+		void this.saveSavedViewsToPluginData();
 		this.emit("saved-views-changed", this.getSavedViews());
 	}
 
@@ -291,7 +318,7 @@ export class ViewStateManager extends EventEmitter {
 	 */
 	clearAllSavedViews(): void {
 		this.savedViews = [];
-		this.saveSavedViewsToPluginData();
+		void this.saveSavedViewsToPluginData();
 		this.emit("saved-views-changed", this.getSavedViews());
 	}
 
@@ -302,7 +329,7 @@ export class ViewStateManager extends EventEmitter {
 		const view = this.savedViews.find((v) => v.id === viewId);
 		if (view) {
 			view.visibleProperties = properties;
-			this.saveSavedViewsToPluginData();
+			void this.saveSavedViewsToPluginData();
 			this.emit("saved-views-changed", this.getSavedViews());
 		}
 	}
@@ -339,7 +366,7 @@ export class ViewStateManager extends EventEmitter {
 		this.savedViews.splice(toIndex, 0, movedView);
 
 		// Save the reordered views
-		this.saveSavedViewsToPluginData();
+		void this.saveSavedViewsToPluginData();
 		this.emit("saved-views-changed", this.getSavedViews());
 	}
 
@@ -347,7 +374,7 @@ export class ViewStateManager extends EventEmitter {
 	 * Generate a unique ID for saved views
 	 */
 	private generateId(): string {
-		return Date.now().toString(36) + Math.random().toString(36).substr(2, 9);
+		return Date.now().toString(36) + Math.random().toString(36).slice(2, 11);
 	}
 
 	/**
@@ -365,8 +392,6 @@ export class ViewStateManager extends EventEmitter {
 				typeof localStorageData === "string" &&
 				this.savedViews.length === 0
 			) {
-				console.log("TaskNotes: Migrating saved views from localStorage to plugin data...");
-
 				// Parse localStorage data
 				const localStorageViews: SavedView[] = JSON.parse(localStorageData);
 
@@ -376,13 +401,13 @@ export class ViewStateManager extends EventEmitter {
 
 				// Clear localStorage after successful migration
 				this.app.saveLocalStorage(this.savedViewsStorageKey, null);
-
-				console.log(
-					`TaskNotes: Successfully migrated ${localStorageViews.length} saved views to plugin data.`
-				);
 			}
 		} catch (error) {
-			console.warn("Failed to load/migrate saved views:", error);
+			tasknotesLogger.warn("Failed to load/migrate saved views:", {
+				category: "persistence",
+				operation: "load-migrate-saved-views",
+				error: error,
+			});
 			this.savedViews = [];
 		}
 	}
@@ -398,7 +423,11 @@ export class ViewStateManager extends EventEmitter {
 			// Save to data.json
 			await this.plugin.saveSettings();
 		} catch (error) {
-			console.warn("Failed to save saved views to plugin data:", error);
+			tasknotesLogger.warn("Failed to save saved views to plugin data:", {
+				category: "persistence",
+				operation: "save-saved-views-plugin-data",
+				error: error,
+			});
 		}
 	}
 
@@ -433,7 +462,11 @@ export class ViewStateManager extends EventEmitter {
 			// Emit migration complete event
 			this.emit("migration-complete");
 		} catch (error) {
-			console.error("Error during ViewStateManager migration:", error);
+			tasknotesLogger.error("Error during ViewStateManager migration:", {
+				category: "configuration",
+				operation: "viewstatemanager-migration",
+				error: error,
+			});
 			// Fallback: ensure we have empty saved views
 			this.savedViews = [];
 			await this.saveSavedViewsToPluginData();

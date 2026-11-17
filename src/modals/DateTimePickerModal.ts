@@ -1,100 +1,367 @@
-import { App, Modal, Setting } from "obsidian";
+import { msg } from "@lingui/core/macro";
+import { App, Modal, Notice, setIcon } from "obsidian";
+import type TaskNotesPlugin from "../main";
+import { createI18nService, type MessageDescriptor, type InterpolationValues } from "../i18n";
+import { NaturalLanguageParser, type ParsedTaskData } from "../services/NaturalLanguageParser";
+import { attachDateInputBehavior } from "../ui/dateInputBehavior";
 
 export interface DateTimePickerOptions {
 	currentDate?: string | null;
 	currentTime?: string | null;
 	title?: string;
+	dateRole?: "due" | "scheduled";
+	showTime?: boolean;
+	plugin?: TaskNotesPlugin;
+	naturalLanguageParser?: NaturalLanguageDateParser;
 	onSelect: (date: string | null, time: string | null) => void;
 }
 
+export interface NaturalLanguageDateParser {
+	parseInput(input: string): ParsedTaskData;
+}
+
+export interface ParsedDateTimeSelection {
+	date: string;
+	time: string | null;
+}
+
+function pad(value: number): string {
+	return String(value).padStart(2, "0");
+}
+
+export function formatCalendarDate(year: number, monthIndex: number, day: number): string {
+	return `${year}-${pad(monthIndex + 1)}-${pad(day)}`;
+}
+
+export function getParsedDateTimeSelection(
+	parsed: Pick<ParsedTaskData, "dueDate" | "dueTime" | "scheduledDate" | "scheduledTime">,
+	dateRole?: "due" | "scheduled"
+): ParsedDateTimeSelection | null {
+	let primaryDate = parsed.scheduledDate || parsed.dueDate;
+	let primaryTime = parsed.scheduledDate ? parsed.scheduledTime : parsed.dueTime;
+
+	if (dateRole === "due") {
+		primaryDate = parsed.dueDate;
+		primaryTime = parsed.dueTime;
+	} else if (dateRole === "scheduled") {
+		primaryDate = parsed.scheduledDate;
+		primaryTime = parsed.scheduledTime;
+	}
+
+	if (primaryDate) {
+		return { date: primaryDate, time: primaryTime || null };
+	}
+
+	const fallbackDate = dateRole === "due" ? parsed.scheduledDate : parsed.dueDate;
+	const fallbackTime = dateRole === "due" ? parsed.scheduledTime : parsed.dueTime;
+
+	return fallbackDate ? { date: fallbackDate, time: fallbackTime || null } : null;
+}
+
+export function parseNaturalLanguageDateTime(
+	input: string,
+	parser: NaturalLanguageDateParser,
+	dateRole?: "due" | "scheduled"
+): ParsedDateTimeSelection | null {
+	const trimmed = input.trim();
+	if (!trimmed) return null;
+	return getParsedDateTimeSelection(parser.parseInput(trimmed), dateRole);
+}
+
+function addDays(date: Date, days: number): Date {
+	const result = new Date(date);
+	result.setDate(result.getDate() + days);
+	return result;
+}
+
+function nextMonday(from: Date): Date {
+	const result = new Date(from);
+	const daysUntilMonday = (1 - result.getDay() + 7) % 7 || 7;
+	result.setDate(result.getDate() + daysUntilMonday);
+	return result;
+}
+
 /**
- * Simple modal for picking date and time using native Obsidian components
+ * Calendar-first modal for selecting a task date and optional time.
  */
 export class DateTimePickerModal extends Modal {
-	private options: DateTimePickerOptions;
-	private dateInput: HTMLInputElement;
-	private timeInput: HTMLInputElement;
+	private readonly options: DateTimePickerOptions;
+	private readonly translate: (key: MessageDescriptor, values?: InterpolationValues) => string;
+	private selectedDate: string | null;
+	private naturalLanguageInput: HTMLInputElement | null = null;
+	private dateInput: HTMLInputElement | null = null;
+	private timeInput: HTMLInputElement | null = null;
+	private selectButtonEl: HTMLButtonElement | null = null;
+	private detachDateInputBehavior: (() => void) | null = null;
 
 	constructor(app: App, options: DateTimePickerOptions) {
 		super(app);
 		this.options = options;
+		const i18n = options.plugin?.i18n ?? createI18nService();
+		this.translate = i18n.translate.bind(i18n);
+		this.selectedDate = options.currentDate ?? null;
 	}
 
 	onOpen(): void {
 		const { contentEl } = this;
 		contentEl.empty();
-		contentEl.addClass("date-time-picker-modal");
+		contentEl.addClass("tasknotes-plugin", "date-time-picker-modal");
 
-		// Title
 		if (this.options.title) {
-			contentEl.createEl("h3", { text: this.options.title });
+			contentEl.createEl("h3", {
+				text: this.options.title,
+				cls: "date-time-picker-modal__title",
+			});
 		}
 
-		// Date input
-		new Setting(contentEl)
-			.setName("Date")
-			.addText((text) => {
-				this.dateInput = text.inputEl;
-				this.dateInput.type = "date";
-				if (this.options.currentDate) {
-					this.dateInput.value = this.options.currentDate;
-				}
-			});
+		this.renderQuickActions(contentEl);
+		this.renderNaturalLanguageInput(contentEl);
+		this.renderDateInput(contentEl);
+		if (this.shouldShowTime()) {
+			this.renderTimeInput(contentEl);
+		}
+		this.renderActions(contentEl);
+		this.updateSelectButtonState();
 
-		// Time input (optional)
-		new Setting(contentEl)
-			.setName("Time (optional)")
-			.addText((text) => {
-				this.timeInput = text.inputEl;
-				this.timeInput.type = "time";
-				if (this.options.currentTime) {
-					this.timeInput.value = this.options.currentTime;
-				}
-			});
-
-		// Buttons
-		new Setting(contentEl)
-			.addButton((btn) =>
-				btn
-					.setButtonText("Cancel")
-					.onClick(() => {
-						this.close();
-					})
-			)
-			.addButton((btn) =>
-				btn
-					.setButtonText("Select")
-					.setCta()
-					.onClick(() => {
-						const date = this.dateInput.value || null;
-						const time = this.timeInput.value || null;
-						this.options.onSelect(date, time);
-						this.close();
-					})
-			);
-
-		// Focus date input
-		setTimeout(() => {
-			this.dateInput.focus();
-		}, 100);
-
-		// Handle Enter key
-		const handleEnter = (e: KeyboardEvent) => {
-			if (e.key === "Enter") {
-				e.preventDefault();
-				const date = this.dateInput.value || null;
-				const time = this.timeInput.value || null;
-				this.options.onSelect(date, time);
-				this.close();
+		window.setTimeout(() => {
+			// Prefer the natural language input when it is enabled and rendered,
+			// so keyboard users land on the NLP box first (matches user expectation
+			// from Quick Actions). Fall back to the date input otherwise.
+			if (this.canUseNaturalLanguageInput() && this.naturalLanguageInput) {
+				this.naturalLanguageInput.focus();
+			} else {
+				this.dateInput?.focus();
 			}
-		};
-
-		this.dateInput.addEventListener("keydown", handleEnter);
-		this.timeInput.addEventListener("keydown", handleEnter);
+		}, 100);
 	}
 
 	onClose(): void {
-		const { contentEl } = this;
-		contentEl.empty();
+		this.detachDateInputBehavior?.();
+		this.detachDateInputBehavior = null;
+		this.contentEl.empty();
+	}
+
+	private renderQuickActions(container: HTMLElement): void {
+		const today = new Date();
+		const quickActions = [
+			{ label: this.translate(msg({ message: "Today", context: "views.agenda.today" })), date: today },
+			{
+				label: this.translate(msg({ message: "Tomorrow", context: "settings.defaults.options.tomorrow" })),
+				date: addDays(today, 1),
+			},
+			{
+				label: this.translate(msg({ message: "Next week", context: "settings.defaults.options.nextWeek" })),
+				date: nextMonday(today),
+			},
+		];
+
+		const row = container.createDiv({ cls: "date-time-picker-modal__quick-actions" });
+		for (const action of quickActions) {
+			const button = row.createEl("button", {
+				text: action.label,
+				cls: "date-time-picker-modal__quick-button",
+				attr: { type: "button" },
+			});
+			button.addEventListener("click", () => {
+				this.selectDate(
+					formatCalendarDate(
+						action.date.getFullYear(),
+						action.date.getMonth(),
+						action.date.getDate()
+					)
+				);
+			});
+		}
+	}
+
+	private renderNaturalLanguageInput(container: HTMLElement): void {
+		if (!this.canUseNaturalLanguageInput()) return;
+
+		const row = container.createDiv({ cls: "date-time-picker-modal__nlp-row" });
+		this.naturalLanguageInput = row.createEl("input", {
+			cls: "date-time-picker-modal__nlp-input",
+			attr: {
+				type: "text",
+				placeholder: this.translate(msg({ message: "Enter a date or date/time", context: "modals.dateTimePicker.placeholder" })),
+				"aria-label": this.translate(msg({ message: "Natural language date", context: "modals.dateTimePicker.naturalLanguage" })),
+			},
+		});
+		this.naturalLanguageInput.addEventListener("keydown", (event) => {
+			if (event.key !== "Enter") return;
+			event.preventDefault();
+			this.applyNaturalLanguageInput();
+		});
+
+		const applyButton = row.createEl("button", {
+			cls: "clickable-icon date-time-picker-modal__nlp-button",
+			attr: {
+				type: "button",
+				"aria-label": this.translate(msg({ message: "Apply natural language date", context: "modals.dateTimePicker.apply" })),
+				title: this.translate(msg({ message: "Apply natural language date", context: "modals.dateTimePicker.apply" })),
+			},
+		});
+		setIcon(applyButton, "wand");
+		applyButton.addEventListener("click", () => this.applyNaturalLanguageInput());
+	}
+
+	private renderDateInput(container: HTMLElement): void {
+		const field = container.createDiv({ cls: "date-time-picker-modal__date-field" });
+		field.createEl("label", {
+			text: this.translate(msg({ message: "Date", context: "components.dateContextMenu.dateLabel" })),
+			cls: "date-time-picker-modal__field-label",
+			attr: { for: "tasknotes-date-time-picker-date" },
+		});
+
+		const control = field.createDiv({ cls: "date-time-picker-modal__native-date-control" });
+		this.dateInput = control.createEl("input", {
+			cls: "date-time-picker-modal__date-input",
+			attr: {
+				id: "tasknotes-date-time-picker-date",
+				type: "date",
+				value: this.selectedDate ?? "",
+				"aria-label": this.translate(msg({ message: "Date", context: "components.dateContextMenu.dateLabel" })),
+			},
+		});
+		const updateDateFromInput = () => {
+			this.updateSelectedDate(this.dateInput?.value || null);
+		};
+		this.dateInput.addEventListener("input", updateDateFromInput);
+		this.dateInput.addEventListener("change", updateDateFromInput);
+		this.detachDateInputBehavior = attachDateInputBehavior(this.dateInput, {
+			onCommit: (value) => this.updateSelectedDate(value),
+		});
+		this.dateInput.addEventListener("keydown", (event) => {
+			if (event.key === "Enter" && this.dateInput?.value) {
+				event.preventDefault();
+				this.updateSelectedDate(this.dateInput.value);
+				this.confirmSelectedDate();
+			}
+		});
+
+		const pickerButton = control.createEl("button", {
+			cls: "clickable-icon date-time-picker-modal__native-date-button",
+			attr: {
+				type: "button",
+				"aria-label": this.translate(msg({ message: "Open native date picker", context: "modals.dateTimePicker.nativePicker" })),
+				title: this.translate(msg({ message: "Open native date picker", context: "modals.dateTimePicker.nativePicker" })),
+			},
+		});
+		setIcon(pickerButton, "calendar-days");
+		pickerButton.addEventListener("click", () => {
+			this.dateInput?.showPicker?.();
+			this.dateInput?.focus();
+		});
+	}
+
+	private renderTimeInput(container: HTMLElement): void {
+		const field = container.createDiv({ cls: "date-time-picker-modal__time-field" });
+		field.createEl("label", {
+			text: this.translate(msg({ message: "Time (optional)", context: "contextMenus.date.modal.timeLabel" })),
+			cls: "date-time-picker-modal__field-label",
+			attr: { for: "tasknotes-date-time-picker-time" },
+		});
+
+		this.timeInput = field.createEl("input", {
+			cls: "date-time-picker-modal__time-input",
+			attr: {
+				id: "tasknotes-date-time-picker-time",
+				type: "time",
+				value: this.options.currentTime ?? "",
+			},
+		});
+		this.timeInput.addEventListener("keydown", (event) => {
+			if (event.key === "Enter" && this.selectedDate) {
+				event.preventDefault();
+				this.confirmSelectedDate();
+			}
+		});
+	}
+
+	private renderActions(container: HTMLElement): void {
+		const actions = container.createDiv({ cls: "date-time-picker-modal__actions" });
+
+		if (this.options.currentDate) {
+			const clearButton = actions.createEl("button", {
+				text: this.translate(msg({ message: "Clear date", context: "contextMenus.date.clearDate" })),
+				cls: "date-time-picker-modal__action-button",
+				attr: { type: "button" },
+			});
+			clearButton.addEventListener("click", () => {
+				this.options.onSelect(null, null);
+				this.close();
+			});
+		}
+
+		const cancelButton = actions.createEl("button", {
+			text: this.translate(msg({ message: "Cancel", context: "common.cancel" })),
+			cls: "date-time-picker-modal__action-button",
+			attr: { type: "button" },
+		});
+		cancelButton.addEventListener("click", () => this.close());
+
+		this.selectButtonEl = actions.createEl("button", {
+			text: this.translate(msg({ message: "Select", context: "contextMenus.date.modal.select" })),
+			cls: "mod-cta date-time-picker-modal__action-button",
+			attr: { type: "button" },
+		});
+		this.selectButtonEl.addEventListener("click", () => this.confirmSelectedDate());
+	}
+
+	private selectDate(date: string): void {
+		this.updateSelectedDate(date);
+		this.confirmSelectedDate();
+	}
+
+	private updateSelectedDate(date: string | null): void {
+		this.selectedDate = date;
+		if (this.dateInput && this.dateInput.value !== (date ?? "")) {
+			this.dateInput.value = date ?? "";
+		}
+		this.updateSelectButtonState();
+	}
+
+	private confirmSelectedDate(): void {
+		if (!this.selectedDate) return;
+		this.options.onSelect(
+			this.selectedDate,
+			this.shouldShowTime() ? this.timeInput?.value || null : null
+		);
+		this.close();
+	}
+
+	private updateSelectButtonState(): void {
+		if (!this.selectButtonEl) return;
+		this.selectButtonEl.disabled = !this.selectedDate;
+	}
+
+	private canUseNaturalLanguageInput(): boolean {
+		if (this.options.naturalLanguageParser) return true;
+		return Boolean(this.options.plugin?.settings.enableNaturalLanguageInput);
+	}
+
+	private shouldShowTime(): boolean {
+		return this.options.showTime !== false;
+	}
+
+	private getNaturalLanguageParser(): NaturalLanguageDateParser | null {
+		if (this.options.naturalLanguageParser) return this.options.naturalLanguageParser;
+		if (!this.options.plugin?.settings.enableNaturalLanguageInput) return null;
+		return NaturalLanguageParser.fromPlugin(this.options.plugin);
+	}
+
+	private applyNaturalLanguageInput(): void {
+		const parser = this.getNaturalLanguageParser();
+		const input = this.naturalLanguageInput?.value ?? "";
+		const selection = parser
+			? parseNaturalLanguageDateTime(input, parser, this.options.dateRole)
+			: null;
+
+		if (!selection) {
+			new Notice(this.translate(msg({ message: "Could not find a date in that text.", context: "modals.dateTimePicker.notFound" })));
+			return;
+		}
+
+		this.options.onSelect(selection.date, this.shouldShowTime() ? selection.time : null);
+		this.close();
 	}
 }

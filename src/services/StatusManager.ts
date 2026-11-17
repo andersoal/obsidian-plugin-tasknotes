@@ -1,50 +1,112 @@
+import { uiData } from "../i18n/dataText";
+
 import { StatusConfig } from "../types";
+import { normalizeStatusConfigValue } from "../core/fieldMapping";
+import { isSupportedColorValue, normalizeThemeColor } from "../utils/themeColors";
 
 /**
  * Service for managing custom task statuses
  */
 export class StatusManager {
-	constructor(private statuses: StatusConfig[], private defaultStatus: string = "open") {}
+	constructor(
+		private statuses: StatusConfig[],
+		private defaultStatus = "open"
+	) {}
+
+	normalizeStatusValue(value: unknown): string {
+		return normalizeStatusConfigValue(value, this.statuses) ?? String(value);
+	}
+
+	private findStatusIndex(statuses: StatusConfig[], statusValue: string): number {
+		const normalizedValue = this.normalizeStatusValue(statusValue);
+		return statuses.findIndex(
+			(status) => this.normalizeStatusValue(status.value) === normalizedValue
+		);
+	}
+
+	private getCycleStatuses(): StatusConfig[] {
+		return this.getStatusesByOrder().filter((status) => !status.excludeFromCycle);
+	}
 
 	/**
 	 * Get next status in cycle from current status
 	 */
 	getNextStatus(currentStatus: string): string {
-		const sortedStatuses = this.getStatusesByOrder();
-		const currentIndex = sortedStatuses.findIndex((s) => s.value === currentStatus);
-
-		if (currentIndex === -1) {
-			// Current status not found, return first status
-			return sortedStatuses[0]?.value || this.defaultStatus;
+		const currentStatusConfig = this.getStatusConfig(currentStatus);
+		const normalizedCurrentStatus = currentStatusConfig
+			? this.normalizeStatusValue(currentStatusConfig.value)
+			: undefined;
+		const normalizedConfiguredNextStatus = currentStatusConfig?.nextStatus
+			? this.normalizeStatusValue(currentStatusConfig.nextStatus)
+			: undefined;
+		const configuredNextStatus =
+			normalizedConfiguredNextStatus &&
+			normalizedConfiguredNextStatus !== normalizedCurrentStatus
+				? this.getStatusConfig(normalizedConfiguredNextStatus)
+				: undefined;
+		if (configuredNextStatus) {
+			return configuredNextStatus.value;
 		}
 
-		// Get next status, cycling to first if at end
-		const nextIndex = (currentIndex + 1) % sortedStatuses.length;
-		return sortedStatuses[nextIndex].value;
+		const cycleStatuses = this.getCycleStatuses();
+		const currentIndex = this.findStatusIndex(cycleStatuses, currentStatus);
+
+		if (cycleStatuses.length === 0) {
+			return currentStatusConfig?.value || this.defaultStatus;
+		}
+
+		if (currentIndex !== -1) {
+			// Get next status, cycling to first if at end
+			const nextIndex = (currentIndex + 1) % cycleStatuses.length;
+			return cycleStatuses[nextIndex].value;
+		}
+
+		if (!currentStatusConfig) {
+			// Current status not found, return first cycleable status
+			return cycleStatuses[0]?.value || this.defaultStatus;
+		}
+
+		return (
+			cycleStatuses.find((status) => status.order > currentStatusConfig.order)?.value ||
+			cycleStatuses[0].value
+		);
 	}
 
 	/**
 	 * Get previous status in cycle from current status (reverse cycling)
 	 */
 	getPreviousStatus(currentStatus: string): string {
-		const sortedStatuses = this.getStatusesByOrder();
-		const currentIndex = sortedStatuses.findIndex((s) => s.value === currentStatus);
+		const cycleStatuses = this.getCycleStatuses();
+		const currentIndex = this.findStatusIndex(cycleStatuses, currentStatus);
 
-		if (currentIndex === -1) {
-			// Current status not found, return last status
-			return sortedStatuses[sortedStatuses.length - 1]?.value || this.defaultStatus;
+		if (cycleStatuses.length === 0) {
+			return this.getStatusConfig(currentStatus)?.value || this.defaultStatus;
 		}
 
-		// Get previous status, cycling to last if at beginning
-		const prevIndex = (currentIndex - 1 + sortedStatuses.length) % sortedStatuses.length;
-		return sortedStatuses[prevIndex].value;
+		if (currentIndex !== -1) {
+			// Get previous status, cycling to last if at beginning
+			const prevIndex = (currentIndex - 1 + cycleStatuses.length) % cycleStatuses.length;
+			return cycleStatuses[prevIndex].value;
+		}
+
+		const currentStatusConfig = this.getStatusConfig(currentStatus);
+		if (!currentStatusConfig) {
+			// Current status not found, return last cycleable status
+			return cycleStatuses[cycleStatuses.length - 1]?.value || this.defaultStatus;
+		}
+
+		return (
+			[...cycleStatuses].reverse().find((status) => status.order < currentStatusConfig.order)
+				?.value || cycleStatuses[cycleStatuses.length - 1].value
+		);
 	}
 
 	/**
 	 * Get status configuration by value
 	 */
 	getStatusConfig(value: string): StatusConfig | undefined {
-		return this.statuses.find((s) => s.value === value);
+		const normalizedValue = this.normalizeStatusValue(value);
+		return this.statuses.find((s) => this.normalizeStatusValue(s.value) === normalizedValue);
 	}
 
 	/**
@@ -52,6 +114,18 @@ export class StatusManager {
 	 */
 	getCompletedStatuses(): string[] {
 		return this.statuses.filter((s) => s.isCompleted).map((s) => s.value);
+	}
+
+	/**
+	 * Get the status explicitly configured to follow the first completed status,
+	 * the one toggleStatus completes to. Unlike getNextStatus, this never falls back
+	 * to cycle order, so a recurring series keeps its status unless the user has
+	 * said what comes after done.
+	 */
+	getConfiguredStatusAfterCompletion(): string | undefined {
+		const completed = this.getStatusConfig(this.getCompletedStatuses()[0] ?? "");
+		const next = completed?.nextStatus ? this.getStatusConfig(completed.nextStatus) : undefined;
+		return next && !next.isCompleted ? next.value : undefined;
 	}
 
 	/**
@@ -85,17 +159,13 @@ export class StatusManager {
 	}
 
 	/**
-	 * Get CSS variables for status colors
+	 * Get CSS variables for status colors.
 	 */
-	getStatusStyles(): string {
-		const cssRules: string[] = [];
-
-		for (const status of this.statuses) {
-			const cssClass = `--status-${status.value.replace(/[^a-zA-Z0-9-]/g, "-")}-color`;
-			cssRules.push(`${cssClass}: ${status.color};`);
-		}
-
-		return `:root { ${cssRules.join(" ")} }`;
+	getStatusColorVariables(): ReadonlyArray<readonly [string, string]> {
+		return this.statuses.map((status) => [
+			`--status-${status.value.replace(/[^a-zA-Z0-9-]/g, "-")}-color`,
+			normalizeThemeColor(status.color),
+		]);
 	}
 
 	/**
@@ -160,8 +230,8 @@ export class StatusManager {
 				errors.push("Status labels cannot be empty");
 				break;
 			}
-			if (!status.color || !status.color.match(/^#[0-9a-fA-F]{6}$/)) {
-				errors.push("Status colors must be valid hex colors (#rrggbb)");
+			if (!isSupportedColorValue(status.color)) {
+				errors.push("Status colors must be valid CSS colors or Obsidian theme colors");
 				break;
 			}
 		}
@@ -198,9 +268,10 @@ export class StatusManager {
 		return {
 			id,
 			value: "new-status",
-			label: "New status",
+			label: uiData("New status", "Writable persisted seed for a new user-configured label; not a display getter"),
 			color: "#808080",
 			isCompleted: false,
+			excludeFromCycle: false,
 			order,
 			autoArchive: false,
 			autoArchiveDelay: 5,

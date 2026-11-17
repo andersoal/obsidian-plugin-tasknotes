@@ -1,3 +1,6 @@
+import { uiLocale } from "../i18n/runtime";
+import { uiText } from "../i18n/runtime";
+import { msg } from "@lingui/core/macro";
 import {
 	App,
 	Modal,
@@ -8,6 +11,9 @@ import {
 	stringifyYaml,
 	TFile,
 	setTooltip,
+	getFrontMatterInfo,
+	parseLinktext,
+	moment as obsidianMoment,
 } from "obsidian";
 import TaskNotesPlugin from "../main";
 import { openFileSelector } from "./FileSelectorModal";
@@ -18,8 +24,30 @@ import {
 	appHasDailyNotesPluginLoaded,
 } from "obsidian-daily-notes-interface";
 import { formatDateForStorage } from "../utils/dateUtils";
-import { TranslationKey } from "../i18n";
+import { colorValueToInputValue, normalizeThemeColor } from "../utils/themeColors";
+import { configureThemeColorInput } from "../settings/components/CardComponent";
+import type { InterpolationValues, MessageDescriptor } from "../i18n";
+import { modifyVaultFile } from "../services/VaultMutationService";
 import { TaskInfo } from "../types";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Modals/TimeblockInfoModal" });
+
+type DailyNoteMoment = Parameters<typeof getDailyNote>[0];
+
+function getDailyNoteMoment(input: string, format: string): DailyNoteMoment {
+	return (obsidianMoment as unknown as (input: string, format: string) => DailyNoteMoment)(
+		input,
+		format
+	);
+}
+
+function parseFrontmatterRecord(frontmatterText: string): Record<string, unknown> {
+	const parsed = parseYaml(frontmatterText);
+	return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+		? (parsed as Record<string, unknown>)
+		: {};
+}
 
 export interface TimeBlock {
 	title: string;
@@ -40,7 +68,7 @@ export class TimeblockInfoModal extends Modal {
 	private timeblockDate: string;
 	private plugin: TaskNotesPlugin;
 	private originalTimeblock: TimeBlock;
-	private translate: (key: TranslationKey, variables?: Record<string, any>) => string;
+	private translate: (key: MessageDescriptor, variables?: InterpolationValues) => string;
 
 	// Form fields
 	private titleInput: HTMLInputElement;
@@ -49,6 +77,8 @@ export class TimeblockInfoModal extends Modal {
 
 	// Attachment management
 	private selectedAttachments: TAbstractFile[] = [];
+	// Preserve existing link text rather than rewriting it to a file path on save.
+	private attachmentLinks = new Map<string, string>();
 	private attachmentsList: HTMLElement;
 	private keyboardHandler: ((e: KeyboardEvent) => void) | null = null;
 
@@ -82,76 +112,91 @@ export class TimeblockInfoModal extends Modal {
 		this.keyboardHandler = (e: KeyboardEvent) => {
 			if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
 				e.preventDefault();
-				this.handleSave();
+				void this.handleSave();
 			}
 		};
 		this.containerEl.addEventListener("keydown", this.keyboardHandler);
 
-		new Setting(contentEl).setName(this.translate("modals.timeblockInfo.editHeading")).setHeading();
+		new Setting(contentEl)
+			.setName(this.translate(msg({ message: "Edit timeblock", context: "modals.timeblockInfo.editHeading" })))
+			.setHeading();
 
 		// Date and time display (read-only)
 		const dateDisplay = contentEl.createDiv({ cls: "timeblock-date-display" });
-		dateDisplay.createEl("strong", { text: this.translate("modals.timeblockInfo.dateTimeLabel") });
-		const dateText = `${this.eventDate.toLocaleDateString()} from ${this.timeblock.startTime} to ${this.timeblock.endTime}`;
+		dateDisplay.createEl("strong", {
+			text: this.translate(msg({ message: "Date & time: ", context: "modals.timeblockInfo.dateTimeLabel" })),
+		});
+		const dateText = uiText(msg({ message: "{value1} from {startTime} to {endTime}", context: "modals/TimeblockInfoModal: TimeblockInfoModal.onOpen display" }), { value1: this.eventDate.toLocaleDateString(uiLocale()), startTime: this.timeblock.startTime, endTime: this.timeblock.endTime });
 		dateDisplay.createSpan({ text: dateText });
 
 		// Title field (editable)
 		new Setting(contentEl)
-			.setName(this.translate("modals.timeblockInfo.titleLabel"))
-			.setDesc(this.translate("modals.timeblockInfo.titleDesc"))
+			.setName(this.translate(msg({ message: "Title", context: "modals.timeblockInfo.titleLabel" })))
+			.setDesc(this.translate(msg({ message: "Title for your timeblock", context: "modals.timeblockInfo.titleDesc" })))
 			.addText((text) => {
 				this.titleInput = text.inputEl;
-				text.setPlaceholder(this.translate("modals.timeblockInfo.titlePlaceholder"))
+				text.setPlaceholder(this.translate(msg({ message: "e.g., Deep work session", context: "modals.timeblockInfo.titlePlaceholder" })))
 					.setValue(this.timeblock.title || "")
 					.onChange(() => this.validateForm());
 			});
 
 		// Description (editable)
 		new Setting(contentEl)
-			.setName(this.translate("modals.timeblockInfo.descriptionLabel"))
-			.setDesc(this.translate("modals.timeblockInfo.descriptionDesc"))
+			.setName(this.translate(msg({ message: "Description", context: "modals.timeblockInfo.descriptionLabel" })))
+			.setDesc(this.translate(msg({ message: "Optional description for the timeblock", context: "modals.timeblockInfo.descriptionDesc" })))
 			.addTextArea((text) => {
 				this.descriptionInput = text.inputEl;
-				text.setPlaceholder(this.translate("modals.timeblockInfo.descriptionPlaceholder")).setValue(
-					this.timeblock.description || ""
-				);
+				text.setPlaceholder(
+					this.translate(msg({ message: "Focus on new features, no interruptions", context: "modals.timeblockInfo.descriptionPlaceholder" }))
+				).setValue(this.timeblock.description || "");
 				this.descriptionInput.rows = 3;
 			});
 
 		// Color (editable)
 		new Setting(contentEl)
-			.setName(this.translate("modals.timeblockInfo.colorLabel"))
-			.setDesc(this.translate("modals.timeblockInfo.colorDesc"))
+			.setName(this.translate(msg({ message: "Color", context: "modals.timeblockInfo.colorLabel" })))
+			.setDesc(this.translate(msg({ message: "Optional color for the timeblock", context: "modals.timeblockInfo.colorDesc" })))
 			.addText((text) => {
 				this.colorInput = text.inputEl;
-				text.setPlaceholder(this.translate("modals.timeblockInfo.colorPlaceholder")).setValue(this.timeblock.color || this.plugin.settings.calendarViewSettings.defaultTimeblockColor);
-				this.colorInput.type = "color";
+				text.setPlaceholder(
+					this.translate(msg({ message: "#3b82f6", context: "modals.timeblockInfo.colorPlaceholder" }))
+				).setValue(
+					colorValueToInputValue(
+						this.timeblock.color ||
+							this.plugin.settings.calendarViewSettings.defaultTimeblockColor
+					)
+				);
+				configureThemeColorInput(this.colorInput);
 			});
 
 		// Attachments (editable)
 		new Setting(contentEl)
-			.setName(this.translate("modals.timeblockInfo.attachmentsLabel"))
-			.setDesc(this.translate("modals.timeblockInfo.attachmentsDesc"))
+			.setName(this.translate(msg({ message: "Attachments", context: "modals.timeblockInfo.attachmentsLabel" })))
+			.setDesc(this.translate(msg({ message: "Files or notes linked to this timeblock", context: "modals.timeblockInfo.attachmentsDesc" })))
 			.addButton((button) => {
 				button
-					.setButtonText(this.translate("modals.timeblockInfo.addAttachmentButton"))
-					.setTooltip(this.translate("modals.timeblockInfo.addAttachmentTooltip"))
+					.setButtonText(this.translate(msg({ message: "Add attachment", context: "modals.timeblockInfo.addAttachmentButton" })))
+					.setTooltip(this.translate(msg({ message: "Select a file or note using fuzzy search", context: "modals.timeblockInfo.addAttachmentTooltip" })))
 					.onClick(() => {
-						openFileSelector(this.plugin, (file) => {
-							if (file) this.addAttachment(file);
-						}, {
-							placeholder: "Search files or type to create new...",
-							filter: "all",
-							sortOrder:
-								this.plugin.settings.calendarViewSettings
-									.timeblockAttachmentSearchOrder,
-						});
+						openFileSelector(
+							this.plugin,
+							(file) => {
+								if (file instanceof TAbstractFile) this.addAttachment(file);
+							},
+							{
+								placeholder: this.translate(msg({ message: "Search files or type to create new...", context: "modals.fileSelector.placeholder" })),
+								filter: "all",
+								sortOrder:
+									this.plugin.settings.calendarViewSettings
+										.timeblockAttachmentSearchOrder,
+							}
+						);
 					});
 			})
 			.addButton((button) => {
 				button
-					.setButtonText("Add task")
-					.setTooltip("Select task")
+					.setButtonText(this.translate(msg({ message: "Add task", context: "modals.task.dependencies.addTaskButton" })))
+					.setTooltip(this.translate(msg({ message: "Select task", context: "modals.taskSelector.title" })))
 					.onClick(() => {
 						void this.openTaskSelectorForTitle();
 					});
@@ -166,31 +211,84 @@ export class TimeblockInfoModal extends Modal {
 
 		// Buttons
 		const buttonContainer = contentEl.createDiv({ cls: "timeblock-modal-buttons" });
-		buttonContainer.style.display = "flex";
-		buttonContainer.style.justifyContent = "space-between";
-		buttonContainer.style.alignItems = "center";
-		buttonContainer.style.marginTop = "20px";
+		buttonContainer.classList.remove(
+			"tn-static-display-block-2a1b75c9",
+			"tn-static-display-flex-4d51fc62",
+			"tn-static-display-flex-8bb39979",
+			"tn-static-display-inline-block-60e32dcb",
+			"tn-static-display-inline-cccfa456",
+			"tn-static-display-inline-flex-f984c520",
+			"tn-static-display-none-6b99de8b",
+			"tn-static-min-height-800px-997b4c8c"
+		);
+		buttonContainer.classList.add("tn-static-display-flex-75816cae");
+		buttonContainer.classList.remove(
+			"tn-static-justify-content-center-03c4bb6f",
+			"tn-static-justify-content-flex-end-455f8cca"
+		);
+		buttonContainer.classList.add("tn-static-justify-content-space-between-a562f4fd");
+		buttonContainer.classList.remove(
+			"tn-static-align-items-baseline-4b95b5c7",
+			"tn-static-align-items-flex-start-0486f781"
+		);
+		buttonContainer.classList.add("tn-static-align-items-center-7c619740");
+		buttonContainer.classList.remove(
+			"tn-static-font-size-12px-b0cc7e05",
+			"tn-static-margin-top-0-5rem-3dc98b5e",
+			"tn-static-margin-top-0-d462248a",
+			"tn-static-margin-top-12px-91e0f558",
+			"tn-static-margin-top-16px-1b0f4999",
+			"tn-static-margin-top-1rem-2239d6d5",
+			"tn-static-margin-top-30px-2fbbbcd4",
+			"tn-static-margin-top-4px-96ad6099",
+			"tn-static-margin-top-8px-8a77e5a3",
+			"tn-static-margin-top-8px-f4f01e68"
+		);
+		buttonContainer.classList.add("tn-static-margin-top-20px-a26bda7d");
 
 		// Delete button (left side)
 		const deleteButton = buttonContainer.createEl("button", {
-			text: this.translate("modals.timeblockInfo.deleteButton"),
+			text: this.translate(msg({ message: "Delete timeblock", context: "modals.timeblockInfo.deleteButton" })),
 			cls: "mod-warning timeblock-delete-button",
 		});
-		deleteButton.addEventListener("click", () => this.handleDelete());
+		deleteButton.addEventListener("click", () => {
+			void this.handleDelete();
+		});
 
 		// Right side buttons container
 		const rightButtons = buttonContainer.createDiv({ cls: "timeblock-modal-buttons-right" });
-		rightButtons.style.display = "flex";
-		rightButtons.style.gap = "8px";
+		rightButtons.classList.remove(
+			"tn-static-display-block-2a1b75c9",
+			"tn-static-display-flex-4d51fc62",
+			"tn-static-display-flex-8bb39979",
+			"tn-static-display-inline-block-60e32dcb",
+			"tn-static-display-inline-cccfa456",
+			"tn-static-display-inline-flex-f984c520",
+			"tn-static-display-none-6b99de8b",
+			"tn-static-min-height-800px-997b4c8c"
+		);
+		rightButtons.classList.add("tn-static-display-flex-75816cae");
+		rightButtons.classList.remove(
+			"tn-static-display-flex-8bb39979",
+			"tn-static-gap-0-5rem-ce2fca4d",
+			"tn-static-gap-10px-f3d7ce77",
+			"tn-static-gap-12px-ed7b3d87",
+			"tn-static-gap-6px-f0abc1db"
+		);
+		rightButtons.classList.add("tn-static-gap-8px-33fcd4c3");
 
-		const cancelButton = rightButtons.createEl("button", { text: this.translate("common.cancel") });
+		const cancelButton = rightButtons.createEl("button", {
+			text: this.translate(msg({ message: "Cancel", context: "common.cancel" })),
+		});
 		cancelButton.addEventListener("click", () => this.close());
 
 		const saveButton = rightButtons.createEl("button", {
-			text: this.translate("modals.timeblockInfo.saveButton"),
+			text: this.translate(msg({ message: "Save changes", context: "modals.timeblockInfo.saveButton" })),
 			cls: "mod-cta timeblock-save-button",
 		});
-		saveButton.addEventListener("click", () => this.handleSave());
+		saveButton.addEventListener("click", () => {
+			void this.handleSave();
+		});
 
 		// Initial validation
 		this.validateForm();
@@ -219,9 +317,13 @@ export class TimeblockInfoModal extends Modal {
 		for (const attachmentPath of this.timeblock.attachments) {
 			// Remove wikilink brackets if present
 			const cleanPath = attachmentPath.replace(/^\[\[|\]\]$/g, "");
-			const file = this.app.vault.getAbstractFileByPath(cleanPath);
-			if (file) {
+			const linkpath = parseLinktext(cleanPath.split("|")[0]).path;
+			const file =
+				this.app.metadataCache.getFirstLinkpathDest(linkpath, "") ??
+				this.app.vault.getAbstractFileByPath(cleanPath);
+			if (file && !this.attachmentLinks.has(file.path)) {
 				this.selectedAttachments.push(file);
+				this.attachmentLinks.set(file.path, attachmentPath);
 			}
 		}
 	}
@@ -229,7 +331,9 @@ export class TimeblockInfoModal extends Modal {
 	private addAttachment(file: TAbstractFile): void {
 		// Avoid duplicates
 		if (this.selectedAttachments.some((existing) => existing.path === file.path)) {
-			new Notice(this.translate("notices.timeblockAttachmentExists", { fileName: file.name }));
+			new Notice(
+				this.translate(msg({ message: "\"{fileName}\" is already attached", context: "notices.timeblockAttachmentExists" }), { fileName: file.name })
+			);
 			return;
 		}
 
@@ -243,7 +347,7 @@ export class TimeblockInfoModal extends Modal {
 
 		this.selectedAttachments.push(file);
 		this.renderAttachmentsList();
-		new Notice(this.translate("notices.timeblockAttachmentAdded", { fileName: file.name }));
+		new Notice(this.translate(msg({ message: "Added \"{fileName}\" as attachment", context: "notices.timeblockAttachmentAdded" }), { fileName: file.name }));
 	}
 
 	private async openTaskSelectorForTitle(): Promise<void> {
@@ -252,27 +356,38 @@ export class TimeblockInfoModal extends Modal {
 			const candidates = allTasks.filter((task) => !task.archived);
 
 			if (candidates.length === 0) {
-				new Notice("No tasks available to select");
+				new Notice(this.translate(msg({ message: "No tasks available to select", context: "modals.timeblockInfo.noTasks" })));
 				return;
 			}
 
-			openTaskSelector(this.plugin, candidates, (selectedTask) => {
-				if (!selectedTask) return;
+			openTaskSelector(
+				this.plugin,
+				candidates,
+				(selectedTask) => {
+					if (!selectedTask) return;
 
-				this.titleInput.value = selectedTask.title || "";
-				this.timeblock.title = selectedTask.title || "";
-				this.validateForm();
+					if (!this.titleInput.value.trim()) {
+						this.titleInput.value = selectedTask.title || "";
+						this.timeblock.title = selectedTask.title || "";
+						this.validateForm();
+					}
 
-				const taskFile = this.app.vault.getAbstractFileByPath(selectedTask.path);
-				if (taskFile) {
-					this.addAttachment(taskFile);
+					const taskFile = this.app.vault.getAbstractFileByPath(selectedTask.path);
+					if (taskFile) {
+						this.addAttachment(taskFile);
+					}
+				},
+				{
+					title: this.translate(msg({ message: "Select task", context: "modals.taskSelector.title" })),
 				}
-			}, {
-				title: "Select task",
-			});
+			);
 		} catch (error) {
-			console.error("Failed to open task selector for timeblock edit:", error);
-			new Notice("Failed to open task selector");
+			tasknotesLogger.error("Failed to open task selector for timeblock edit:", {
+				category: "persistence",
+				operation: "open-task-selector-timeblock-edit",
+				error: error,
+			});
+			new Notice(this.translate(msg({ message: "Failed to open task selector", context: "modals.timeblockInfo.selectorFailed" })));
 		}
 	}
 
@@ -281,14 +396,16 @@ export class TimeblockInfoModal extends Modal {
 			(existing) => existing.path !== file.path
 		);
 		this.renderAttachmentsList();
-		new Notice(this.translate("notices.timeblockAttachmentRemoved", { fileName: file.name }));
+		new Notice(this.translate(msg({ message: "Removed \"{fileName}\" from attachments", context: "notices.timeblockAttachmentRemoved" }), { fileName: file.name }));
 	}
 
 	private openAttachment(file: TAbstractFile): void {
 		if (file instanceof TFile) {
-			this.app.workspace.getLeaf(false).openFile(file);
+			void this.app.workspace.getLeaf(false).openFile(file);
 		} else {
-			new Notice(this.translate("notices.timeblockFileTypeNotSupported", { fileName: file.name }));
+			new Notice(
+				this.translate(msg({ message: "Cannot open \"{fileName}\" - file type not supported", context: "notices.timeblockFileTypeNotSupported" }), { fileName: file.name })
+			);
 		}
 	}
 
@@ -299,7 +416,7 @@ export class TimeblockInfoModal extends Modal {
 			const emptyState = this.attachmentsList.createDiv({
 				cls: "timeblock-attachments-empty",
 			});
-			emptyState.textContent = "No attachments";
+			emptyState.textContent = uiText(msg({ message: "No attachments", context: "modals/TimeblockInfoModal: TimeblockInfoModal.renderAttachmentsList display" }));
 			return;
 		}
 
@@ -310,8 +427,12 @@ export class TimeblockInfoModal extends Modal {
 
 			// Info container (clickable to open)
 			const infoEl = attachmentItem.createDiv({ cls: "timeblock-attachment-info" });
-			infoEl.style.cursor = "pointer";
-			setTooltip(infoEl, "Click to open", { placement: "top" });
+			infoEl.classList.remove(
+				"tn-static-cursor-grab-dad79857",
+				"tn-static-cursor-pointer-2723efcc"
+			);
+			infoEl.classList.add("tn-static-cursor-pointer-3b6a3a65");
+			setTooltip(infoEl, uiText(msg({ message: "Click to open", context: "modals/TimeblockInfoModal: TimeblockInfoModal.renderAttachmentsList display" })), { placement: "top" });
 			infoEl.addEventListener("click", () => this.openAttachment(file));
 
 			// File name
@@ -329,7 +450,7 @@ export class TimeblockInfoModal extends Modal {
 				cls: "timeblock-attachment-remove",
 				text: "×",
 			});
-			setTooltip(removeBtn, "Remove attachment", { placement: "top" });
+			setTooltip(removeBtn, uiText(msg({ message: "Remove attachment", context: "modals/TimeblockInfoModal: TimeblockInfoModal.renderAttachmentsList display" })), { placement: "top" });
 			removeBtn.addEventListener("click", (e) => {
 				e.stopPropagation();
 				this.removeAttachment(file);
@@ -342,18 +463,19 @@ export class TimeblockInfoModal extends Modal {
 			// Validate inputs
 			const title = this.titleInput.value.trim();
 			if (!title) {
-				new Notice(this.translate("notices.timeblockTitleRequired"));
+				new Notice(this.translate(msg({ message: "Please enter a title for the timeblock", context: "notices.timeblockTitleRequired" })));
 				return;
 			}
 
 			// Update timeblock with new values
 			this.timeblock.title = title;
 			this.timeblock.description = this.descriptionInput.value.trim() || undefined;
-			this.timeblock.color = this.colorInput.value || undefined;
+			this.timeblock.color =
+				normalizeThemeColor(this.colorInput.value || undefined) || undefined;
 
 			// Convert selected attachments to wikilinks
 			const attachments: string[] = this.selectedAttachments.map(
-				(file) => `[[${file.path}]]`
+				(file) => this.attachmentLinks.get(file.path) ?? `[[${file.path}]]`
 			);
 			this.timeblock.attachments = attachments.length > 0 ? attachments : undefined;
 
@@ -366,11 +488,15 @@ export class TimeblockInfoModal extends Modal {
 			// Refresh calendar views
 			this.plugin.emitter.trigger("data-changed");
 
-			new Notice(this.translate("notices.timeblockUpdatedSuccess", { title }));
+			new Notice(this.translate(msg({ message: "Timeblock \"{title}\" updated successfully", context: "notices.timeblockUpdatedSuccess" }), { title }));
 			this.close();
 		} catch (error) {
-			console.error("Error updating timeblock:", error);
-			new Notice(this.translate("notices.timeblockUpdateFailed"));
+			tasknotesLogger.error("Error updating timeblock:", {
+				category: "internal",
+				operation: "updating-timeblock",
+				error: error,
+			});
+			new Notice(this.translate(msg({ message: "Failed to update timeblock. Check console for details.", context: "notices.timeblockUpdateFailed" })));
 		}
 	}
 
@@ -381,9 +507,9 @@ export class TimeblockInfoModal extends Modal {
 
 		// Get daily note for the date
 		const dateStr = this.timeblockDate;
-		const moment = (window as any).moment(dateStr, "YYYY-MM-DD");
+		const dailyNoteMoment = getDailyNoteMoment(dateStr, "YYYY-MM-DD");
 		const allDailyNotes = getAllDailyNotes();
-		const dailyNote = getDailyNote(moment, allDailyNotes);
+		const dailyNote = getDailyNote(dailyNoteMoment, allDailyNotes);
 
 		if (!dailyNote) {
 			throw new Error("Daily note not found");
@@ -393,21 +519,20 @@ export class TimeblockInfoModal extends Modal {
 		const content = await this.app.vault.read(dailyNote);
 
 		// Parse existing frontmatter
-		let frontmatter: any = {};
-		let bodyContent = content;
+		let frontmatter: Record<string, unknown> = {};
+		const info = getFrontMatterInfo(content);
+		const bodyContent = info.exists ? content.slice(info.contentStart) : content;
 
-		if (content.startsWith("---")) {
-			const endOfFrontmatter = content.indexOf("---", 3);
-			if (endOfFrontmatter !== -1) {
-				const frontmatterText = content.substring(3, endOfFrontmatter);
-				bodyContent = content.substring(endOfFrontmatter + 3);
-
-				try {
-					frontmatter = parseYaml(frontmatterText) || {};
-				} catch (error) {
-					console.error("Error parsing existing frontmatter:", error);
-					frontmatter = {};
-				}
+		if (info.exists) {
+			try {
+				frontmatter = parseFrontmatterRecord(info.frontmatter);
+			} catch (error) {
+				tasknotesLogger.error("Error parsing existing frontmatter:", {
+					category: "validation",
+					operation: "parsing-existing-frontmatter",
+					error: error,
+				});
+				frontmatter = {};
 			}
 		}
 
@@ -431,13 +556,13 @@ export class TimeblockInfoModal extends Modal {
 		}
 
 		// Convert frontmatter back to YAML
-		const frontmatterText = stringifyYaml(frontmatter);
+		const newFrontmatterText = stringifyYaml(frontmatter);
 
 		// Reconstruct file content
-		const newContent = `---\n${frontmatterText}---${bodyContent}`;
+		const newContent = `---\n${newFrontmatterText}---\n${bodyContent}`;
 
 		// Write back to file
-		await this.app.vault.modify(dailyNote, newContent);
+		await modifyVaultFile(this.app, dailyNote, newContent);
 	}
 
 	private async handleDelete(): Promise<void> {
@@ -454,42 +579,85 @@ export class TimeblockInfoModal extends Modal {
 			// Refresh calendar views
 			this.plugin.emitter.trigger("data-changed");
 
-			new Notice(this.translate("notices.timeblockDeletedSuccess", { title: this.timeblock.title }));
+			new Notice(
+				this.translate(msg({ message: "Timeblock \"{title}\" deleted successfully", context: "notices.timeblockDeletedSuccess" }), { title: this.timeblock.title })
+			);
 			this.close();
 		} catch (error) {
-			console.error("Error deleting timeblock:", error);
-			new Notice(this.translate("notices.timeblockDeleteFailed"));
+			tasknotesLogger.error("Error deleting timeblock:", {
+				category: "internal",
+				operation: "deleting-timeblock",
+				error: error,
+			});
+			new Notice(this.translate(msg({ message: "Failed to delete timeblock. Check console for details.", context: "notices.timeblockDeleteFailed" })));
 		}
 	}
 
 	private async showDeleteConfirmation(): Promise<boolean> {
 		return new Promise((resolve) => {
 			const modal = new Modal(this.app);
-			modal.titleEl.setText(this.translate("modals.timeblockInfo.deleteConfirmationTitle"));
+			modal.titleEl.setText(this.translate(msg({ message: "Delete timeblock", context: "modals.timeblockInfo.deleteConfirmationTitle" })));
 
 			const content = modal.contentEl;
 			content.createEl("p", {
-				text: `Are you sure you want to delete the timeblock "${this.timeblock.title}"?`,
+				text: this.translate(msg({ message: "Are you sure you want to delete the timeblock \"{title}\"?", context: "modals.timeblockInfo.confirmDelete" }), {
+					title: this.timeblock.title,
+				}),
 			});
 			content.createEl("p", {
-				text: "This action cannot be undone.",
+				text: this.translate(msg({ message: "This action cannot be undone.", context: "common.cannotUndo" })),
 				cls: "mod-warning",
 			});
 
 			const buttonContainer = content.createDiv({ cls: "modal-button-container" });
-			buttonContainer.style.display = "flex";
-			buttonContainer.style.justifyContent = "flex-end";
-			buttonContainer.style.gap = "8px";
-			buttonContainer.style.marginTop = "20px";
+			buttonContainer.classList.remove(
+				"tn-static-display-block-2a1b75c9",
+				"tn-static-display-flex-4d51fc62",
+				"tn-static-display-flex-8bb39979",
+				"tn-static-display-inline-block-60e32dcb",
+				"tn-static-display-inline-cccfa456",
+				"tn-static-display-inline-flex-f984c520",
+				"tn-static-display-none-6b99de8b",
+				"tn-static-min-height-800px-997b4c8c"
+			);
+			buttonContainer.classList.add("tn-static-display-flex-75816cae");
+			buttonContainer.classList.remove(
+				"tn-static-justify-content-center-03c4bb6f",
+				"tn-static-justify-content-space-between-a562f4fd"
+			);
+			buttonContainer.classList.add("tn-static-justify-content-flex-end-455f8cca");
+			buttonContainer.classList.remove(
+				"tn-static-display-flex-8bb39979",
+				"tn-static-gap-0-5rem-ce2fca4d",
+				"tn-static-gap-10px-f3d7ce77",
+				"tn-static-gap-12px-ed7b3d87",
+				"tn-static-gap-6px-f0abc1db"
+			);
+			buttonContainer.classList.add("tn-static-gap-8px-33fcd4c3");
+			buttonContainer.classList.remove(
+				"tn-static-font-size-12px-b0cc7e05",
+				"tn-static-margin-top-0-5rem-3dc98b5e",
+				"tn-static-margin-top-0-d462248a",
+				"tn-static-margin-top-12px-91e0f558",
+				"tn-static-margin-top-16px-1b0f4999",
+				"tn-static-margin-top-1rem-2239d6d5",
+				"tn-static-margin-top-30px-2fbbbcd4",
+				"tn-static-margin-top-4px-96ad6099",
+				"tn-static-margin-top-8px-8a77e5a3",
+				"tn-static-margin-top-8px-f4f01e68"
+			);
+			buttonContainer.classList.add("tn-static-margin-top-20px-a26bda7d");
 
-			const cancelBtn = buttonContainer.createEl("button", { text: this.translate("common.cancel") });
+			const cancelBtn = buttonContainer.createEl("button", {
+				text: this.translate(msg({ message: "Cancel", context: "common.cancel" })),
+			});
 			cancelBtn.addEventListener("click", () => {
 				modal.close();
 				resolve(false);
 			});
 
 			const deleteBtn = buttonContainer.createEl("button", {
-				text: "Delete",
+				text: this.translate(msg({ message: "Delete", context: "views.advancedCalendar.contextMenus.deleteButton" })),
 				cls: "mod-warning",
 			});
 			deleteBtn.addEventListener("click", () => {
@@ -500,7 +668,7 @@ export class TimeblockInfoModal extends Modal {
 			modal.open();
 
 			// Focus the cancel button by default for safety
-			setTimeout(() => cancelBtn.focus(), 50);
+			window.setTimeout(() => cancelBtn.focus(), 50);
 		});
 	}
 
@@ -511,9 +679,9 @@ export class TimeblockInfoModal extends Modal {
 
 		// Get daily note for the date
 		const dateStr = this.timeblockDate;
-		const moment = (window as any).moment(dateStr, "YYYY-MM-DD");
+		const dailyNoteMoment = getDailyNoteMoment(dateStr, "YYYY-MM-DD");
 		const allDailyNotes = getAllDailyNotes();
-		const dailyNote = getDailyNote(moment, allDailyNotes);
+		const dailyNote = getDailyNote(dailyNoteMoment, allDailyNotes);
 
 		if (!dailyNote) {
 			throw new Error("Daily note not found");
@@ -523,21 +691,20 @@ export class TimeblockInfoModal extends Modal {
 		const content = await this.app.vault.read(dailyNote);
 
 		// Parse existing frontmatter
-		let frontmatter: any = {};
-		let bodyContent = content;
+		let frontmatter: Record<string, unknown> = {};
+		const info = getFrontMatterInfo(content);
+		const bodyContent = info.exists ? content.slice(info.contentStart) : content;
 
-		if (content.startsWith("---")) {
-			const endOfFrontmatter = content.indexOf("---", 3);
-			if (endOfFrontmatter !== -1) {
-				const frontmatterText = content.substring(3, endOfFrontmatter);
-				bodyContent = content.substring(endOfFrontmatter + 3);
-
-				try {
-					frontmatter = parseYaml(frontmatterText) || {};
-				} catch (error) {
-					console.error("Error parsing existing frontmatter:", error);
-					frontmatter = {};
-				}
+		if (info.exists) {
+			try {
+				frontmatter = parseFrontmatterRecord(info.frontmatter);
+			} catch (error) {
+				tasknotesLogger.error("Error parsing existing frontmatter:", {
+					category: "validation",
+					operation: "parsing-existing-frontmatter",
+					error: error,
+				});
+				frontmatter = {};
 			}
 		}
 
@@ -566,16 +733,16 @@ export class TimeblockInfoModal extends Modal {
 		}
 
 		// Convert frontmatter back to YAML
-		const frontmatterText =
+		const newFrontmatterText =
 			Object.keys(frontmatter).length > 0 ? stringifyYaml(frontmatter) : "";
 
 		// Reconstruct file content
-		const newContent = frontmatterText
-			? `---\n${frontmatterText}---${bodyContent}`
+		const newContent = newFrontmatterText
+			? `---\n${newFrontmatterText}---\n${bodyContent}`
 			: bodyContent.trim();
 
 		// Write back to file
-		await this.app.vault.modify(dailyNote, newContent);
+		await modifyVaultFile(this.app, dailyNote, newContent);
 	}
 
 	onClose() {

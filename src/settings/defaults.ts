@@ -1,3 +1,4 @@
+import { uiData } from "../i18n/dataText";
 import { FieldMapping, StatusConfig, PriorityConfig } from "../types";
 import {
 	TaskNotesSettings,
@@ -8,6 +9,8 @@ import {
 	NLPTriggersConfig,
 	GoogleCalendarExportSettings,
 } from "../types/settings";
+import { DEFAULT_FIELD_MAPPING } from "../core/defaultFieldMapping";
+export { DEFAULT_FIELD_MAPPING } from "../core/defaultFieldMapping";
 
 /**
  * Internal field names for default visible properties.
@@ -22,42 +25,15 @@ export const DEFAULT_INTERNAL_VISIBLE_PROPERTIES: (keyof FieldMapping)[] = [
 	"contexts",
 ];
 
-// Default field mapping maintains backward compatibility
-export const DEFAULT_FIELD_MAPPING: FieldMapping = {
-	title: "title",
-	status: "status",
-	priority: "priority",
-	due: "due",
-	scheduled: "scheduled",
-	contexts: "contexts",
-	projects: "projects",
-	timeEstimate: "timeEstimate",
-	completedDate: "completedDate",
-	dateCreated: "dateCreated",
-	dateModified: "dateModified",
-	recurrence: "recurrence",
-	recurrenceAnchor: "recurrence_anchor",
-	archiveTag: "archived",
-	timeEntries: "timeEntries",
-	completeInstances: "complete_instances",
-	skippedInstances: "skipped_instances",
-	blockedBy: "blockedBy",
-	pomodoros: "pomodoros",
-	icsEventId: "icsEventId",
-	icsEventTag: "ics_event",
-	googleCalendarEventId: "googleCalendarEventId",
-	reminders: "reminders",
-	sortOrder: "tasknotes_manual_order",
-};
-
 // Default status configuration matches current hardcoded behavior
 export const DEFAULT_STATUSES: StatusConfig[] = [
 	{
 		id: "none",
 		value: "none",
-		label: "None",
+		label: uiData("None", "Writable persisted default label; localized only by configLabel at display boundaries"),
 		color: "#cccccc",
 		isCompleted: false,
+		excludeFromCycle: false,
 		order: 0,
 		autoArchive: false,
 		autoArchiveDelay: 5,
@@ -65,9 +41,10 @@ export const DEFAULT_STATUSES: StatusConfig[] = [
 	{
 		id: "open",
 		value: "open",
-		label: "Open",
+		label: uiData("Open", "Writable persisted default label; localized only by configLabel at display boundaries"),
 		color: "#808080",
 		isCompleted: false,
+		excludeFromCycle: false,
 		order: 1,
 		autoArchive: false,
 		autoArchiveDelay: 5,
@@ -75,9 +52,10 @@ export const DEFAULT_STATUSES: StatusConfig[] = [
 	{
 		id: "in-progress",
 		value: "in-progress",
-		label: "In progress",
+		label: uiData("In progress", "Writable persisted default label; localized only by configLabel at display boundaries"),
 		color: "#0066cc",
 		isCompleted: false,
+		excludeFromCycle: false,
 		order: 2,
 		autoArchive: false,
 		autoArchiveDelay: 5,
@@ -85,9 +63,12 @@ export const DEFAULT_STATUSES: StatusConfig[] = [
 	{
 		id: "done",
 		value: "done",
-		label: "Done",
+		label: uiData("Done", "Writable persisted default label; localized only by configLabel at display boundaries"),
 		color: "#00aa00",
 		isCompleted: true,
+		excludeFromCycle: false,
+		// Reopening a task, or finishing a recurring occurrence, starts again at Open.
+		nextStatus: "open",
 		order: 3,
 		autoArchive: false,
 		autoArchiveDelay: 5,
@@ -99,28 +80,28 @@ export const DEFAULT_PRIORITIES: PriorityConfig[] = [
 	{
 		id: "none",
 		value: "none",
-		label: "None",
+		label: uiData("None", "Writable persisted default label; localized only by configLabel at display boundaries"),
 		color: "#cccccc",
 		weight: 0,
 	},
 	{
 		id: "low",
 		value: "low",
-		label: "Low",
+		label: uiData("Low", "Writable persisted default label; localized only by configLabel at display boundaries"),
 		color: "#00aa00",
 		weight: 1,
 	},
 	{
 		id: "normal",
 		value: "normal",
-		label: "Normal",
+		label: uiData("Normal", "Writable persisted default label; localized only by configLabel at display boundaries"),
 		color: "#ffaa00",
 		weight: 2,
 	},
 	{
 		id: "high",
 		value: "high",
-		label: "High",
+		label: uiData("High", "Writable persisted default label; localized only by configLabel at display boundaries"),
 		color: "#ff0000",
 		weight: 3,
 	},
@@ -130,13 +111,20 @@ export const DEFAULT_TASK_CREATION_DEFAULTS: TaskCreationDefaults = {
 	defaultContexts: "",
 	defaultTags: "",
 	defaultProjects: "",
+	useParentNoteForTaskCreation: false,
 	useParentNoteAsProject: false,
+	useParentHeaderAsProject: false,
+	inheritParentTaskProperties: false,
 	defaultTimeEstimate: 0,
 	defaultRecurrence: "none",
 	defaultDueDate: "none",
+	defaultDueTime: "none",
 	defaultScheduledDate: "today",
+	defaultScheduledTime: "none",
 	bodyTemplate: "",
 	useBodyTemplate: false,
+	occurrenceBodyTemplate: "",
+	useOccurrenceBodyTemplate: false,
 	defaultReminders: [],
 };
 
@@ -147,6 +135,7 @@ export const DEFAULT_CALENDAR_VIEW_SETTINGS: CalendarViewSettings = {
 	customDayCount: 3, // Default to 3 days as requested in issue #282
 	// Time settings
 	slotDuration: "00:30:00", // 30-minute slots
+	slotHeight: 24, // Height of one slot in px; 15-minute slots therefore take half the height of an hour
 	slotMinTime: "00:00:00", // Start at midnight
 	slotMaxTime: "24:00:00", // End at midnight next day
 	scrollTime: "08:00:00", // Scroll to 8 AM
@@ -195,8 +184,13 @@ export const DEFAULT_ICS_INTEGRATION_SETTINGS: ICSIntegrationSettings = {
 	autoExportPath: "tasknotes-calendar.ics",
 	autoExportInterval: 60, // 60 minutes by default
 	useDurationForExport: false, // Preserve existing behavior: use due date as DTEND
+	excludeArchivedFromExport: false, // Preserve existing behavior: include archived tasks
+	excludeCompletedFromExport: false, // Preserve existing behavior: include completed tasks
+	requireDueDateForExport: false, // Preserve existing behavior: include tasks without due dates
+	requireScheduledDateForExport: false, // Preserve existing behavior: include tasks without scheduled dates
 	// Task creation defaults
 	useICSEndAsDue: false, // Preserve existing behavior: don't set due date from ICS events
+	recurringEventRelatedNotesMode: "series", // Preserve existing behavior: link recurring event notes across the series
 };
 
 export const DEFAULT_GOOGLE_CALENDAR_EXPORT: GoogleCalendarExportSettings = {
@@ -211,9 +205,13 @@ export const DEFAULT_GOOGLE_CALENDAR_EXPORT: GoogleCalendarExportSettings = {
 	eventColorId: null, // Use calendar default color
 	syncTrigger: "scheduled", // Default to scheduled date
 	createAsAllDay: true, // All-day events by default
+	showAllDayAsFree: false, // Preserve Busy availability unless explicitly enabled
 	defaultEventDuration: 60, // 1 hour if timed events
 	includeObsidianLink: true, // Include link back to Obsidian
-	defaultReminderMinutes: null, // No reminder by default (user opts in)
+	defaultReminderMinutes: null, // No reminder override by default (user opts in)
+	syncTimeblocks: false, // Timeblock sync is opt-in
+	timeblockTargetCalendarId: "", // Empty = use the task target calendar
+	timeblockEventTitleTemplate: "{{title}}",
 };
 
 export const DEFAULT_PROJECT_AUTOSUGGEST: ProjectAutosuggestSettings = {
@@ -264,6 +262,7 @@ export const DEFAULT_SETTINGS: TaskNotesSettings = {
 	taskTag: "task",
 	taskIdentificationMethod: "tag", // Default to tag-based identification
 	hideIdentifyingTagsInCards: false, // Default to showing all tags (backward compatibility)
+	hideIdentifyingTagsMode: "all", // Default to existing exact + hierarchical hiding behavior
 	taskPropertyName: "",
 	taskPropertyValue: "",
 	excludedFolders: "", // Default to no excluded folders
@@ -273,9 +272,12 @@ export const DEFAULT_SETTINGS: TaskNotesSettings = {
 	// Task filename defaults
 	taskFilenameFormat: "zettel", // Keep existing behavior as default
 	storeTitleInFilename: true,
-	customFilenameTemplate: "{title}", // Simple title template
+	customFilenameTemplate: "{{title}}", // Simple title template
+	occurrenceFilenameTemplate: "",
+	occurrenceFilenameTemplateProperty: "occurrenceFilenameTemplate",
 	// Task creation defaults
 	taskCreationDefaults: DEFAULT_TASK_CREATION_DEFAULTS,
+	openTaskAfterCreation: "none",
 	// Calendar view defaults
 	calendarViewSettings: DEFAULT_CALENDAR_VIEW_SETTINGS,
 	// Pomodoro defaults
@@ -290,13 +292,17 @@ export const DEFAULT_SETTINGS: TaskNotesSettings = {
 	pomodoroSoundVolume: 50,
 	pomodoroStorageLocation: "plugin",
 	pomodoroMobileSidebar: "tab",
+	showPomodoroInStatusBar: true,
 	// Editor defaults
 	enableTaskLinkOverlay: true,
 	disableOverlayOnAlias: false,
 	enableInstantTaskConvert: true,
 	useDefaultsOnInstantConvert: true,
+	preserveCheckboxOnConvert: false,
+	taskModalTabMovesFocus: true,
 	enableNaturalLanguageInput: true,
 	nlpDefaultToScheduled: true,
+	nlpEnterToSubmit: false,
 	nlpLanguage: "en", // Default to English
 	uiLanguage: "system",
 	// NLP status suggestion trigger (deprecated)
@@ -324,6 +330,9 @@ export const DEFAULT_SETTINGS: TaskNotesSettings = {
 	// Release notes defaults
 	lastSeenVersion: undefined,
 	showReleaseNotesOnUpdate: true,
+	checkForUpdatesOnStartup: true,
+	lastNotifiedReleaseVersion: undefined,
+	starterNoteCreated: false,
 	// Status bar defaults
 	showTrackedTasksInStatusBar: false,
 	// Time tracking defaults
@@ -335,8 +344,11 @@ export const DEFAULT_SETTINGS: TaskNotesSettings = {
 	relationshipsPosition: "bottom",
 	// Task card in note defaults
 	showTaskCardInNote: true,
+	showCompletedTaskStrikethrough: true,
+	completionMenuAsSubmenu: true,
 	// Task card expandable subtasks defaults
 	showExpandableSubtasks: true,
+	expandSubtasksByDefault: false,
 	// Subtask chevron position default
 	subtaskChevronPosition: "right",
 	// Filter toolbar layout defaults
@@ -350,6 +362,8 @@ export const DEFAULT_SETTINGS: TaskNotesSettings = {
 	// Notification defaults
 	enableNotifications: true,
 	notificationType: "system",
+	notificationSoundEnabled: false,
+	notificationSoundVolume: 50,
 	// HTTP API defaults
 	enableAPI: false,
 	apiPort: 8080,
@@ -383,25 +397,26 @@ export const DEFAULT_SETTINGS: TaskNotesSettings = {
 	autoCreateDefaultBasesFiles: true, // Auto-create missing default Base files on startup
 	// Command-to-file mappings for view commands (v4)
 	commandFileMapping: {
-		'open-calendar-view': 'TaskNotes/Views/mini-calendar-default.base',
-		'open-kanban-view': 'TaskNotes/Views/kanban-default.base',
-		'open-tasks-view': 'TaskNotes/Views/tasks-default.base',
-		'open-advanced-calendar-view': 'TaskNotes/Views/calendar-default.base',
-		'open-agenda-view': 'TaskNotes/Views/agenda-default.base',
-		'relationships': 'TaskNotes/Views/relationships.base',
+		"open-calendar-view": "TaskNotes/Views/mini-calendar-default.base",
+		"open-kanban-view": "TaskNotes/Views/kanban-default.base",
+		"open-tasks-view": "TaskNotes/Views/tasks-default.base",
+		"open-advanced-calendar-view": "TaskNotes/Views/calendar-default.base",
+		"open-agenda-view": "TaskNotes/Views/agenda-default.base",
+		"pomodoro-stats-base": "TaskNotes/Views/pomodoro-stats.base",
+		relationships: "TaskNotes/Views/relationships.base",
 	},
 	// Recurring task behavior defaults
 	maintainDueDateOffsetInRecurring: false,
 	resetCheckboxesOnRecurrence: false, // Off by default - user opts in
+	// On for new setups; settings saved before it existed load with it off (#2521).
+	resetRecurringStatusAfterOccurrence: true,
 	// Frontmatter link format defaults
 	useFrontmatterMarkdownLinks: false, // Default to wikilinks for compatibility
 	// OAuth Calendar Integration defaults
-	googleOAuthClientId: "",
-	googleOAuthClientSecret: "",
-	microsoftOAuthClientId: "",
-	microsoftOAuthClientSecret: "",
+	// OAuth client credentials and account tokens are stored in Obsidian SecretStorage.
 	enableGoogleCalendar: false,
 	enableMicrosoftCalendar: false,
+	disableCalendarOnMobile: false,
 	// Google Calendar selection (empty = show all calendars)
 	enabledGoogleCalendars: [],
 	// Google Calendar sync tokens (for incremental sync)

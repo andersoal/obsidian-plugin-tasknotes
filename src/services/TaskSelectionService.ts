@@ -1,6 +1,8 @@
-import { Notice } from "obsidian";
-import TaskNotesPlugin from "../main";
-import { TaskInfo } from "../types";
+import type TaskNotesPlugin from "../main";
+import type { TaskInfo } from "../types";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Services/TaskSelectionService" });
 
 /**
  * Service for managing task selection state across views.
@@ -76,9 +78,8 @@ export class TaskSelectionService {
 			this.selectedTaskPaths.delete(taskPath);
 			// If we removed the primary, pick a new one
 			if (this.primarySelectedPath === taskPath) {
-				this.primarySelectedPath = this.selectedTaskPaths.size > 0
-					? Array.from(this.selectedTaskPaths)[0]
-					: null;
+				this.primarySelectedPath =
+					this.selectedTaskPaths.size > 0 ? Array.from(this.selectedTaskPaths)[0] : null;
 			}
 		} else {
 			// First selected task becomes primary
@@ -164,6 +165,38 @@ export class TaskSelectionService {
 
 		this.lastSelectedPath = taskPath;
 		this.notifySelectionChange();
+	}
+
+	/**
+	 * Extend the current range selection to the next or previous visible task.
+	 */
+	selectAdjacentRange(direction: -1 | 1, allVisiblePaths: string[]): void {
+		if (allVisiblePaths.length === 0) return;
+
+		let currentPath = this.lastSelectedPath;
+		if (!currentPath || !allVisiblePaths.includes(currentPath)) {
+			currentPath =
+				allVisiblePaths.find((path) => this.selectedTaskPaths.has(path)) ?? null;
+		}
+
+		if (!currentPath) {
+			this.selectTask(
+				direction > 0 ? allVisiblePaths[0] : allVisiblePaths[allVisiblePaths.length - 1]
+			);
+			return;
+		}
+
+		const currentIndex = allVisiblePaths.indexOf(currentPath);
+		if (currentIndex === -1) return;
+
+		const nextIndex = Math.max(
+			0,
+			Math.min(allVisiblePaths.length - 1, currentIndex + direction)
+		);
+		if (nextIndex === currentIndex) return;
+
+		this.lastSelectedPath = currentPath;
+		this.selectRange(allVisiblePaths[nextIndex], allVisiblePaths);
 	}
 
 	/**
@@ -259,7 +292,11 @@ export class TaskSelectionService {
 			try {
 				listener(active);
 			} catch (e) {
-				console.error("[TaskSelectionService] Error in selection mode listener:", e);
+				tasknotesLogger.error("[TaskSelectionService] Error in selection mode listener:", {
+					category: "persistence",
+					operation: "selection-mode-listener",
+					error: e,
+				});
 			}
 		}
 	}
@@ -270,7 +307,10 @@ export class TaskSelectionService {
 			try {
 				listener(paths);
 			} catch (e) {
-				console.error("[TaskSelectionService] Error in selection change listener:", e);
+				tasknotesLogger.error(
+					"[TaskSelectionService] Error in selection change listener:",
+					{ category: "persistence", operation: "selection-change-listener", error: e }
+				);
 			}
 		}
 	}

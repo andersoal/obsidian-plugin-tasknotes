@@ -1,20 +1,50 @@
+import { configLabel } from "../i18n/configLabels";
+import { uiText } from "../i18n/runtime";
+import { msg } from "@lingui/core/macro";
 import {
 	autocompletion,
 	CompletionContext,
-	CompletionResult,
 	Completion,
 	acceptCompletion,
 	moveCompletionSelection,
-	closeCompletion
+	closeCompletion,
 } from "@codemirror/autocomplete";
 import { Extension, Prec } from "@codemirror/state";
-import { keymap } from "@codemirror/view";
+import { EditorView, keymap } from "@codemirror/view";
 import TaskNotesPlugin from "../main";
 import { NaturalLanguageParser } from "../services/NaturalLanguageParser";
 import { TriggerConfigService } from "../services/TriggerConfigService";
 import { FileSuggestHelper } from "../suggest/FileSuggestHelper";
 import { ProjectMetadataResolver, ProjectEntry } from "../utils/projectMetadataResolver";
 import { parseDisplayFieldsRow } from "../utils/projectAutosuggestDisplayFieldsParser";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+import { createElementInDocument } from "../utils/documentDom";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Editor/NLPCodeMirrorAutocomplete" });
+
+type ProjectCompletion = {
+	projectMetadata?: ProjectCompletionMetadata;
+	projectQuery?: string;
+};
+type CompletionSourceResult = {
+	from: number;
+	to?: number;
+	options: Completion[];
+	validFor?: RegExp;
+	filter?: boolean;
+};
+
+type ProjectCompletionMetadataPart = {
+	text: string;
+	searchable: boolean;
+	kind: "label" | "literal" | "value";
+};
+
+type ProjectCompletionMetadataRow = ProjectCompletionMetadataPart[];
+
+export type ProjectCompletionMetadata = ProjectCompletionMetadataRow[];
+
+const DEFAULT_SEARCHABLE_PROJECT_FIELDS = new Set(["title", "aliases", "file.basename"]);
 
 /**
  * CodeMirror autocomplete extension for NLP triggers with configurable trigger support
@@ -33,99 +63,7 @@ import { parseDisplayFieldsRow } from "../utils/projectAutosuggestDisplayFieldsP
  */
 export function createNLPAutocomplete(plugin: TaskNotesPlugin): Extension[] {
 	const autocomplete = autocompletion({
-		override: [
-			async (context: CompletionContext): Promise<CompletionResult | null> => {
-				// Initialize trigger config service
-				const triggerConfig = new TriggerConfigService(
-					plugin.settings.nlpTriggers,
-					plugin.settings.userFields || []
-				);
-
-				// Get text before cursor
-				const line = context.state.doc.lineAt(context.pos);
-				const textBeforeCursor = line.text.slice(0, context.pos - line.from);
-
-				// Helper: check if index is at a word boundary
-				const isBoundary = (index: number, text: string) => {
-					if (index === -1) return false;
-					if (index === 0) return true;
-					const prev = text[index - 1];
-					return !/\w/.test(prev);
-				};
-
-				// Find all enabled triggers and their positions
-				const enabledTriggers = triggerConfig.getTriggersOrderedByLength();
-				const candidates: Array<{
-					propertyId: string;
-					trigger: string;
-					index: number;
-					triggerLength: number;
-				}> = [];
-
-				for (const triggerDef of enabledTriggers) {
-					// Skip native tag suggester (# trigger) - Obsidian handles that
-					if (triggerDef.propertyId === "tags" && triggerDef.trigger === "#") {
-						continue;
-					}
-
-					const lastIndex = textBeforeCursor.lastIndexOf(triggerDef.trigger);
-					if (isBoundary(lastIndex, textBeforeCursor)) {
-						candidates.push({
-							propertyId: triggerDef.propertyId,
-							trigger: triggerDef.trigger,
-							index: lastIndex,
-							triggerLength: triggerDef.trigger.length,
-						});
-					}
-				}
-
-				if (candidates.length === 0) return null;
-
-				// Sort by position (most recent first)
-				candidates.sort((a, b) => b.index - a.index);
-				const active = candidates[0];
-
-				// Extract query after trigger
-				const queryStart = active.index + active.triggerLength;
-				const query = textBeforeCursor.slice(queryStart);
-
-				// Don't suggest if there's already a completed wikilink for projects
-				if (active.propertyId === "projects" && /^\[\[[^\]]*\]\]/.test(query)) {
-					return null;
-				}
-
-				// Don't suggest if there's a space (except for projects which allow multi-word)
-				if (
-					active.propertyId !== "projects" &&
-					(query.includes(" ") || query.includes("\n"))
-				) {
-					return null;
-				}
-
-				// Get suggestions based on property type
-				const options = await getSuggestionsForProperty(
-					active.propertyId,
-					query,
-					plugin,
-					triggerConfig
-				);
-
-				// Return null if no options (let native suggesters handle their triggers)
-				if (!options || options.length === 0) {
-					return null;
-				}
-
-				const from = line.from + active.index + active.triggerLength;
-				const to = context.pos;
-
-				return {
-					from,
-					to,
-					options,
-					validFor: /^[\w\s-]*$/,
-				};
-			},
-		],
+		override: [createNLPCompletionSource(plugin)],
 		// Show autocomplete immediately when typing after trigger
 		activateOnTyping: true,
 		// Close on blur
@@ -135,23 +73,8 @@ export function createNLPAutocomplete(plugin: TaskNotesPlugin): Extension[] {
 		// Custom rendering for project suggestions with metadata
 		addToOptions: [
 			{
-				render: (completion: any, _state: any, _view: any) => {
-					// Only render custom content for project suggestions with metadata
-					if (!completion.projectMetadata) return null;
-
-					const container = document.createElement("div");
-					container.className = "cm-project-suggestion__metadata";
-
-					const metadata = completion.projectMetadata;
-					for (const row of metadata) {
-						const metaRow = document.createElement("div");
-						metaRow.className = "cm-project-suggestion__meta";
-						metaRow.textContent = row;
-						container.appendChild(metaRow);
-					}
-
-					return container;
-				},
+				render: (completion: Completion, _state: unknown, view: EditorView) =>
+					renderProjectCompletionMetadata(completion, view.dom.ownerDocument),
 				position: 100, // After label (50) and detail (80)
 			},
 		],
@@ -170,6 +93,141 @@ export function createNLPAutocomplete(plugin: TaskNotesPlugin): Extension[] {
 	);
 
 	return [Prec.high(autocomplete), autocompleteKeymap];
+}
+
+export function createNLPCompletionSource(
+	plugin: TaskNotesPlugin
+): (context: CompletionContext) => Promise<CompletionSourceResult | null> {
+	return async (context: CompletionContext): Promise<CompletionSourceResult | null> => {
+		const triggerConfig = new TriggerConfigService(
+			plugin.settings.nlpTriggers,
+			plugin.settings.userFields || []
+		);
+
+		const line = context.state.doc.lineAt(context.pos);
+		const textBeforeCursor = line.text.slice(0, context.pos - line.from);
+
+		const isBoundary = (index: number, text: string) => {
+			if (index === -1) return false;
+			if (index === 0) return true;
+			const prev = text[index - 1];
+			return !/\w/.test(prev);
+		};
+
+		const enabledTriggers = triggerConfig.getTriggersOrderedByLength();
+		const candidates: Array<{
+			propertyId: string;
+			trigger: string;
+			index: number;
+			triggerLength: number;
+		}> = [];
+
+		for (const triggerDef of enabledTriggers) {
+			// Skip native tag suggester (# trigger) - Obsidian handles that
+			if (triggerDef.propertyId === "tags" && triggerDef.trigger === "#") {
+				continue;
+			}
+
+			const lastIndex = textBeforeCursor.lastIndexOf(triggerDef.trigger);
+			if (isBoundary(lastIndex, textBeforeCursor)) {
+				candidates.push({
+					propertyId: triggerDef.propertyId,
+					trigger: triggerDef.trigger,
+					index: lastIndex,
+					triggerLength: triggerDef.trigger.length,
+				});
+			}
+		}
+
+		if (candidates.length === 0) return null;
+
+		candidates.sort((a, b) => b.index - a.index);
+		const active = candidates[0];
+
+		const queryStart = active.index + active.triggerLength;
+		const query = textBeforeCursor.slice(queryStart);
+
+		if (active.propertyId === "projects" && /^\[\[[^\]]*\]\]/.test(query)) {
+			return null;
+		}
+
+		if (active.propertyId !== "projects" && (query.includes(" ") || query.includes("\n"))) {
+			return null;
+		}
+
+		const options = await getSuggestionsForProperty(
+			active.propertyId,
+			query,
+			plugin,
+			triggerConfig
+		);
+
+		if (!options || options.length === 0) {
+			return null;
+		}
+
+		let to = context.pos;
+		const textAfterCursor = line.text.slice(context.pos - line.from);
+		if (active.propertyId === "status" && textAfterCursor.startsWith(active.trigger)) {
+			to = Math.min(line.to, context.pos + active.triggerLength);
+		}
+
+		return {
+			from: line.from + active.index + active.triggerLength,
+			to,
+			options,
+			// Status suggestions are already filtered using the text before the cursor.
+			// When consuming an auto-paired closing trigger, CodeMirror would otherwise
+			// filter against that trigger too (e.g. "op*") and hide every suggestion.
+			// Unfiltered results cannot use validFor; re-query after each edit instead.
+			...(to > context.pos ? { filter: false } : { validFor: /^[\w\s-]*$/ }),
+		};
+	};
+}
+
+export function renderProjectCompletionMetadata(
+	completion: Completion,
+	doc: Document = activeDocument
+): HTMLElement | null {
+	const projectCompletion = completion as unknown as ProjectCompletion;
+	if (!projectCompletion.projectMetadata) return null;
+
+	const container = createElementInDocument(doc, "div");
+	container.className = "cm-project-suggestion__metadata";
+
+	for (const row of projectCompletion.projectMetadata) {
+		const metaRow = createElementInDocument(doc, "div");
+		metaRow.className = "cm-project-suggestion__meta";
+
+		row.forEach((part, index) => {
+			if (index > 0) {
+				metaRow.appendChild(doc.createTextNode(" "));
+			}
+
+			const span = createElementInDocument(doc, "span");
+			span.className =
+				part.kind === "value"
+					? "cm-project-suggestion__meta-value"
+					: part.kind === "label"
+						? "cm-project-suggestion__meta-label"
+						: "cm-project-suggestion__meta-literal";
+			if (part.searchable) {
+				span.classList.add("cm-project-suggestion__meta-searchable");
+			}
+
+			if (part.searchable && projectCompletion.projectQuery) {
+				appendHighlightedText(span, part.text, projectCompletion.projectQuery);
+			} else {
+				span.textContent = part.text;
+			}
+
+			metaRow.appendChild(span);
+		});
+
+		container.appendChild(metaRow);
+	}
+
+	return container;
 }
 
 /**
@@ -222,12 +280,12 @@ function getListSuggestions(
 	switch (propertyId) {
 		case "tags":
 			items = plugin.cacheManager.getAllTags();
-			label = "Tag";
+			label = uiText(msg({ message: "Tag", context: "editor/NLPCodeMirrorAutocomplete: getListSuggestions display" }));
 			break;
 
 		case "contexts":
 			items = plugin.cacheManager.getAllContexts();
-			label = "Context";
+			label = uiText(msg({ message: "Context", context: "editor/NLPCodeMirrorAutocomplete: getListSuggestions display" }));
 			break;
 
 		default:
@@ -270,21 +328,7 @@ async function getFileSuggestions(
 			autosuggestConfig = userField?.autosuggestFilter;
 		}
 
-		const excluded = (plugin.settings.excludedFolders || "")
-			.split(",")
-			.map((s) => s.trim())
-			.filter(Boolean);
-
 		const list = await FileSuggestHelper.suggest(plugin, query, 20, autosuggestConfig);
-
-		// Filter out excluded folders
-		const filteredList = list.filter((item) => {
-			const file = plugin.app.vault
-				.getMarkdownFiles()
-				.find((f) => f.basename === item.insertText);
-			if (!file) return true;
-			return !excluded.some((ex) => file.path.startsWith(ex));
-		});
 
 		// For projects, add rich metadata rendering
 		if (propertyId === "projects") {
@@ -293,20 +337,20 @@ async function getFileSuggestions(
 			});
 			const rowConfigs = (plugin.settings?.projectAutosuggest?.rows ?? []).slice(0, 3);
 
-			return filteredList.map((item) => {
+			return list.map((item) => {
 				const displayText = item.displayText || item.insertText;
 				const insertText = item.insertText;
 
 				// Get file metadata for rendering
 				const file = plugin.app.vault
 					.getMarkdownFiles()
-					.find((f) => f.basename === item.insertText);
+					.find((f) => f.path === item.path);
 
 				// Build metadata rows using shared utility
-				let metadataRows: string[] = [];
+				let metadataRows: ProjectCompletionMetadata = [];
 				if (file && rowConfigs.length > 0) {
 					const cache = plugin.app.metadataCache.getFileCache(file);
-					const frontmatter: Record<string, any> = cache?.frontmatter || {};
+					const frontmatter: Record<string, unknown> = cache?.frontmatter || {};
 					const mapped = plugin.fieldMapper.mapFromFrontmatter(
 						frontmatter,
 						file.path,
@@ -315,7 +359,7 @@ async function getFileSuggestions(
 
 					const title = typeof mapped.title === "string" ? mapped.title : "";
 					const aliases = Array.isArray(frontmatter["aliases"])
-						? (frontmatter["aliases"] as any[]).filter((a: any) => typeof a === "string")
+						? frontmatter["aliases"].filter((a: unknown) => typeof a === "string")
 						: [];
 
 					const fileData: ProjectEntry = {
@@ -328,22 +372,23 @@ async function getFileSuggestions(
 						frontmatter,
 					};
 
-					metadataRows = resolver.buildMetadataRows(rowConfigs, fileData, parseDisplayFieldsRow);
+					metadataRows = buildProjectMetadataRows(rowConfigs, fileData, resolver);
 				}
 
 				return {
 					label: displayText,
 					apply: `[[${insertText}]] `,
 					type: "text",
-					info: "Project",
+					info: uiText(msg({ message: "Project", context: "editor/NLPCodeMirrorAutocomplete: getFileSuggestions info" })),
 					// Add metadata as a custom property for the render function
 					projectMetadata: metadataRows.length > 0 ? metadataRows : undefined,
-				} as any;
+					projectQuery: query,
+				};
 			});
 		}
 
 		// For non-project file suggestions, use simple rendering
-		return filteredList.map((item) => {
+		return list.map((item) => {
 			const displayText = item.displayText || item.insertText;
 			const insertText = item.insertText;
 
@@ -351,12 +396,121 @@ async function getFileSuggestions(
 				label: displayText,
 				apply: `[[${insertText}]] `,
 				type: "text",
-				info: propertyId === "projects" ? "Project" : propertyId,
+				info: propertyId === "projects" ? uiText(msg({ message: "Project", context: "editor/NLPCodeMirrorAutocomplete: getFileSuggestions info" })) : propertyId,
 			};
 		});
 	} catch (error) {
-		console.error(`Error getting file suggestions for ${propertyId}:`, error);
+		tasknotesLogger.error(`Error getting file suggestions for ${propertyId}:`, {
+			category: "persistence",
+			operation: "getting-file-suggestions",
+			error: error,
+		});
 		return [];
+	}
+}
+
+function buildProjectMetadataRows(
+	rowConfigs: string[],
+	fileData: ProjectEntry,
+	resolver: ProjectMetadataResolver
+): ProjectCompletionMetadata {
+	const metadataRows: ProjectCompletionMetadata = [];
+	const maxRows = Math.min(rowConfigs.length, 3);
+
+	for (let i = 0; i < maxRows; i++) {
+		const row = rowConfigs[i];
+		if (!row) continue;
+
+		try {
+			const tokens = parseDisplayFieldsRow(row);
+			const parts: ProjectCompletionMetadataPart[] = [];
+
+			for (const token of tokens) {
+				if (token.property.startsWith("literal:")) {
+					const text = token.property.slice(8);
+					if (text) {
+						parts.push({ text, searchable: false, kind: "literal" });
+					}
+					continue;
+				}
+
+				const value = resolver.resolve(token.property, fileData);
+				if (!value) continue;
+
+				if (token.showName) {
+					parts.push({
+						text: `${token.displayName ?? token.property}:`,
+						searchable: false,
+						kind: "label",
+					});
+				}
+
+				parts.push({
+					text: value,
+					searchable:
+						token.searchable === true ||
+						DEFAULT_SEARCHABLE_PROJECT_FIELDS.has(token.property),
+					kind: "value",
+				});
+			}
+
+			if (parts.some((part) => part.text.trim().length > 0)) {
+				metadataRows.push(parts);
+			}
+		} catch {
+			// Ignore invalid project metadata rows.
+		}
+	}
+
+	return metadataRows;
+}
+
+function appendHighlightedText(container: HTMLElement, text: string, query: string): void {
+	const doc = container.ownerDocument;
+	const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+	if (words.length === 0) {
+		container.textContent = text;
+		return;
+	}
+
+	const lowerText = text.toLowerCase();
+	const matches: Array<{ start: number; end: number }> = [];
+	for (const word of words) {
+		let index = lowerText.indexOf(word);
+		while (index !== -1) {
+			matches.push({ start: index, end: index + word.length });
+			index = lowerText.indexOf(word, index + 1);
+		}
+	}
+
+	matches.sort((a, b) => a.start - b.start);
+	const nonOverlappingMatches: typeof matches = [];
+	for (const match of matches) {
+		const previous = nonOverlappingMatches[nonOverlappingMatches.length - 1];
+		if (!previous || match.start >= previous.end) {
+			nonOverlappingMatches.push(match);
+		}
+	}
+
+	if (nonOverlappingMatches.length === 0) {
+		container.textContent = text;
+		return;
+	}
+
+	let lastIndex = 0;
+	for (const match of nonOverlappingMatches) {
+		if (match.start > lastIndex) {
+			container.appendChild(doc.createTextNode(text.slice(lastIndex, match.start)));
+		}
+
+		const mark = createElementInDocument(doc, "mark");
+		mark.textContent = text.slice(match.start, match.end);
+		container.appendChild(mark);
+		lastIndex = match.end;
+	}
+
+	if (lastIndex < text.length) {
+		container.appendChild(doc.createTextNode(text.slice(lastIndex)));
 	}
 }
 
@@ -371,7 +525,7 @@ function getStatusSuggestions(query: string, plugin: TaskNotesPlugin): Completio
 		label: s.display,
 		apply: s.value + " ",
 		type: "text",
-		info: "Status",
+		info: uiText(msg({ message: "Status", context: "editor/NLPCodeMirrorAutocomplete: getStatusSuggestions info" })),
 	}));
 }
 
@@ -382,13 +536,13 @@ function getPrioritySuggestions(query: string, plugin: TaskNotesPlugin): Complet
 	const priorities = plugin.settings.customPriorities || [];
 
 	return priorities
-		.filter((p) => p.label.toLowerCase().includes(query.toLowerCase()))
+		.filter((p) => [p.value, p.label, configLabel(p)].some(label => label.toLowerCase().includes(query.toLowerCase())))
 		.slice(0, 10)
 		.map((p) => ({
-			label: p.label,
+			label: configLabel(p),
 			apply: p.value + " ",
 			type: "text",
-			info: "Priority",
+			info: uiText(msg({ message: "Priority", context: "editor/NLPCodeMirrorAutocomplete: getPrioritySuggestions info" })),
 		}));
 }
 
@@ -404,6 +558,6 @@ function getBooleanSuggestions(query: string): Completion[] {
 			label: opt,
 			apply: opt + " ",
 			type: "text",
-			info: "Boolean",
+			info: uiText(msg({ message: "Boolean", context: "editor/NLPCodeMirrorAutocomplete: getBooleanSuggestions info" })),
 		}));
 }

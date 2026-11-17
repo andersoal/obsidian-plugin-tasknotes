@@ -6,107 +6,35 @@
  */
 
 import { App, Plugin } from "obsidian";
+import type { BasesViewRegistration as ObsidianBasesViewRegistration } from "obsidian";
+import { createTaskNotesLogger, type TaskNotesLogger } from "../utils/tasknotesLogger";
+import { applyBasesViewOptionDefaults } from "./basesViewOptionDefaults";
 
 export interface BasesQuery {
 	on?: (event: string, callback: () => void) => void;
 	off?: (event: string, callback: () => void) => void;
-	getViewConfig?: (key: string) => any;
-	properties?: Record<string, any>;
+	getViewConfig?: (key: string) => unknown;
+	properties?: Record<string, unknown>;
 }
 
 export interface BasesController {
 	runQuery?: () => Promise<void>;
-	getViewConfig?: () => any;
-	results?: Map<any, any>;
+	getViewConfig?: () => unknown;
+	results?: Map<unknown, unknown>;
 	query?: BasesQuery;
 }
 
 export interface BasesContainer {
-	results?: Map<any, any>;
+	results?: Map<unknown, unknown>;
 	query?: BasesQuery;
 	viewContainerEl?: HTMLElement;
 	controller?: BasesController;
 	ctx?: {
-		formulas?: Record<string, any>;
+		formulas?: Record<string, unknown>;
 	};
 }
 
-// View Option Types (Obsidian 1.10.0+ Public API)
-export type ViewOption =
-	| PropertyOption
-	| DropdownOption
-	| SliderOption
-	| ToggleOption
-	| TextOption
-	| MultitextOption
-	| GroupOption;
-
-export interface PropertyOption {
-	type: "property";
-	key: string;
-	displayName: string;
-	default?: string;
-	placeholder?: string;
-	filter?: (prop: string) => boolean;
-}
-
-export interface DropdownOption {
-	type: "dropdown";
-	key: string;
-	displayName: string;
-	options: string[];
-	default?: string;
-}
-
-export interface SliderOption {
-	type: "slider";
-	key: string;
-	displayName: string;
-	min: number;
-	max: number;
-	step: number;
-	default?: number;
-}
-
-export interface ToggleOption {
-	type: "toggle";
-	key: string;
-	displayName: string;
-	default?: boolean;
-}
-
-export interface TextOption {
-	type: "text";
-	key: string;
-	displayName: string;
-	default?: string;
-	placeholder?: string;
-}
-
-export interface MultitextOption {
-	type: "multitext";
-	key: string;
-	displayName: string;
-	default?: string;
-	placeholder?: string;
-}
-
-export interface GroupOption {
-	type: "group";
-	displayName: string;
-	options: ViewOption[];
-}
-
-/**
- * Bases View Registration interface (Obsidian 1.10.0+ Public API)
- * Updated to match official BasesViewFactory signature.
- */
-export interface BasesViewRegistration {
-	name: string;
-	icon: string;
-	factory: (controller: any, containerEl: HTMLElement) => any;
-	options?: () => ViewOption[];
-}
+export type BasesViewRegistration = ObsidianBasesViewRegistration;
 
 export interface BasesAPI {
 	registrations: Record<string, BasesViewRegistration>;
@@ -114,29 +42,56 @@ export interface BasesAPI {
 	version?: string;
 }
 
+type InternalPluginManager = {
+	getEnabledPluginById?: (id: string) => {
+		registrations?: Record<string, BasesViewRegistration>;
+		manifest?: { version?: string };
+	};
+};
+
+type AppWithInternalPlugins = {
+	internalPlugins?: InternalPluginManager;
+};
+
+function isObject(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object";
+}
+
+const basesApiLogger = createTaskNotesLogger({ tag: "Bases/API" });
+
 /**
  * Safely retrieves the Bases plugin API
  */
-export function getBasesAPI(app: App): BasesAPI | null {
+export function getBasesAPI(
+	app: App,
+	logger: TaskNotesLogger = basesApiLogger
+): BasesAPI | null {
 	try {
 		// Try the correct path for Bases plugin (internal plugins)
-		const internalPlugins = (app as any).internalPlugins;
+		const internalPlugins = (app as unknown as AppWithInternalPlugins).internalPlugins;
 		if (!internalPlugins) {
-			console.debug("[TaskNotes][Bases] Internal plugins manager not available");
+			logger.debug("Internal plugins manager not available", {
+				category: "configuration",
+				operation: "get-api",
+			});
 			return null;
 		}
 
 		const basesPlugin = internalPlugins.getEnabledPluginById?.("bases");
 		if (!basesPlugin) {
-			console.debug("[TaskNotes][Bases] Bases plugin not found or not enabled");
+			logger.debug("Bases plugin not found or not enabled", {
+				category: "configuration",
+				operation: "get-api",
+			});
 			return null;
 		}
 
 		// Check if the plugin has the expected API structure
 		if (!basesPlugin.registrations || typeof basesPlugin.registrations !== "object") {
-			console.warn(
-				"[TaskNotes][Bases] Bases plugin found but registrations API not available"
-			);
+			logger.warn("Bases plugin found but registrations API is not available", {
+				category: "provider",
+				operation: "get-api",
+			});
 			return null;
 		}
 
@@ -146,7 +101,11 @@ export function getBasesAPI(app: App): BasesAPI | null {
 			version: basesPlugin.manifest?.version || "unknown",
 		};
 	} catch (error) {
-		console.warn("[TaskNotes][Bases] Error accessing Bases plugin API:", error);
+		logger.warn("Error accessing Bases plugin API", {
+			category: "provider",
+			operation: "get-api",
+			error,
+		});
 		return null;
 	}
 }
@@ -166,39 +125,59 @@ export function isBasesPluginAvailable(app: App): boolean {
 export function registerBasesView(
 	plugin: Plugin,
 	viewId: string,
-	registration: BasesViewRegistration
+	registration: BasesViewRegistration,
+	logger: TaskNotesLogger = basesApiLogger
 ): boolean {
 	// Use public API (Obsidian 1.10.0+)
-	if (typeof (plugin as any).registerBasesView === "function") {
+	if (typeof plugin.registerBasesView === "function") {
 		try {
-			const success = (plugin as any).registerBasesView(viewId, registration);
+			const options = registration.options;
+			const compatibleRegistration: BasesViewRegistration = options
+				? {
+					...registration,
+					options: (config) => applyBasesViewOptionDefaults(options(config), config),
+				}
+				: registration;
+			const success = plugin.registerBasesView(viewId, compatibleRegistration);
 			if (success) {
-				console.debug(
-					`[TaskNotes][Bases] Successfully registered view via public API: ${viewId}`
-				);
+				logger.debug("Successfully registered view via public API", {
+					category: "configuration",
+					operation: "register-view",
+					details: { viewId },
+				});
 				return true;
 			}
-			console.debug(
-				`[TaskNotes][Bases] Public API returned false (Bases may be disabled)`
-			);
+			logger.debug("Public API returned false", {
+				category: "configuration",
+				operation: "register-view",
+				details: { viewId },
+			});
 			return false;
-		} catch (error: any) {
+		} catch (error: unknown) {
 			// Check if error is because view already exists - treat as success
-			if (error?.message?.includes("already exists")) {
-				console.debug(
-					`[TaskNotes][Bases] View ${viewId} already registered via public API`
-				);
+			if (error instanceof Error && error.message.includes("already exists")) {
+				logger.debug("View already registered via public API", {
+					category: "configuration",
+					operation: "register-view",
+					details: { viewId },
+				});
 				return true;
 			}
-			console.warn(
-				`[TaskNotes][Bases] Public API registration failed for ${viewId}:`,
-				error
-			);
+			logger.warn("Public API registration failed", {
+				category: "provider",
+				operation: "register-view",
+				details: { viewId },
+				error,
+			});
 			return false;
 		}
 	}
 
-	console.warn("[TaskNotes][Bases] Cannot register view: Bases public API not available (requires Obsidian 1.10.0+)");
+	logger.warn("Cannot register view because Bases public API is not available", {
+		category: "configuration",
+		operation: "register-view",
+		details: { viewId },
+	});
 	return false;
 }
 
@@ -206,8 +185,12 @@ export function registerBasesView(
  * Safely unregister a view from the Bases plugin
  * Note: Public API doesn't provide unregister method, so we use internal API
  */
-export function unregisterBasesView(plugin: Plugin, viewId: string): boolean {
-	const api = getBasesAPI(plugin.app);
+export function unregisterBasesView(
+	plugin: Plugin,
+	viewId: string,
+	logger: TaskNotesLogger = basesApiLogger
+): boolean {
+	const api = getBasesAPI(plugin.app, logger);
 	if (!api) {
 		// If Bases is not available, consider unregistration successful
 		return true;
@@ -219,7 +202,12 @@ export function unregisterBasesView(plugin: Plugin, viewId: string): boolean {
 		}
 		return true;
 	} catch (error) {
-		console.error(`[TaskNotes][Bases] Error unregistering view ${viewId}:`, error);
+		logger.error("Error unregistering view", {
+			category: "provider",
+			operation: "unregister-view",
+			details: { viewId },
+			error,
+		});
 		return false;
 	}
 }
@@ -227,14 +215,16 @@ export function unregisterBasesView(plugin: Plugin, viewId: string): boolean {
 /**
  * Type guard to check if a container is a valid BasesContainer
  */
-export function isValidBasesContainer(container: any): container is BasesContainer {
+export function isValidBasesContainer(container: unknown): container is BasesContainer {
+	if (!isObject(container)) {
+		return false;
+	}
+
 	// Use cross-window compatible instanceOf check for pop-out window support
 	const isValidViewContainer =
 		container.viewContainerEl === undefined ||
-		(container.viewContainerEl as Node)?.instanceOf?.(HTMLElement);
+		(container.viewContainerEl as Node)?.instanceOf?.(HTMLElement) === true;
 	return (
-		container &&
-		typeof container === "object" &&
 		(container.results instanceof Map || container.results === undefined) &&
 		isValidViewContainer
 	);

@@ -1,12 +1,33 @@
 import { BasesDataItem } from "./helpers";
-import { BasesEntryLike, BasesGroupLike, BasesValueLike, BasesViewLike } from "./types";
+import type {
+	BasesEntry,
+	BasesEntryGroup,
+	BasesPropertyId,
+	BasesView,
+} from "obsidian";
+import { createTaskNotesLogger, type TaskNotesLogger } from "../utils/tasknotesLogger";
+import {
+	convertBasesGroupKeyToLinkTitle,
+	convertBasesGroupKeyToString,
+	convertBasesValueToNative,
+} from "./basesValueConversion";
+import { extractBasesEntryProperties } from "./basesEntryProperties";
+
+type BasesViewDataSource = Pick<BasesView, "config" | "data">;
 
 /**
  * Adapter for accessing Bases data using public API (1.10.0+).
  * Eliminates all internal API dependencies.
  */
 export class BasesDataAdapter {
-	constructor(private basesView: BasesViewLike) {}
+	private readonly logger: TaskNotesLogger;
+
+	constructor(
+		private basesView: BasesViewDataSource,
+		logger: TaskNotesLogger = createTaskNotesLogger({ tag: "Bases/DataAdapter" })
+	) {
+		this.logger = logger;
+	}
 
 	/**
 	 * Extract all data items from Bases query result.
@@ -18,7 +39,7 @@ export class BasesDataAdapter {
 	 */
 	extractDataItems(): BasesDataItem[] {
 		const entries = this.basesView.data.data;
-		return entries.map((entry: BasesEntryLike) => ({
+		return entries.map((entry) => ({
 			key: entry.file.path,
 			data: entry,
 			file: entry.file,
@@ -34,7 +55,7 @@ export class BasesDataAdapter {
 	 *
 	 * Note: Returns pre-grouped data. Bases has already applied groupBy configuration.
 	 */
-	getGroupedData(): BasesGroupLike[] {
+	getGroupedData(): BasesEntryGroup[] {
 		return this.basesView.data.groupedData;
 	}
 
@@ -82,68 +103,26 @@ export class BasesDataAdapter {
 	 * Uses public API: basesView.config.getDisplayName()
 	 */
 	getPropertyDisplayName(propertyId: string): string {
-		return this.basesView.config.getDisplayName(propertyId);
+		return this.basesView.config.getDisplayName(propertyId as BasesPropertyId);
 	}
 
 	/**
 	 * Get property value from a Bases entry.
 	 * Uses public API: entry.getValue()
 	 */
-	getPropertyValue(entry: BasesEntryLike, propertyId: string): unknown {
+	getPropertyValue(entry: BasesEntry, propertyId: string): unknown {
 		try {
-			const value = entry.getValue(propertyId);
-			return this.convertValueToNative(value);
+			const value = entry.getValue(propertyId as BasesPropertyId);
+			return convertBasesValueToNative(value);
 		} catch (e) {
-			console.warn(`[BasesDataAdapter] Failed to get property ${propertyId}:`, e);
+			this.logger.warn("Failed to get property value", {
+				category: "provider",
+				operation: "get-property-value",
+				details: { propertyId },
+				error: e,
+			});
 			return null;
 		}
-	}
-
-
-	/**
-	 * Convert Bases Value object to native JavaScript value.
-	 * Handles: PrimitiveValue, ListValue, DateValue, FileValue, NullValue, etc.
-	 */
-	private convertValueToNative(value: BasesValueLike | unknown): unknown {
-		const basesValue = value as BasesValueLike | null | undefined;
-		if (basesValue == null || basesValue.constructor?.name === "NullValue") {
-			return null;
-		}
-
-		// PrimitiveValue (string, number, boolean)
-		if (typeof basesValue.data !== "undefined") {
-			return basesValue.data;
-		}
-
-		// ListValue
-		if (typeof basesValue.length === "function" && typeof basesValue.at === "function") {
-			const len = basesValue.length();
-			const result = [];
-			for (let i = 0; i < len; i++) {
-				const item = basesValue.at(i);
-				result.push(this.convertValueToNative(item));
-			}
-			return result;
-		}
-
-		// DateValue - check for date property (more reliable than constructor check)
-		if (basesValue.date instanceof Date) {
-			// Return the date as ISO string for consistency
-			return basesValue.date.toISOString();
-		}
-
-		// DateValue - legacy check with toISOString method
-		if (basesValue.constructor?.name === "DateValue" && basesValue.toISOString) {
-			return basesValue.toISOString();
-		}
-
-		// FileValue
-		if (basesValue.file) {
-			return basesValue.file.path;
-		}
-
-		// Fallback: try to extract raw data
-		return basesValue;
 	}
 
 	/**
@@ -151,58 +130,21 @@ export class BasesDataAdapter {
 	 * Handles Bases Value objects, particularly DateValue which has special structure.
 	 * For FileValue (links), returns the file path which can be rendered as a clickable link.
 	 */
-	convertGroupKeyToString(key: BasesValueLike | unknown): string {
-		const basesKey = key as BasesValueLike | null | undefined;
-		// Check if key exists and is valid
-		if (basesKey == null || (basesKey.hasKey && !basesKey.hasKey())) {
-			return "Unknown";
-		}
+	convertGroupKeyToString(key: unknown): string {
+		return convertBasesGroupKeyToString(key);
+	}
 
-		// Extract the actual value from Bases Value object
-		let actualValue: unknown;
-
-		// FileValue has a .file property containing the TFile object
-		if (basesKey.file && typeof basesKey.file === "object") {
-			// Return the full path so it can be rendered as a clickable link
-			actualValue = basesKey.file.path;
-		}
-		// DateValue has a .date property containing the Date object
-		else if (basesKey.date instanceof Date) {
-			actualValue = basesKey.date;
-		}
-		// Other Value types have a .data property
-		else if (typeof basesKey.data !== "undefined") {
-			actualValue = basesKey.data;
-		}
-		// Fallback: try to use the key directly
-		else {
-			actualValue = basesKey;
-		}
-
-		// Handle null/undefined after extraction
-		if (actualValue === null || actualValue === undefined) {
-			return "None";
-		}
-
-		// Format Date objects as YYYY-MM-DD (date only, no time)
-		if (actualValue instanceof Date) {
-			const year = actualValue.getFullYear();
-			const month = String(actualValue.getMonth() + 1).padStart(2, '0');
-			const day = String(actualValue.getDate()).padStart(2, '0');
-			return `${year}-${month}-${day}`;
-		}
-
-		// Handle other types
-		if (typeof actualValue === "string") {
-			return actualValue || "None";
-		}
-		if (typeof actualValue === "number") return String(actualValue);
-		if (typeof actualValue === "boolean") return actualValue ? "True" : "False";
-		if (Array.isArray(actualValue)) {
-			return actualValue.length > 0 ? actualValue.join(", ") : "None";
-		}
-
-		return String(actualValue);
+	/** Link markup for the Bases group whose string key is `groupKey`, when its value is a link. */
+	getGroupLinkTitle(groupKey: string): string | null {
+		// Views can render headers before Bases has supplied data.
+		const groups: BasesEntryGroup[] = this.basesView.data?.groupedData ?? [];
+		const titles = new Set(
+			groups
+				.filter((group) => this.convertGroupKeyToString(group.key) === groupKey)
+				.map((group) => convertBasesGroupKeyToLinkTitle(group.key))
+		);
+		const [title] = titles;
+		return titles.size === 1 && title ? title : null;
 	}
 
 	/**
@@ -210,38 +152,12 @@ export class BasesDataAdapter {
 	 * Extracts frontmatter and basic file properties only (cheap operations).
 	 * Computed file properties (backlinks, links, etc.) are fetched lazily via getComputedProperty().
 	 */
-	private extractEntryProperties(entry: BasesEntryLike): Record<string, unknown> {
-		// Extract all properties from the entry's frontmatter
-		// We don't filter by visible properties here - that happens during rendering
-		// This ensures all properties are available for TaskInfo creation
-		const frontmatter = entry.frontmatter || entry.properties || {};
-
-		// Start with frontmatter properties
-		const result = { ...frontmatter };
-
-		// Also extract file properties directly from the TFile object (these are cheap - no getValue calls)
-		const file = entry.file;
-		if (file) {
-			// Add common TFile properties with file. prefix
-			if (file.name !== undefined) result["file.name"] = file.name;
-			if (file.basename !== undefined) result["file.basename"] = file.basename;
-			if (file.extension !== undefined) result["file.extension"] = file.extension;
-			if (file.path !== undefined) result["file.path"] = file.path;
-
-			// Add file stats if available
-			if (file.stat) {
-				if (file.stat.size !== undefined) result["file.size"] = file.stat.size;
-				if (file.stat.ctime !== undefined) result["file.ctime"] = file.stat.ctime;
-				if (file.stat.mtime !== undefined) result["file.mtime"] = file.stat.mtime;
-			}
-		}
-
+	private extractEntryProperties(entry: BasesEntry): Record<string, unknown> {
 		// NOTE: Computed file properties (links, embeds, tags, backlinks, etc.) are NOT extracted here.
 		// They are fetched lazily via getComputedProperty() during rendering to avoid expensive
 		// getValue() calls for all 6756+ entries. With virtualization, only ~20-50 visible items
 		// need these properties computed.
-
-		return result;
+		return extractBasesEntryProperties(entry);
 	}
 
 	/**
@@ -249,25 +165,18 @@ export class BasesDataAdapter {
 	 * Call this during rendering for visible items only - NOT during bulk extraction.
 	 * This is much more efficient for expensive properties like backlinks.
 	 */
-	getComputedProperty(basesEntry: BasesEntryLike | null | undefined, propertyId: string): unknown {
-		if (!basesEntry) return null;
+	getComputedProperty(basesEntry: unknown, propertyId: string): unknown {
+		if (!basesEntry || typeof basesEntry !== "object") return null;
 
 		try {
-			const value = basesEntry.getValue(propertyId);
-			return this.convertValueToNative(value);
-		} catch (e) {
+			const getValue = (basesEntry as { getValue?: (id: BasesPropertyId) => unknown })
+				.getValue;
+			if (typeof getValue !== "function") return null;
+			const value = getValue.call(basesEntry, propertyId);
+			return convertBasesValueToNative(value);
+		} catch {
 			return null;
 		}
 	}
 
-	/**
-	 * Remove property type prefix (note., file., formula.)
-	 */
-	private stripPropertyPrefix(propertyId: string): string {
-		const parts = propertyId.split(".");
-		if (parts.length > 1 && ["note", "file", "formula"].includes(parts[0])) {
-			return parts.slice(1).join(".");
-		}
-		return propertyId;
-	}
 }

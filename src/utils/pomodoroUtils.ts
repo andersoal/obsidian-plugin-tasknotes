@@ -1,15 +1,22 @@
-/* eslint-disable @typescript-eslint/no-non-null-assertion */
+/* eslint-disable @typescript-eslint/no-non-null-assertion -- Timer helpers check active interval state before clearing handles. */
 /**
  * Pomodoro Utility Functions
  */
 
 import { PomodoroTimePeriod } from "../types";
 
+type PomodoroSessionLike = {
+	activePeriods?: PomodoroTimePeriod[];
+	duration?: number;
+	startTime?: string;
+	endTime?: string;
+};
+
 /**
  * Backward compatibility helper for calculating duration
  * Can be used in stats calculations to handle both old and new formats
  */
-export function getSessionDuration(session: any): number {
+export function getSessionDuration(session: PomodoroSessionLike): number {
 	// New format: calculate from activePeriods
 	if (session.activePeriods && Array.isArray(session.activePeriods)) {
 		return session.activePeriods
@@ -38,35 +45,4 @@ export function getSessionDuration(session: any): number {
 	return 0;
 }
 
-export const timerWorker = `
-  let timerInterval;
-
-  self.onmessage = function(e) {
-    const { command, duration } = e.data;
-
-    if (command === 'start') {
-      if (timerInterval) {
-        clearInterval(timerInterval);
-      }
-
-      let timeRemaining = duration;
-      timerInterval = setInterval(() => {
-        timeRemaining--;
-        // Notificar al hilo principal cada segundo para actualizar la UI
-        self.postMessage({ type: 'tick', timeRemaining: timeRemaining });
-
-        if (timeRemaining <= 0) {
-          self.postMessage({ type: 'done' });
-          clearInterval(timerInterval);
-          timerInterval = null;
-        }
-      }, 1000);
-
-    } else if (command === 'stop') {
-      if (timerInterval) {
-        clearInterval(timerInterval);
-        timerInterval = null;
-      }
-    }
-  };
-`;
+/* eslint-enable @typescript-eslint/no-non-null-assertion -- Re-enable after the Pomodoro utility implementation. */

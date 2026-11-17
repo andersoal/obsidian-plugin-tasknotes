@@ -398,6 +398,41 @@ describe('MicrosoftCalendarService', () => {
 	});
 
 	describe('updateEvent', () => {
+		test('should update events for opaque Exchange calendar IDs with URL-safe Base64 padding', async () => {
+			const exchangeCalendarId = 'AAMkAGVmMDEzLWQ2ZTItNDlhNi04ZGVlLWE5YzI0ZDBmZmI0MQBGAAAAAABJfK9X-6kTRqRX4dQ0n5I8BwABF5Gfe_M0Tqe7tZxHdg4mAAAAAAEGAABF5Gfe_M0Tqe7tZxHdg4mAAABJrC3AAA=';
+			const exchangeEventId = 'AAMkAGVmMDEzLWQ2ZTItNDlhNi04ZGVlLWE5YzI0ZDBmZmI0MQBGAAAAAABJfK9X-6kTRqRX4dQ0n5I8BwABF5Gfe_M0Tqe7tZxHdg4mAAABJrC3AABk_TEST=';
+			const updates = {
+				start: '2025-10-23T10:00:00',
+				end: '2025-10-23T11:00:00'
+			};
+
+			mockRequestUrl.mockResolvedValueOnce({
+				status: 200,
+				json: {
+					id: exchangeEventId,
+					subject: 'Meeting',
+					start: { dateTime: updates.start, timeZone: 'UTC' },
+					end: { dateTime: updates.end, timeZone: 'UTC' },
+					isAllDay: false,
+					webLink: 'https://outlook.office365.com/calendar/item'
+				},
+				text: '',
+				arrayBuffer: new ArrayBuffer(0),
+				headers: {}
+			});
+
+			await service.updateEvent(exchangeCalendarId, exchangeEventId, updates);
+
+			expect(mockRequestUrl).toHaveBeenCalledWith(
+				expect.objectContaining({
+					url: expect.stringContaining(
+						`/calendars/${encodeURIComponent(exchangeCalendarId)}/events/${encodeURIComponent(exchangeEventId)}`
+					),
+					method: 'PATCH'
+				})
+			);
+		});
+
 		test('should update event properties', async () => {
 			const updates = {
 				title: 'Updated Meeting',
@@ -631,6 +666,83 @@ describe('MicrosoftCalendarService', () => {
 			});
 
 			await expect(service.listCalendars()).rejects.toThrow();
+		});
+	});
+
+	describe('Sync Status', () => {
+		test('should record successful calendar refresh status separately from OAuth status', async () => {
+			mockPlugin.settings!.enabledMicrosoftCalendars = ['AAMkADA1'];
+			mockRequestUrl
+				.mockResolvedValueOnce({
+					status: 200,
+					json: mockCalendarList,
+					text: '',
+					arrayBuffer: new ArrayBuffer(0),
+					headers: {}
+				})
+				.mockResolvedValueOnce({
+					status: 200,
+					json: mockEventsList,
+					text: '',
+					arrayBuffer: new ArrayBuffer(0),
+					headers: {}
+				});
+
+			await service.refreshAllCalendars();
+
+			const status = service.getSyncStatus();
+			expect(status.lastAttempt).toBeTruthy();
+			expect(status.lastSuccess).toBeTruthy();
+			expect(status.lastError).toBeNull();
+			expect(status.calendarErrors).toEqual([]);
+			expect(status.calendarsChecked).toBe(1);
+			expect(status.eventsLoaded).toBe(2);
+		});
+
+		test('should record per-calendar fetch errors without throwing away the diagnostic state', async () => {
+			const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+			mockPlugin.settings!.enabledMicrosoftCalendars = ['AAMkADA1'];
+			mockRequestUrl
+				.mockResolvedValueOnce({
+					status: 200,
+					json: mockCalendarList,
+					text: '',
+					arrayBuffer: new ArrayBuffer(0),
+					headers: {}
+				})
+				.mockRejectedValueOnce(Object.assign(new Error('Forbidden'), { status: 403 }));
+
+			await service.refreshAllCalendars();
+
+			const status = service.getSyncStatus();
+			expect(status.lastAttempt).toBeTruthy();
+			expect(status.lastSuccess).toBeNull();
+			expect(status.lastError).toContain('Calendar');
+			expect(status.lastError).toContain('Forbidden');
+			expect(status.calendarErrors).toHaveLength(1);
+			expect(status.calendarErrors[0]).toMatchObject({
+				calendarId: 'AAMkADA1',
+				calendarName: 'Calendar',
+				status: 403
+			});
+			expect(status.eventsLoaded).toBe(0);
+			consoleErrorSpy.mockRestore();
+		});
+
+		test('should record calendar list failures as sync failures', async () => {
+			const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+			mockRequestUrl.mockRejectedValueOnce(Object.assign(new Error('Unauthorized'), { status: 401 }));
+
+			await service.refreshAllCalendars();
+
+			const status = service.getSyncStatus();
+			expect(status.lastAttempt).toBeTruthy();
+			expect(status.lastSuccess).toBeNull();
+			expect(status.lastError).toContain('Failed to fetch calendar list');
+			expect(status.calendarErrors).toHaveLength(1);
+			expect(status.calendarErrors[0].status).toBe(401);
+			expect(status.calendarsChecked).toBe(0);
+			consoleErrorSpy.mockRestore();
 		});
 	});
 

@@ -1,6 +1,9 @@
-/* eslint-disable no-console */
+import { withPluginDataWriteLock } from "../utils/pluginDataWriteLock";
 import { PendingAutoArchive, TaskInfo, StatusConfig } from "../types";
 import TaskNotesPlugin from "../main";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Services/AutoArchiveService" });
 
 /**
  * Service for automatically archiving tasks based on status configuration.
@@ -8,7 +11,8 @@ import TaskNotesPlugin from "../main";
  */
 export class AutoArchiveService {
 	private plugin: TaskNotesPlugin;
-	private processorInterval: ReturnType<typeof setInterval> | null = null;
+	private processorTimer: number | null = null;
+	private isRunning = false;
 	private readonly PROCESSOR_INTERVAL_MS = 60000; // Check every 60 seconds
 
 	constructor(plugin: TaskNotesPlugin) {
@@ -19,29 +23,69 @@ export class AutoArchiveService {
 		return !!task.googleCalendarEventId;
 	}
 
+	private normalizeStatusValue(value: unknown): string {
+		return typeof value === "boolean" ? (value ? "true" : "false") : String(value);
+	}
+
+	private getCalendarCleanupState(): "ready" | "retry" | "skip" {
+		const googleCalendarExport = this.plugin.settings.googleCalendarExport;
+
+		if (!googleCalendarExport?.enabled || !googleCalendarExport?.syncOnTaskDelete) {
+			return "skip";
+		}
+
+		if (!this.plugin.taskCalendarSyncService) {
+			return "retry";
+		}
+
+		return this.plugin.taskCalendarSyncService.isEnabled() ? "ready" : "retry";
+	}
+
 	/**
 	 * Start the auto-archive service and begin periodic processing
 	 */
 	async start(): Promise<void> {
+		this.stop();
+		this.isRunning = true;
+
 		// Process any missed archives from when plugin was offline
 		await this.processQueue();
 
-		// Start periodic processor
-		this.processorInterval = setInterval(() => {
-			this.processQueue().catch((error) => {
-				console.error("Error processing auto-archive queue:", error);
-			});
-		}, this.PROCESSOR_INTERVAL_MS);
+		this.scheduleNextProcess();
 	}
 
 	/**
 	 * Stop the auto-archive service
 	 */
 	stop(): void {
-		if (this.processorInterval) {
-			clearInterval(this.processorInterval);
-			this.processorInterval = null;
+		this.isRunning = false;
+		if (this.processorTimer !== null) {
+			window.clearTimeout(this.processorTimer);
+			this.processorTimer = null;
 		}
+	}
+
+	private scheduleNextProcess(): void {
+		if (!this.isRunning) {
+			return;
+		}
+
+		this.processorTimer = window.setTimeout(() => {
+			this.processorTimer = null;
+			this.processQueue()
+				.catch((error) => {
+					tasknotesLogger.error("Error processing auto-archive queue:", {
+						category: "persistence",
+						operation: "processing-auto-archive-queue",
+						error: error,
+					});
+				})
+				.finally(() => {
+					if (this.isRunning) {
+						this.scheduleNextProcess();
+					}
+				});
+		}, this.PROCESSOR_INTERVAL_MS);
 	}
 
 	/**
@@ -49,6 +93,11 @@ export class AutoArchiveService {
 	 */
 	async scheduleAutoArchive(task: TaskInfo, statusConfig: StatusConfig): Promise<void> {
 		if (!statusConfig.autoArchive) {
+			return;
+		}
+
+		if (task.recurrence) {
+			await this.cancelAutoArchive(task.path);
 			return;
 		}
 
@@ -120,7 +169,11 @@ export class AutoArchiveService {
 					remainingItems.push(item);
 				}
 			} catch (error) {
-				console.error(`Error processing auto-archive for ${item.taskPath}:`, error);
+				tasknotesLogger.error(`Error processing auto-archive for ${item.taskPath}:`, {
+					category: "persistence",
+					operation: "processing-auto-archive",
+					error: error,
+				});
 				// Keep item for retry on next cycle
 				remainingItems.push(item);
 			}
@@ -144,21 +197,42 @@ export class AutoArchiveService {
 			return true;
 		}
 
-		if (currentTask.status !== item.statusValue) {
+		if (
+			this.normalizeStatusValue(currentTask.status) !==
+			this.normalizeStatusValue(item.statusValue)
+		) {
 			// Task status changed since scheduling, consider processed
 			return true;
 		}
 
 		if (currentTask.archived) {
-			if (
-				this.plugin.taskCalendarSyncService?.isEnabled() &&
-				this.hasGoogleCalendarLink(currentTask)
-			) {
+			if (this.hasGoogleCalendarLink(currentTask)) {
+				const calendarCleanupState = this.getCalendarCleanupState();
+				if (calendarCleanupState === "skip") {
+					return true;
+				}
+
+				if (calendarCleanupState === "retry") {
+					tasknotesLogger.warn(
+						`Auto-archive Google cleanup deferred until calendar sync is ready for ${item.taskPath}`,
+						{
+							category: "provider",
+							operation:
+								"auto-archive-google-cleanup-deferred-until-calendar-sync-ready",
+						}
+					);
+					return false;
+				}
+
 				const deleted =
 					await this.plugin.taskCalendarSyncService.deleteTaskFromCalendar(currentTask);
 				if (!deleted) {
-					console.warn(
-						`Auto-archive Google cleanup still pending for ${item.taskPath}`
+					tasknotesLogger.warn(
+						`Auto-archive Google cleanup still pending for ${item.taskPath}`,
+						{
+							category: "provider",
+							operation: "auto-archive-google-cleanup-still-pending",
+						}
 					);
 				}
 				return deleted;
@@ -171,16 +245,32 @@ export class AutoArchiveService {
 		// Archive the task
 		try {
 			const archivedTask = await this.plugin.taskService.toggleArchive(currentTask);
-			if (
-				archivedTask.archived &&
-				this.plugin.taskCalendarSyncService?.isEnabled() &&
-				this.hasGoogleCalendarLink(archivedTask)
-			) {
+			if (archivedTask.archived && this.hasGoogleCalendarLink(archivedTask)) {
+				item.taskPath = archivedTask.path;
+				const calendarCleanupState = this.getCalendarCleanupState();
+				if (calendarCleanupState === "skip") {
+					return true;
+				}
+
+				if (calendarCleanupState === "retry") {
+					tasknotesLogger.warn(
+						`Auto-archive Google cleanup deferred until calendar sync is ready for ${item.taskPath}`,
+						{
+							category: "provider",
+							operation:
+								"auto-archive-google-cleanup-deferred-until-calendar-sync-ready",
+						}
+					);
+				}
 				return false;
 			}
 			return true;
 		} catch (error) {
-			console.error(`Failed to archive task ${item.taskPath}:`, error);
+			tasknotesLogger.error(`Failed to archive task ${item.taskPath}:`, {
+				category: "persistence",
+				operation: "archive-task",
+				error: error,
+			});
 			return false; // Retry later
 		}
 	}
@@ -189,7 +279,9 @@ export class AutoArchiveService {
 	 * Get the current auto-archive queue from plugin data
 	 */
 	private async getQueue(): Promise<PendingAutoArchive[]> {
-		const data = await this.plugin.loadData();
+		const data = (await this.plugin.loadData()) as {
+			autoArchiveQueue?: PendingAutoArchive[];
+		} | null;
 		return data?.autoArchiveQueue || [];
 	}
 
@@ -197,9 +289,12 @@ export class AutoArchiveService {
 	 * Save the auto-archive queue to plugin data
 	 */
 	private async saveQueue(queue: PendingAutoArchive[]): Promise<void> {
-		const data = (await this.plugin.loadData()) || {};
-		data.autoArchiveQueue = queue;
-		await this.plugin.saveData(data);
+		await withPluginDataWriteLock(this.plugin, async () => {
+			const data = await this.plugin.loadPluginDataForSafeWrite("save-auto-archive-queue");
+			if (!data) return;
+			data.autoArchiveQueue = queue;
+			await this.plugin.saveData(data);
+		});
 	}
 
 	/**

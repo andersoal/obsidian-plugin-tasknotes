@@ -1,9 +1,10 @@
+import { uiData } from "../i18n/dataText";
 import { App, TFile, parseLinktext } from "obsidian";
 import type { TaskDependency, TaskDependencyRelType } from "../types";
 import { splitListPreservingLinksAndQuotes } from "./stringSplit";
 import { generateLink, parseLinkToPath } from "./linkUtils";
 
-export const DEFAULT_DEPENDENCY_RELTYPE: TaskDependencyRelType = "FINISHTOSTART";
+export const DEFAULT_DEPENDENCY_RELTYPE: TaskDependencyRelType = uiData("FINISHTOSTART", "RFC 5545 dependency relationship wire identifier, also displayed verbatim as metadata");
 
 const VALID_RELATIONSHIP_TYPES: TaskDependencyRelType[] = [
 	"FINISHTOSTART",
@@ -16,8 +17,17 @@ export function isValidDependencyRelType(value: string): value is TaskDependency
 	return VALID_RELATIONSHIP_TYPES.includes(value as TaskDependencyRelType);
 }
 
-export function extractDependencyUid(entry: TaskDependency | string): string {
-	return typeof entry === "string" ? entry : entry.uid;
+export function extractDependencyUid(entry: unknown): string {
+	if (typeof entry === "string") {
+		return entry;
+	}
+
+	if (typeof entry === "object" && entry !== null) {
+		const uid = (entry as Record<string, unknown>).uid;
+		return typeof uid === "string" ? uid : "";
+	}
+
+	return "";
 }
 
 export function normalizeDependencyEntry(value: unknown): TaskDependency | null {
@@ -36,7 +46,7 @@ export function normalizeDependencyEntry(value: unknown): TaskDependency | null 
 		const normalizedUid = parseLinkToPath(rawUid);
 		const reltypeRaw = typeof raw.reltype === "string" ? raw.reltype.trim().toUpperCase() : "";
 		const reltype = isValidDependencyRelType(reltypeRaw)
-			? (reltypeRaw as TaskDependencyRelType)
+			? (reltypeRaw)
 			: DEFAULT_DEPENDENCY_RELTYPE;
 		const gap = typeof raw.gap === "string" && raw.gap.trim().length > 0 ? raw.gap.trim() : undefined;
 		return gap ? { uid: normalizedUid, reltype, gap } : { uid: normalizedUid, reltype };
@@ -62,7 +72,7 @@ export function normalizeDependencyList(value: unknown): TaskDependency[] | unde
 	return normalized.length > 0 ? normalized : undefined;
 }
 
-export function serializeDependencies(dependencies: TaskDependency[]): any[] {
+export function serializeDependencies(dependencies: TaskDependency[]): unknown[] {
 	return dependencies.map((dependency) => {
 		// Wrap uid in wikilink brackets if not already wrapped.
 		// normalizeDependencyEntry() strips link formatting from uids,
@@ -81,7 +91,7 @@ export function serializeDependencies(dependencies: TaskDependency[]): any[] {
 
 export interface DependencyResolution {
 	path: string;
-	file: TFile | null;
+	file: TFile;
 }
 
 export function parseDependencyInput(value: string): string[] {

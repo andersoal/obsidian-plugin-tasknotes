@@ -24,6 +24,13 @@ styles.css
 # Don't include the auto-generated release notes import file
 src/releaseNotes.ts
 
+# Generated compiled ICU data; authored PO files are the source of truth.
+/src/i18n/locales/*/messages.json
+
+# Generated language-pack exports and local bundle measurements
+/dist/
+tasknotes-e2e-vault/.obsidian/plugins/tasknotes/language-packs/
+
 # Exclude sourcemaps
 *.map
 
@@ -87,3 +94,22 @@ AGENTS.md
 /docs-builder/dist
 .ops/
 .serena/
+/.codex
+
+# Hyperframes release-announcement videos
+# Track HTML source + audio + docs in git; ignore rendered mp4s and experimental dirs.
+/release-videos/*
+!/release-videos/_audio/
+!/release-videos/_shared/
+!/release-videos/_shared/**
+!/release-videos/INSTRUCTIONS.md
+!/release-videos/render-with-crt.sh
+!/release-videos/4.5.2/
+/release-videos/_audio/*.wav
+/release-videos/_audio/__pycache__/
+/release-videos/4.5.2/*.mp4
+/release-videos
+/.agents/skills/impeccable
+/.tmp
+/DESIGN.md
+/PRODUCT.md

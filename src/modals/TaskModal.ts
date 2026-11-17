@@ -1,154 +1,196 @@
-import {
-	App,
-	Modal,
-	Notice,
-	Setting,
-	setIcon,
-	TAbstractFile,
-	TFile,
-	AbstractInputSuggest,
-	setTooltip,
-} from "obsidian";
+import { uiData } from "../i18n/dataText";
+import type { MessageDescriptor } from "@lingui/core";
+import { msg } from "@lingui/core/macro";
+import { App, Modal, Notice, TAbstractFile, TFile } from "obsidian";
+
+type Nullable<T> = T | null;
+
 import TaskNotesPlugin from "../main";
-import { getOrderedModalGroups, shouldShowFieldForModal } from "./taskModalFieldConfig";
-import { createTaskModalMarkdownEditor } from "./taskModalEditorAdapter";
-import { DateContextMenu } from "../components/DateContextMenu";
-import { PriorityContextMenu } from "../components/PriorityContextMenu";
-import { StatusContextMenu } from "../components/StatusContextMenu";
-import { RecurrenceContextMenu } from "../components/RecurrenceContextMenu";
-import { ReminderContextMenu } from "../components/ReminderContextMenu";
-import { getDatePart, getTimePart, combineDateAndTime } from "../utils/dateUtils";
-import { sanitizeTags, splitFrontmatterAndBody } from "../utils/helpers";
+import { shouldShowFieldForModal } from "./taskModalFieldConfig";
+import type { ModalFieldConfigLike, ModalFieldsConfigLike } from "./taskModalFieldConfig";
+import {
+	renderTaskModalFieldGroups,
+	type TaskModalFieldRendererMap,
+} from "./taskModalFieldRenderer";
+import {
+	createTaskModalDetailsEditor,
+	destroyTaskModalDetailsEditor,
+	setTaskModalDetailsEditorValue,
+} from "./taskModalDetailsEditor";
+import { splitFrontmatterAndBody } from "../utils/helpers";
 import { ProjectSelectModal } from "./ProjectSelectModal";
-import { TaskDependency, TaskInfo, Reminder } from "../types";
+import { AttachmentFileSuggestModal } from "./AttachmentFileSuggestModal";
 import {
-	DEFAULT_DEPENDENCY_RELTYPE,
-	formatDependencyLink,
-	normalizeDependencyEntry,
-	resolveDependencyEntry,
-} from "../utils/dependencyUtils";
+	TaskModalAttachmentsField,
+	materializeTaskModalAttachments,
+	type MaterializedTaskModalAttachments,
+	type TaskModalAttachmentEntry,
+} from "./taskModalAttachments";
+import { fieldLabelForId } from "../i18n/fieldLabels";
+import { createVaultBinaryFile } from "../services/VaultMutationService";
+import { TaskDependency } from "../types";
+import { DEFAULT_DEPENDENCY_RELTYPE, formatDependencyLink } from "../utils/dependencyUtils";
+import { type LinkServices } from "../ui/renderers/linkRenderer";
+import { generateLink } from "../utils/linkUtils";
+import type { EmbeddableMarkdownEditor } from "../editor/EmbeddableMarkdownEditor";
 import {
-	appendInternalLink,
-	renderProjectLinks,
-	type LinkServices,
-} from "../ui/renderers/linkRenderer";
-import { openTaskSelector } from "./TaskSelectorWithCreateModal";
-import { generateLink, generateLinkWithDisplay, parseLinkToPath } from "../utils/linkUtils";
-import { EmbeddableMarkdownEditor } from "../editor/EmbeddableMarkdownEditor";
-import { createTaskModalListField } from "./taskModalOrganizationFields";
+	createTaskModalBlockedByField,
+	createTaskModalBlockingField,
+	createTaskModalProjectsField,
+	createTaskModalSubtasksField,
+	type TaskModalOrganizationFieldContext,
+} from "./taskModalOrganizationFields";
 import { createTaskCard } from "../ui/TaskCard";
+import {
+	addDependencyItem,
+	createDependencyItemFromDependency as createDependencyItemFromDependencyHelper,
+	createDependencyItemFromFile as createDependencyItemFromFileHelper,
+	createDependencyItemFromPath as createDependencyItemFromPathHelper,
+	DependencyItem,
+	getBlockedByDependencyCandidates,
+	getBlockingDependencyCandidates,
+	removeDependencyItemAtIndex,
+	renderDependencyList,
+} from "./taskModalDependencies";
+import {
+	createTaskModalContextsField,
+	createTaskModalTagsField,
+	createTaskModalTimeEstimateField,
+	formatTaskModalTimeEstimate,
+	type TaskModalMetadataFieldContext,
+} from "./taskModalMetadataFields";
+import {
+	createTaskModalConfiguredUserField,
+	updateTaskModalUserFieldControls,
+	type TaskModalUserFieldContext,
+	type TaskModalUserFieldToggleControl,
+} from "./taskModalUserFieldControls";
+import {
+	createTaskModalActionButtons,
+	type TaskModalActionButtonContext,
+	type TaskModalLeadingButton,
+	type TaskModalOverflowAction,
+} from "./taskModalActionButtons";
+import {
+	createTaskModalActionIcon,
+	createTaskModalActionIcons,
+	type TaskModalActionIconSpec,
+} from "./taskModalActionBar";
+import { updateTaskModalActionIconStates } from "./taskModalActionIconStates";
+import {
+	buildTaskModalActionIconState,
+	createTaskModalActionMenuContext,
+	createTaskModalActionMenuState,
+} from "./taskModalActionState";
+import {
+	showTaskModalDateContextMenu,
+	showTaskModalPriorityContextMenu,
+	showTaskModalRecurrenceContextMenu,
+	showTaskModalReminderContextMenu,
+	showTaskModalStatusContextMenu,
+	type TaskModalActionMenuContext,
+	type TaskModalActionMenuState,
+} from "./taskModalActionMenus";
+import {
+	addTaskModalProjectItemsFromStrings,
+	createTaskModalProjectItemFromFile,
+	getTaskModalProjectsValue,
+	hasTaskModalProjectItem,
+	removeTaskModalProjectItem,
+	renderTaskModalProjectsList,
+	type TaskModalProjectItem,
+	type TaskModalProjectStringContext,
+} from "./taskModalProjects";
+import {
+	addTaskModalSubtaskFile,
+	getTaskModalSubtaskCandidates,
+	removeTaskModalSubtaskFile,
+	renderTaskModalSubtasksList,
+} from "./taskModalSubtasks";
+import { openTaskModalTaskSelector } from "./taskModalTaskSelector";
+import { buildSubtaskCreationPrePopulatedValues } from "../services/taskRelationshipActions";
+import {
+	createTaskModalTitleTextarea,
+	type TaskModalTitleInputElement,
+} from "./taskModalTitleInput";
+import { setTaskModalDetailsCollapsed } from "./taskModalLayout";
+import { resizeTaskModalTitleTextarea } from "./taskModalTitleInput";
+import { TaskFormModel, type TaskFormErrorField } from "./taskFormModel";
+import type { TaskSaveOutcome } from "./taskModalSave";
+import { ConfirmationModal } from "./ConfirmationModal";
+import {
+	TaskModalFocusGuards,
+	type TaskModalMobileKeyboardScrollGuardOptions,
+} from "./taskModalFocusGuards";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
 
-interface DependencyItem {
-	dependency: TaskDependency;
-	name: string;
-	path?: string;
-	unresolved?: boolean;
+const tasknotesLogger = createTaskNotesLogger({ tag: "Modals/TaskModal" });
+
+export interface TaskSubmitOptions {
+	createAnother?: boolean;
 }
 
-interface ProjectItem {
-	file?: TFile;
-	name: string;
-	link: string;
-	unresolved?: boolean;
-}
+type UnsavedChangesChoice = "save" | "discard" | "cancel";
 
 export abstract class TaskModal extends Modal {
 	plugin: TaskNotesPlugin;
+	protected abstract readonly mode: "create" | "edit";
+	readonly form = new TaskFormModel({
+		title: "",
+		details: "",
+		dueDate: "",
+		scheduledDate: "",
+		priority: uiData("normal", "Persisted priority value; preserve user metadata and matching semantics"),
+		status: uiData("open", "Persisted status value; preserve user metadata and matching semantics"),
+		contexts: "",
+		projects: "",
+		tags: "",
+		timeEstimate: 0,
+		recurrenceRule: "",
+		recurrenceAnchor: "scheduled",
+		reminders: [],
+		userFields: {},
+	});
 	private keyboardHandler: ((e: KeyboardEvent) => void) | null = null;
+	private focusGuards: TaskModalFocusGuards;
+	private unsubscribeForm: (() => void) | null = null;
+	private saveInFlight: Promise<boolean> | null = null;
+	private isShowingConfirmation = false;
+	private pendingClose = false;
+	private isModalOpen = false;
+	private isSyncingControls = false;
+	private saveButton: HTMLButtonElement | null = null;
+	private readonly fieldErrorEls = new Map<TaskFormErrorField, HTMLElement>();
 
 	// Dependency item definition
 	protected createDependencyItemFromFile(
 		file: TFile,
 		options: { sourcePath?: string } = {}
 	): DependencyItem {
-		const sourcePath = options.sourcePath ?? this.getDependencySourcePath();
-		const uid = formatDependencyLink(
-			this.plugin.app,
-			sourcePath,
-			file.path,
-			this.plugin.settings.useFrontmatterMarkdownLinks
+		return createDependencyItemFromFileHelper(
+			{
+				plugin: this.plugin,
+				sourcePath: options.sourcePath ?? this.getDependencySourcePath(),
+			},
+			file
 		);
-		return {
-			dependency: { uid, reltype: DEFAULT_DEPENDENCY_RELTYPE },
-			path: file.path,
-			name: file.basename,
-		};
 	}
 
 	protected createDependencyItemFromDependency(
 		dependency: TaskDependency,
 		sourcePath?: string
 	): DependencyItem {
-		const normalized = normalizeDependencyEntry(dependency);
-		if (!normalized) {
-			const fallbackName =
-				(typeof dependency === "object" && dependency && "uid" in dependency && typeof dependency.uid === "string"
-					? dependency.uid
-					: String(dependency));
-			return {
-				dependency: { uid: fallbackName, reltype: DEFAULT_DEPENDENCY_RELTYPE },
-				name: fallbackName,
-				unresolved: true,
-			};
-		}
-
-		const resolution = resolveDependencyEntry(
-			this.plugin.app,
-			sourcePath ?? this.getDependencySourcePath(),
-			normalized
+		return createDependencyItemFromDependencyHelper(
+			{ plugin: this.plugin, sourcePath: sourcePath ?? this.getDependencySourcePath() },
+			dependency
 		);
-		if (resolution) {
-			const name =
-				resolution.file?.basename || resolution.path.split("/").pop() || normalized.uid;
-			return {
-				dependency: normalized,
-				path: resolution.path,
-				name,
-			};
-		}
-
-		const cleaned = normalized.uid.replace(/^\[\[/, "").replace(/\]\]$/, "");
-		return {
-			dependency: normalized,
-			name: cleaned || dependency.uid,
-			unresolved: true,
-		};
 	}
 
 	protected createDependencyItemFromPath(path: string): DependencyItem {
-		const sourcePath = this.getDependencySourcePath();
-		const file = this.plugin.app.vault.getAbstractFileByPath(path);
-		if (file instanceof TFile) {
-			return {
-				dependency: {
-					uid: formatDependencyLink(
-						this.plugin.app,
-						sourcePath,
-						file.path,
-						this.plugin.settings.useFrontmatterMarkdownLinks
-					),
-					reltype: DEFAULT_DEPENDENCY_RELTYPE,
-				},
-				path: file.path,
-				name: file.basename,
-			};
-		}
-
-		// For unresolved dependencies, create a minimal file-like object to generate link
-		const basename = path.split("/").pop() || path;
-		const nameWithoutExt = basename.replace(/\.md$/i, "");
-
-		// Use a simple wikilink format for unresolved dependencies
-		// This will be resolved when the file is created
-		return {
-			dependency: {
-				uid: `[[${nameWithoutExt}]]`,
-				reltype: DEFAULT_DEPENDENCY_RELTYPE,
-			},
-			path,
-			name: nameWithoutExt,
-			unresolved: true,
-		};
+		return createDependencyItemFromPathHelper(
+			{ plugin: this.plugin, sourcePath: this.getDependencySourcePath() },
+			path
+		);
 	}
 
 	protected getDependencySourcePath(): string {
@@ -160,6 +202,16 @@ export abstract class TaskModal extends Modal {
 		return undefined;
 	}
 
+	protected getModalEditorFile(): Nullable<TFile> {
+		const currentTaskPath = this.getCurrentTaskPath();
+		if (!currentTaskPath) {
+			return this.app.workspace.getActiveFile();
+		}
+
+		const file = this.app.vault.getAbstractFileByPath(currentTaskPath);
+		return file instanceof TFile ? file : this.app.workspace.getActiveFile();
+	}
+
 	protected renderDependencyLists(): void {
 		this.renderBlockedByList();
 		this.renderBlockingList();
@@ -167,22 +219,24 @@ export abstract class TaskModal extends Modal {
 
 	protected getLinkServices(): LinkServices {
 		return {
+			translate: this.t.bind(this),
 			metadataCache: this.plugin.app.metadataCache,
 			workspace: this.plugin.app.workspace,
-			sourcePath: this.getCurrentTaskPath() || this.plugin.app.workspace.getActiveFile()?.path || "",
+			sourcePath:
+				this.getCurrentTaskPath() || this.plugin.app.workspace.getActiveFile()?.path || "",
 		};
 	}
 
 	protected renderBlockedByList(): void {
 		void this.renderDependencyList(this.blockedByList, this.blockedByItems, (index) => {
-			this.blockedByItems.splice(index, 1);
+			this.blockedByItems = removeDependencyItemAtIndex(this.blockedByItems, index);
 			this.renderBlockedByList();
 		});
 	}
 
 	protected renderBlockingList(): void {
 		void this.renderDependencyList(this.blockingList, this.blockingItems, (index) => {
-			this.blockingItems.splice(index, 1);
+			this.blockingItems = removeDependencyItemAtIndex(this.blockingItems, index);
 			this.renderBlockingList();
 		});
 	}
@@ -196,81 +250,14 @@ export abstract class TaskModal extends Modal {
 			return;
 		}
 
-		listEl.empty();
-
-		if (items.length === 0) {
-			return;
-		}
-
-		const linkServices = this.getLinkServices();
-
-		for (const [index, item] of items.entries()) {
-			const itemEl = listEl.createDiv({
-				cls: item.path && !item.unresolved
-					? "task-project-item task-project-item--task-card"
-					: "task-project-item",
-			});
-			if (item.unresolved) {
-				itemEl.addClass("task-project-item--unresolved");
-				setTooltip(
-					itemEl,
-					this.t("contextMenus.task.dependencies.notices.unresolved", {
-						entries: item.dependency.uid,
-					}),
-					{ placement: "top" }
-				);
-			}
-
-			const contentEl = itemEl.createDiv({
-				cls: item.path && !item.unresolved ? "task-project-card-host" : "task-project-info",
-			});
-
-			if (item.path && !item.unresolved) {
-				const taskInfo = await this.plugin.cacheManager.getCachedTaskInfo(item.path);
-				if (taskInfo) {
-					const taskCard = createTaskCard(taskInfo, this.plugin, undefined, {
-						layout: "default",
-						showSecondaryBadges: false,
-						enableHoverPreview: false,
-					});
-					contentEl.appendChild(taskCard);
-				} else {
-					const nameEl = contentEl.createSpan({ cls: "task-project-name clickable-dependency" });
-					appendInternalLink(
-						nameEl,
-						item.path,
-						item.name,
-						linkServices,
-						{
-							cssClass: "task-dependency-link internal-link",
-							hoverSource: "tasknotes-dependency-link",
-							showErrorNotices: true,
-						}
-					);
-					if (item.path !== item.name) {
-						contentEl.createDiv({ cls: "task-project-path", text: item.path });
-					}
-				}
-			} else {
-				const nameEl = contentEl.createSpan({ cls: "task-project-name" });
-				nameEl.textContent = item.name;
-				const pathText = item.path ?? item.dependency.uid;
-				contentEl.createDiv({ cls: "task-project-path", text: pathText });
-			}
-
-			const removeBtn = itemEl.createEl("button", {
-				cls: "task-project-remove",
-				text: "×",
-			});
-			setTooltip(removeBtn, this.t("modals.task.dependencies.removeTaskTooltip"), {
-				placement: "top",
-			});
-			removeBtn.addEventListener("click", (event) => {
-				event.preventDefault();
-				event.stopPropagation();
-				onRemove(index);
-			});
-		}
+		await renderDependencyList({
+			plugin: this.plugin,
+			listEl,
+			items,
+			linkServices: this.getLinkServices(),
+			translate: (key, params) => this.t(key, params),
+			onRemove,
+		});
 	}
 
 	protected extractDetailsFromContent(content: string): string {
@@ -282,35 +269,14 @@ export abstract class TaskModal extends Modal {
 		return value.replace(/\r\n/g, "\n").trimEnd();
 	}
 
-	protected addBlockedByTask(file: TFile): void {
-		const dependency: TaskDependency = {
-			uid: formatDependencyLink(
-				this.plugin.app,
-				this.getDependencySourcePath(),
-				file.path,
-				this.plugin.settings.useFrontmatterMarkdownLinks
-			),
-			reltype: DEFAULT_DEPENDENCY_RELTYPE,
-		};
-		this.addBlockedByDependency(dependency);
-	}
-
-	protected addBlockingTask(file: TFile): void {
-		this.addBlockingTaskFromPath(file.path);
-	}
-
 	protected addBlockedByDependency(dependency: TaskDependency): void {
 		const sourcePath = this.getDependencySourcePath();
 		const item = this.createDependencyItemFromDependency(dependency, sourcePath);
-		const exists = this.blockedByItems.some(
-			(existing) =>
-				existing.dependency.uid === item.dependency.uid ||
-				(item.path && existing.path === item.path)
-		);
-		if (exists) {
+		const nextItems = addDependencyItem(this.blockedByItems, item);
+		if (nextItems.length === this.blockedByItems.length) {
 			return;
 		}
-		this.blockedByItems.push(item);
+		this.blockedByItems = nextItems;
 		this.renderBlockedByList();
 	}
 
@@ -320,174 +286,112 @@ export abstract class TaskModal extends Modal {
 			return;
 		}
 		const item = this.createDependencyItemFromPath(path);
-		const exists = this.blockingItems.some(
-			(existing) =>
-				existing.path === item.path || existing.dependency.uid === item.dependency.uid
-		);
-		if (exists) {
+		const nextItems = addDependencyItem(this.blockingItems, item);
+		if (nextItems.length === this.blockingItems.length) {
 			return;
 		}
-		this.blockingItems.push(item);
+		this.blockingItems = nextItems;
 		this.renderBlockingList();
 	}
 
 	protected async openBlockedBySelector(): Promise<void> {
 		const sourcePath = this.getDependencySourcePath();
-		const currentPath = this.getCurrentTaskPath();
-		const existingUids = new Set(this.blockedByItems.map((item) => item.dependency.uid));
 
-		await this.openTaskDependencySelector(
-			(candidate) => {
-				if (currentPath && candidate.path === currentPath) {
-					return false;
-				}
-				const candidateUid = formatDependencyLink(
-					this.plugin.app,
+		await openTaskModalTaskSelector({
+			plugin: this.plugin,
+			getCandidates: (allTasks) =>
+				getBlockedByDependencyCandidates({
+					plugin: this.plugin,
 					sourcePath,
-					candidate.path,
-					this.plugin.settings.useFrontmatterMarkdownLinks
-				);
-				return !existingUids.has(candidateUid);
-			},
-			(selected) => {
+					allTasks,
+					existingItems: this.blockedByItems,
+					currentPath: this.getCurrentTaskPath(),
+				}),
+			onSelect: (selected) => {
 				const dependency: TaskDependency = {
 					uid: formatDependencyLink(this.plugin.app, sourcePath, selected.path),
 					reltype: DEFAULT_DEPENDENCY_RELTYPE,
 				};
 				this.addBlockedByDependency(dependency);
-			}
-		);
+			},
+			translate: (key) => this.t(key),
+			noEligibleTasksMessageKey: msg({ message: "No matching tasks available", context: "contextMenus.task.dependencies.notices.noEligibleTasks" }),
+			openFailedMessageKey: msg({ message: "Failed to update dependencies", context: "contextMenus.task.dependencies.notices.updateFailed" }),
+			logOperation: "open-blocked-by-selector",
+		});
 	}
 
 	protected async openBlockingSelector(): Promise<void> {
 		const sourcePath = this.getDependencySourcePath();
-		const currentPath = this.getCurrentTaskPath();
-		const existingPaths = new Set(
-			this.blockingItems
-				.map((item) => item.path)
-				.filter((path): path is string => typeof path === "string")
-		);
-		const existingUids = new Set(this.blockingItems.map((item) => item.dependency.uid));
 
-		await this.openTaskDependencySelector(
-			(candidate) => {
-				if (currentPath && candidate.path === currentPath) {
-					return false;
-				}
-				if (existingPaths.has(candidate.path)) {
-					return false;
-				}
-				const candidateUid = formatDependencyLink(
-					this.plugin.app,
+		await openTaskModalTaskSelector({
+			plugin: this.plugin,
+			getCandidates: (allTasks) =>
+				getBlockingDependencyCandidates({
+					plugin: this.plugin,
 					sourcePath,
-					candidate.path,
-					this.plugin.settings.useFrontmatterMarkdownLinks
-				);
-				return !existingUids.has(candidateUid);
-			},
-			(selected) => {
+					allTasks,
+					existingItems: this.blockingItems,
+					currentPath: this.getCurrentTaskPath(),
+				}),
+			onSelect: (selected) => {
 				this.addBlockingTaskFromPath(selected.path);
-			}
-		);
+			},
+			translate: (key) => this.t(key),
+			noEligibleTasksMessageKey: msg({ message: "No matching tasks available", context: "contextMenus.task.dependencies.notices.noEligibleTasks" }),
+			openFailedMessageKey: msg({ message: "Failed to update dependencies", context: "contextMenus.task.dependencies.notices.updateFailed" }),
+			logOperation: "open-blocking-selector",
+		});
 	}
 
-	private async openTaskDependencySelector(
-		filter: (candidate: TaskInfo) => boolean,
-		onSelect: (selected: TaskInfo) => void
-	): Promise<void> {
-		try {
-			const allTasks: TaskInfo[] = (await this.plugin.cacheManager.getAllTasks?.()) ?? [];
-			const candidates = allTasks.filter(filter);
-
-			if (candidates.length === 0) {
-				new Notice(this.t("contextMenus.task.dependencies.notices.noEligibleTasks"));
-				return;
-			}
-
-			openTaskSelector(this.plugin, candidates, (task) => {
-				if (!task) return;
-				onSelect(task);
-			});
-		} catch (error) {
-			console.error("Failed to open task selector for dependencies:", error);
-			new Notice(this.t("contextMenus.task.dependencies.notices.updateFailed"));
-		}
-	}
-
-	// Core task properties
-	protected title = "";
-	protected details = "";
 	protected originalDetails = "";
-	protected dueDate = "";
-	protected scheduledDate = "";
-	protected priority = "normal";
-	protected status = "open";
-	protected contexts = "";
-	protected projects = "";
-	protected tags = "";
-	protected timeEstimate = 0;
-	protected recurrenceRule = "";
-	protected recurrenceAnchor: "scheduled" | "completion" = "scheduled";
-	protected reminders: Reminder[] = [];
 
-	// User-defined fields (dynamic based on settings)
-	protected userFields: Record<string, any> = {};
+	// User-defined field controls (dynamic based on settings)
+	protected userFieldInputs = new Map<string, HTMLInputElement>();
+	protected userFieldToggles = new Map<string, TaskModalUserFieldToggleControl>();
 
 	// Dependency fields
 	protected blockedByItems: DependencyItem[] = [];
 	protected blockingItems: DependencyItem[] = [];
-	protected blockedByList?: HTMLElement;
-	protected blockingList?: HTMLElement;
+	protected blockedByList: HTMLElement | undefined = undefined;
+	protected blockingList: HTMLElement | undefined = undefined;
 
 	// Project link storage
-	protected selectedProjectItems: ProjectItem[] = [];
+	protected selectedProjectItems: TaskModalProjectItem[] = [];
+
+	// Attachments: linked vault files plus disk files imported on save
+	protected attachmentEntries: TaskModalAttachmentEntry[] = [];
+	protected attachmentsField: TaskModalAttachmentsField | null = null;
 
 	// Subtask storage - tracks tasks that should become subtasks of this task
 	protected selectedSubtaskFiles: TAbstractFile[] = [];
 	protected initialSubtaskFiles: TAbstractFile[] = [];
 
 	// UI elements
-	protected titleInput: HTMLInputElement;
-	protected detailsInput: HTMLTextAreaElement; // Legacy - kept for compatibility
+	protected titleInput: TaskModalTitleInputElement | undefined = undefined;
 	protected detailsMarkdownEditor: EmbeddableMarkdownEditor | null = null;
-	protected contextsInput: HTMLInputElement;
-	protected projectsInput: HTMLInputElement;
-	protected tagsInput: HTMLInputElement;
-	protected timeEstimateInput: HTMLInputElement;
-	protected projectsList: HTMLElement;
-	protected subtasksList: HTMLElement;
-	protected actionBar: HTMLElement;
-	protected detailsContainer: HTMLElement;
+	protected contextsInput: HTMLInputElement = undefined as unknown as HTMLInputElement;
+	protected projectsInput: HTMLInputElement = undefined as unknown as HTMLInputElement;
+	protected tagsInput: HTMLInputElement = undefined as unknown as HTMLInputElement;
+	protected timeEstimateInput: HTMLInputElement = undefined as unknown as HTMLInputElement;
+	protected projectsList: HTMLElement = undefined as unknown as HTMLElement;
+	protected subtasksList: HTMLElement = undefined as unknown as HTMLElement;
+	protected actionBar: HTMLElement = undefined as unknown as HTMLElement;
+	protected detailsContainer: HTMLElement = undefined as unknown as HTMLElement;
 	protected isExpanded = false;
 
 	constructor(app: App, plugin: TaskNotesPlugin) {
 		super(app);
 		this.plugin = plugin;
+		this.focusGuards = new TaskModalFocusGuards({
+			containerEl: this.containerEl,
+			modalEl: this.modalEl,
+			contentEl: this.contentEl,
+		});
 	}
 
-	/**
-	 * Get the Obsidian app instance - useful for dependency injection in tests
-	 */
-	protected getApp(): App {
-		return this.app;
-	}
-
-	/**
-	 * Get the plugin instance - useful for dependency injection in tests
-	 */
-	protected getPlugin(): TaskNotesPlugin {
-		return this.plugin;
-	}
-
-	protected t(key: string, params?: Record<string, string | number>): string {
+	protected t(key: MessageDescriptor, params?: Record<string, string | number>): string {
 		return this.plugin.i18n.translate(key, params);
-	}
-
-	/**
-	 * Get a file by path - useful for testing with mocked vault
-	 */
-	protected getFileByPath(path: string): TAbstractFile | null {
-		return this.app.vault.getAbstractFileByPath(path);
 	}
 
 	/**
@@ -498,32 +402,125 @@ export abstract class TaskModal extends Modal {
 	}
 
 	/**
-	 * Get file cache - useful for testing with mocked metadataCache
-	 */
-	protected getFileCache(file: TFile): any {
-		return this.app.metadataCache.getFileCache(file);
-	}
-
-	/**
 	 * Resolve a link to a file - useful for testing with mocked metadataCache
 	 */
-	protected resolveLink(linkPath: string, sourcePath: string): TFile | null {
+	protected resolveLink(linkPath: string, sourcePath: string): unknown {
 		return this.app.metadataCache.getFirstLinkpathDest(linkPath, sourcePath);
 	}
 
-	protected isEditMode(): boolean {
-		return false;
-	}
-
-	protected isCreationMode(): boolean {
-		return false;
-	}
-
 	abstract initializeFormData(): Promise<void>;
-	abstract handleSave(): Promise<void>;
+	/** Writes the task. The modal stays open only when the outcome is `failed`. */
+	abstract handleSave(options?: TaskSubmitOptions): Promise<TaskSaveOutcome>;
 	abstract getModalTitle(): string;
 
+	protected async handleSubmitShortcut(shift: boolean): Promise<void> {
+		await this.submit({ createAnother: shift });
+	}
+
+	/** Save and close. Save, the keyboard shortcuts and the close prompt all end up here. */
+	protected async submit(options: TaskSubmitOptions = {}): Promise<boolean> {
+		const saved = await this.runSave(options);
+		if (saved) {
+			this.forceClose();
+			this.afterSubmit(options);
+		}
+		return saved;
+	}
+
+	protected afterSubmit(_options: TaskSubmitOptions): void {
+		// Overridden by modals that continue after closing.
+	}
+
+	/** Every save shares one in-flight run, so repeated shortcuts cannot write twice. */
+	private runSave(options: TaskSubmitOptions = {}): Promise<boolean> {
+		this.saveInFlight ??= this.executeSave(options).finally(() => {
+			this.saveInFlight = null;
+			if (this.saveButton) this.saveButton.disabled = false;
+		});
+		return this.saveInFlight;
+	}
+
+	private async executeSave(options: TaskSubmitOptions): Promise<boolean> {
+		if (this.saveButton) this.saveButton.disabled = true;
+		return (await this.handleSave(options)).status !== "failed";
+	}
+
+	protected hasUnsavedChanges(): boolean {
+		return false;
+	}
+
+	/** Close without checking for unsaved changes. */
+	forceClose(): void {
+		this.pendingClose = true;
+		super.close();
+	}
+
+	/**
+	 * Prompts before discarding unsaved work. Synchronous to match Obsidian's
+	 * Modal.close() signature; the prompt runs separately.
+	 */
+	close(): void {
+		if (this.pendingClose) {
+			this.pendingClose = false;
+			super.close();
+			return;
+		}
+
+		if (this.isShowingConfirmation) {
+			return;
+		}
+
+		if (!this.hasUnsavedChanges()) {
+			super.close();
+			return;
+		}
+
+		void this.showUnsavedChangesConfirmation();
+	}
+
+	private async showUnsavedChangesConfirmation(): Promise<void> {
+		if (await this.resolveUnsavedChanges()) {
+			this.forceClose();
+		}
+	}
+
+	/** Returns true once it is safe to leave the form: saved, discarded or nothing to save. */
+	protected async resolveUnsavedChanges(): Promise<boolean> {
+		if (!this.hasUnsavedChanges()) {
+			return true;
+		}
+
+		this.isShowingConfirmation = true;
+		try {
+			const choice = await this.showThreeButtonConfirmation();
+			if (choice === "cancel") return false;
+			if (choice === "discard") return true;
+			return await this.runSave();
+		} finally {
+			this.isShowingConfirmation = false;
+		}
+	}
+
+	private showThreeButtonConfirmation(): Promise<UnsavedChangesChoice> {
+		return new Promise((resolve) => {
+			const modal = new ConfirmationModal(this.app, {
+				title: this.t(msg({ message: "Unsaved changes", context: "modals.task.unsavedChanges.title" })),
+				message: this.t(msg({ message: "You have unsaved changes. Do you want to save them?", context: "modals.task.unsavedChanges.message" })),
+				confirmText: this.t(msg({ message: "Save changes", context: "modals.task.unsavedChanges.save" })),
+				cancelText: this.t(msg({ message: "Discard changes", context: "modals.task.unsavedChanges.discard" })),
+				thirdButtonText: this.t(msg({ message: "Keep editing", context: "modals.task.unsavedChanges.cancel" })),
+				defaultToConfirm: true,
+				onThirdButton: () => resolve("cancel"),
+			});
+
+			void modal.show().then((confirmed) => {
+				resolve(confirmed ? "save" : "discard");
+			});
+		});
+	}
+
 	onOpen() {
+		this.isModalOpen = true;
 		this.containerEl.addClass("tasknotes-plugin", "minimalist-task-modal");
 		if (this.plugin.settings.enableModalSplitLayout) {
 			this.containerEl.addClass("split-layout-enabled");
@@ -542,25 +539,38 @@ export abstract class TaskModal extends Modal {
 					return;
 				}
 				e.preventDefault();
-				this.handleSave();
+				void this.handleSubmitShortcut(e.shiftKey);
 			}
 		};
 		this.containerEl.addEventListener("keydown", this.keyboardHandler);
 
-		this.initializeFormData().then(() => {
-			this.createModalContent();
-			this.focusTitleInput();
-		});
+		this.unsubscribeForm = this.form.subscribe(() => this.syncFormControls());
+
+		this.contentEl.createDiv("tn-task-modal__loading");
+		void this.renderForm();
+	}
+
+	/** Loading can outlast the modal, which then has nothing to render into. */
+	private async renderForm(): Promise<void> {
+		await this.initializeFormData();
+		if (!this.isModalOpen) return;
+
+		this.form.markClean();
+		this.createModalContent();
+		this.renderProjectsList();
+		this.updateIconStates();
+		this.focusTitleInput();
 	}
 
 	// Store references to split layout containers for potential reuse
 	protected splitContentWrapper: HTMLElement;
 	protected splitLeftColumn: HTMLElement;
-	protected splitRightColumn: HTMLElement;
+	protected splitRightColumn: HTMLElement = undefined as unknown as HTMLElement;
 
 	protected createModalContent(): void {
 		const { contentEl } = this;
 		contentEl.empty();
+		this.containerEl.classList.toggle("expanded", this.isExpanded);
 
 		// Create main container
 		const container = contentEl.createDiv("minimalist-modal-container");
@@ -568,13 +578,14 @@ export abstract class TaskModal extends Modal {
 		// Create split content wrapper at the top level for wide screen layout
 		this.splitContentWrapper = container.createDiv("modal-split-content");
 		this.splitLeftColumn = this.splitContentWrapper.createDiv("modal-split-left");
-		this.splitRightColumn = this.splitContentWrapper.createDiv("modal-split-right");
 
 		// Create primary input area (title or NLP) - subclasses can override
 		this.createPrimaryInput(this.splitLeftColumn);
 
 		// Create action bar with icons - goes in left column
 		this.createActionBar(this.splitLeftColumn);
+
+		this.splitRightColumn = this.splitLeftColumn.createDiv("modal-split-right");
 
 		// Create collapsible details section (fields in left, details editor in right)
 		this.createDetailsSection(container);
@@ -591,7 +602,9 @@ export abstract class TaskModal extends Modal {
 	 * Default: simple title input
 	 */
 	protected createPrimaryInput(container: HTMLElement): void {
-		this.createTitleInput(container);
+		if (this.mode === "create" || this.shouldShowField("title", this.plugin.settings.modalFieldsConfig)) {
+			this.createTitleInput(container);
+		}
 	}
 
 	/**
@@ -605,89 +618,100 @@ export abstract class TaskModal extends Modal {
 	protected createTitleInput(container: HTMLElement): void {
 		const titleContainer = container.createDiv("title-input-container");
 
-		this.titleInput = titleContainer.createEl("input", {
-			type: "text",
-			cls: "title-input",
-			placeholder: this.t("modals.task.titlePlaceholder"),
-		});
+		this.titleInput = this.createTitleTextarea(
+			titleContainer,
+			"title-input",
+			this.t(msg({ message: "What needs to be done?", context: "modals.task.titlePlaceholder" }))
+		);
+	}
 
-		this.titleInput.value = this.title;
-		this.titleInput.addEventListener("input", (e) => {
-			this.title = (e.target as HTMLInputElement).value;
+	private createTitleTextarea(
+		container: HTMLElement,
+		cls: string,
+		placeholder: string
+	): HTMLTextAreaElement {
+		return createTaskModalTitleTextarea({
+			container,
+			className: cls,
+			placeholder,
+			value: this.form.values.title,
+			onChange: (value) => {
+				this.form.edit("title", value);
+			},
+			attachFocusScrollGuard: (input) => {
+				this.attachTitleFocusScrollGuard(input);
+				this.attachMobileKeyboardScrollGuard(input, { scrollOnFocus: false });
+			},
 		});
 	}
 
 	protected createActionBar(container: HTMLElement): void {
-		this.actionBar = container.createDiv("action-bar");
-
-		// Due date icon
-		this.createActionIcon(
-			this.actionBar,
-			"calendar",
-			this.t("modals.task.actions.due"),
-			(_, event) => {
-				this.showDateContextMenu(event, "due");
-			},
-			"due-date"
-		);
-
-		// Scheduled date icon
-		this.createActionIcon(
-			this.actionBar,
-			"calendar-clock",
-			this.t("modals.task.actions.scheduled"),
-			(_, event) => {
-				this.showDateContextMenu(event, "scheduled");
-			},
-			"scheduled-date"
-		);
-
-		// Status icon
-		this.createActionIcon(
-			this.actionBar,
-			"dot-square",
-			this.t("modals.task.actions.status"),
-			(_, event) => {
-				this.showStatusContextMenu(event);
-			},
-			"status"
-		);
-
-		// Priority icon
-		this.createActionIcon(
-			this.actionBar,
-			"star",
-			this.t("modals.task.actions.priority"),
-			(_, event) => {
-				this.showPriorityContextMenu(event);
-			},
-			"priority"
-		);
-
-		// Recurrence icon
-		this.createActionIcon(
-			this.actionBar,
-			"refresh-ccw",
-			this.t("modals.task.actions.recurrence"),
-			(_, event) => {
-				this.showRecurrenceContextMenu(event);
-			},
-			"recurrence"
-		);
-
-		// Reminder icon
-		this.createActionIcon(
-			this.actionBar,
-			"bell",
-			this.t("modals.task.actions.reminders"),
-			(_, event) => {
-				this.showReminderContextMenu(event);
-			},
-			"reminders"
-		);
-
-		// Update icon states based on current values
+		this.actionBar = container.createDiv("tn-task-modal__action-bar");
+		this.createCoreActionIcons(this.actionBar);
 		this.updateIconStates();
+	}
+
+	protected createCoreActionIcons(container: HTMLElement): HTMLElement[] {
+		return createTaskModalActionIcons(container, this.getCoreActionIconSpecs());
+	}
+
+	protected getCoreActionIconSpecs(): TaskModalActionIconSpec[] {
+		return [
+			{
+				iconName: "circle",
+				tooltip: this.t(msg({ message: "Set status", context: "modals.task.actions.status" })),
+				onClick: (_, event) => {
+					this.showStatusContextMenu(event);
+				},
+				dataType: "status",
+				chip: true,
+			},
+			{
+				iconName: "star",
+				tooltip: this.t(msg({ message: "Set priority", context: "modals.task.actions.priority" })),
+				onClick: (_, event) => {
+					this.showPriorityContextMenu(event);
+				},
+				dataType: "priority",
+				chip: true,
+			},
+			{
+				iconName: "calendar",
+				tooltip: this.t(msg({ message: "Set due date", context: "modals.task.actions.due" })),
+				onClick: (_, event) => {
+					this.showDateContextMenu(event, "due");
+				},
+				dataType: "due-date",
+				chip: true,
+			},
+			{
+				iconName: "calendar-clock",
+				tooltip: this.t(msg({ message: "Set scheduled date", context: "modals.task.actions.scheduled" })),
+				onClick: (_, event) => {
+					this.showDateContextMenu(event, "scheduled");
+				},
+				dataType: "scheduled-date",
+				chip: true,
+			},
+			{
+				iconName: "refresh-ccw",
+				tooltip: this.t(msg({ message: "Set recurrence", context: "modals.task.actions.recurrence" })),
+				onClick: (_, event) => {
+					this.showRecurrenceContextMenu(event);
+				},
+				dataType: "recurrence",
+				chip: true,
+			},
+			{
+				iconName: "bell",
+				tooltip: this.t(msg({ message: "Set reminders", context: "modals.task.actions.reminders" })),
+				onClick: (_, event) => {
+					this.showReminderContextMenu(event);
+				},
+				dataType: "reminders",
+				chip: true,
+			},
+		];
 	}
 
 	protected createActionIcon(
@@ -697,118 +721,77 @@ export abstract class TaskModal extends Modal {
 		onClick: (icon: HTMLElement, event: UIEvent) => void,
 		dataType?: string
 	): HTMLElement {
-		const iconContainer = container.createDiv("action-icon");
-		iconContainer.setAttribute("aria-label", tooltip);
-		// Store initial tooltip for later updates but don't set title attribute
-		iconContainer.setAttribute("data-initial-tooltip", tooltip);
-		iconContainer.setAttribute("tabindex", "0");
-		iconContainer.setAttribute("role", "button");
-		// Add data attribute for easier identification
-		if (dataType) {
-			iconContainer.setAttribute("data-type", dataType);
-		}
-
-		// Add visual tooltip using Obsidian's setTooltip API
-		setTooltip(iconContainer, tooltip, { placement: "top" });
-
-		const icon = iconContainer.createSpan("icon");
-		setIcon(icon, iconName);
-
-		iconContainer.addEventListener("click", (event) => {
-			event.preventDefault();
-			event.stopPropagation();
-			onClick(iconContainer, event);
+		return createTaskModalActionIcon(container, {
+			iconName,
+			tooltip,
+			onClick,
+			dataType,
 		});
-
-		iconContainer.addEventListener("keydown", (event) => {
-			if (event.key === "Enter" || event.key === " ") {
-				event.preventDefault();
-				event.stopPropagation();
-				onClick(iconContainer, event);
-			}
-		});
-
-		return iconContainer;
 	}
 
 	protected createDetailsSection(container: HTMLElement): void {
+		this.userFieldInputs.clear();
+		this.userFieldToggles.clear();
+
 		// The details container wraps the expandable fields (for hide/show animation)
 		// It goes inside the left column for proper expand/collapse
 		this.detailsContainer = this.splitLeftColumn
 			? this.splitLeftColumn.createDiv("details-container")
 			: container.createDiv("details-container");
 
-		if (!this.isExpanded) {
-			this.detailsContainer.style.display = "none";
-			// Also hide the right column when collapsed
-			if (this.splitRightColumn) {
-				this.splitRightColumn.style.display = "none";
-			}
-		}
+		setTaskModalDetailsCollapsed(
+			{ detailsContainer: this.detailsContainer, splitRightColumn: this.splitRightColumn },
+			!this.isExpanded
+		);
 
 		// Check field configuration to determine which fields to show
 		const config = this.plugin.settings.modalFieldsConfig;
 		const shouldShowTitle = this.shouldShowField("title", config);
 		const shouldShowDetails = this.shouldShowField("details", config);
+		this.splitContentWrapper.classList.toggle(
+			"modal-split-content--right-empty",
+			!shouldShowDetails
+		);
 
-		// Title field appears in details section for:
-		// 1. Edit modals (always, if enabled in config)
-		// 2. Creation modals when NLP is enabled (since the main title input is replaced by NLP textarea)
-		const isEditModal = this.isEditMode();
-		const isCreationWithNLP =
-			this.isCreationMode() && this.plugin.settings.enableNaturalLanguageInput;
-
-		if (shouldShowTitle && (isEditModal || isCreationWithNLP)) {
+		// With natural language input the primary field holds the raw text, so the
+		// parsed title gets its own field here.
+		if (shouldShowTitle && this.showsTitleInDetails()) {
 			const titleLabel = this.detailsContainer.createDiv("detail-label");
-			titleLabel.textContent = this.t("modals.task.titleLabel");
+			titleLabel.textContent = this.t(msg({ message: "Title", context: "modals.task.titleLabel" }));
 
-			const titleInputDetailed = this.detailsContainer.createEl("input", {
-				type: "text",
-				cls: "title-input-detailed",
-				placeholder: this.t("modals.task.titleDetailedPlaceholder"),
-			});
-
-			titleInputDetailed.value = this.title;
-			titleInputDetailed.addEventListener("input", (e) => {
-				this.title = (e.target as HTMLInputElement).value;
-			});
-
-			// Store reference for modals that use this as their title input
-			if ((isEditModal || isCreationWithNLP) && !this.titleInput) {
-				this.titleInput = titleInputDetailed;
-			}
+			this.titleInput = this.createTitleTextarea(
+				this.detailsContainer,
+				"title-input-detailed",
+				this.t(msg({ message: "Task title...", context: "modals.task.titleDetailedPlaceholder" }))
+			);
 		}
 
 		// Details editor goes in the right column
 		if (shouldShowDetails) {
 			const rightColumn = this.splitRightColumn || this.detailsContainer;
 
-			const detailsLabel = rightColumn.createDiv("detail-label");
-			detailsLabel.textContent = this.t("modals.task.detailsLabel");
-
-			// Create container for the markdown editor
-			const detailsEditorContainer = rightColumn.createDiv("details-markdown-editor");
-
-			// Create embeddable markdown editor for details using shared method
-			this.detailsMarkdownEditor = createTaskModalMarkdownEditor(this.app, detailsEditorContainer, {
-				value: this.details,
-				placeholder: this.t("modals.task.detailsPlaceholder"),
-				cls: "details-editor",
+			this.detailsMarkdownEditor = createTaskModalDetailsEditor({
+				app: this.app,
+				parent: rightColumn,
+				label: this.t(msg({ message: "Details", context: "modals.task.detailsLabel" })),
+				value: this.form.values.details,
+				placeholder: this.t(msg({ message: "Add more details...", context: "modals.task.detailsPlaceholder" })),
+				file: this.getModalEditorFile(),
+				tabMovesFocus: this.plugin.settings.taskModalTabMovesFocus,
 				onChange: (value) => {
-					this.details = value;
+					// Syncing the editor from the form is not an edit.
+					if (!this.isSyncingControls) this.form.edit("details", value);
 				},
-				onSubmit: () => {
-					// Ctrl/Cmd+Enter - save the task
-					this.handleSave();
+				onSubmit: (shift) => {
+					void this.handleSubmitShortcut(shift);
 				},
 				onEscape: () => {
-					// ESC - close the modal
 					this.close();
 				},
-				onTab: () => {
-					// Tab - jump to next input field
-					this.focusNextField();
-					return true; // Prevent default tab behavior
+				focusNextField: () => this.focusNextField(),
+				focusPreviousField: () => this.focusPreviousField(),
+				attachMobileKeyboardScrollGuard: (container) => {
+					this.attachMobileKeyboardScrollGuard(container);
 				},
 			});
 		}
@@ -820,124 +803,106 @@ export abstract class TaskModal extends Modal {
 	/**
 	 * Check if a field should be shown based on field configuration
 	 */
-	protected shouldShowField(fieldId: string, config?: any): boolean {
-		return shouldShowFieldForModal(fieldId, config, this.isCreationMode());
+	protected shouldShowField(fieldId: string, config?: ModalFieldsConfigLike): boolean {
+		return shouldShowFieldForModal(fieldId, config, this.mode === "create");
+	}
+
+	protected showsTitleInDetails(): boolean {
+		return false;
 	}
 
 	protected createAdditionalFields(container: HTMLElement): void {
 		// Use field configuration (always initialized via migration in main.ts)
 		const config = this.plugin.settings.modalFieldsConfig;
 		if (!config) {
-			console.error(
-				"TaskModal: modalFieldsConfig is not initialized. This should never happen."
+			tasknotesLogger.error(
+				"TaskModal: modalFieldsConfig is not initialized. This should never happen.",
+				{
+					category: "configuration",
+					operation:
+						"taskmodal-modalfieldsconfig-not-initialized-this-should-never-happen",
+				}
 			);
 			return;
 		}
 		this.createFieldsFromConfig(container, config);
 	}
 
-	protected createFieldsFromConfig(container: HTMLElement, config: any): void {
-		const groupsToRender = getOrderedModalGroups(config, this.isCreationMode());
-
-		for (const groupConfig of groupsToRender) {
-			if (groupConfig.id === "basic") continue;
-
-			// Create a section for this group if it has fields
-			const groupContainer = container.createDiv({ cls: "task-modal__field-group" });
-
-			// Add separator before non-metadata groups
-			if (groupConfig.id !== "metadata") {
-				container.createEl("hr", { cls: "task-modal__section-separator" });
-			}
-
-			// Render fields in this group
-			for (const field of groupConfig.fields) {
-				this.createField(groupContainer, field);
-			}
-		}
+	protected createFieldsFromConfig(container: HTMLElement, config: ModalFieldsConfigLike): void {
+		renderTaskModalFieldGroups({
+			container,
+			config,
+			isCreationMode: this.mode === "create",
+			fieldRenderers: this.getFieldRenderers(),
+			renderUserField: (fieldContainer, fieldConfig) => {
+				this.createUserFieldByConfig(fieldContainer, fieldConfig);
+			},
+		});
 	}
 
-	protected createField(container: HTMLElement, fieldConfig: any): void {
-		switch (fieldConfig.id) {
-			case "contexts":
-				this.createContextsField(container);
-				break;
-			case "tags":
-				this.createTagsField(container);
-				break;
-			case "time-estimate":
-				this.createTimeEstimateField(container);
-				break;
-			case "projects":
-				this.createProjectsField(container);
-				break;
-			case "subtasks":
-				this.createSubtasksField(container);
-				break;
-			case "blocked-by":
-				this.createBlockedByField(container);
-				break;
-			case "blocking":
-				this.createBlockingField(container);
-				break;
-			default:
-				// Check if it's a user field
-				if (fieldConfig.fieldType === "user") {
-					this.createUserFieldByConfig(container, fieldConfig);
-				}
-				break;
-		}
+	private getFieldRenderers(): TaskModalFieldRendererMap {
+		return {
+			contexts: (container) => this.createContextsField(container),
+			tags: (container) => this.createTagsField(container),
+			"time-estimate": (container) => this.createTimeEstimateField(container),
+			projects: (container) => this.createProjectsField(container),
+			subtasks: (container) => this.createSubtasksField(container),
+			attachments: (container) => this.createAttachmentsField(container),
+			"blocked-by": (container) => this.createBlockedByField(container),
+			blocking: (container) => this.createBlockingField(container),
+		};
 	}
 
 	protected createContextsField(container: HTMLElement): void {
-		new Setting(container).setName(this.t("modals.task.contextsLabel")).addText((text) => {
-			text.setPlaceholder(this.t("modals.task.contextsPlaceholder"))
-				.setValue(this.contexts)
-				.onChange((value) => {
-					this.contexts = value;
-				});
-
-			// Store reference to input element
-			this.contextsInput = text.inputEl;
-
-			// Add autocomplete functionality
-			new ContextSuggest(this.app, text.inputEl, this.plugin);
+		this.contextsInput = createTaskModalContextsField(this.getMetadataFieldContext(), {
+			container,
+			value: this.form.values.contexts,
+			onChange: (value) => {
+				this.form.edit("contexts", value);
+			},
 		});
 	}
 
 	protected createTagsField(container: HTMLElement): void {
-		new Setting(container).setName(this.t("modals.task.tagsLabel")).addText((text) => {
-			text.setPlaceholder(this.t("modals.task.tagsPlaceholder"))
-				.setValue(this.tags)
-				.onChange((value) => {
-					this.tags = sanitizeTags(value);
-				});
-
-			// Store reference to input element
-			this.tagsInput = text.inputEl;
-
-			// Add autocomplete functionality
-			new TagSuggest(this.app, text.inputEl, this.plugin);
+		this.tagsInput = createTaskModalTagsField(this.getMetadataFieldContext(), {
+			container,
+			value: this.form.values.tags,
+			onChange: (value) => {
+				this.form.edit("tags", value);
+			},
 		});
 	}
 
 	protected createTimeEstimateField(container: HTMLElement): void {
-		new Setting(container).setName(this.t("modals.task.timeEstimateLabel")).addText((text) => {
-			text.setPlaceholder(this.t("modals.task.timeEstimatePlaceholder"))
-				.setValue(this.timeEstimate.toString())
-				.onChange((value) => {
-					this.timeEstimate = parseInt(value) || 0;
-				});
-
-			this.timeEstimateInput = text.inputEl;
+		this.timeEstimateInput = createTaskModalTimeEstimateField(this.getMetadataFieldContext(), {
+			container,
+			value: this.form.values.timeEstimate,
+			onChange: (value) => {
+				this.form.edit("timeEstimate", value ?? 0);
+				this.form.setError(
+					"timeEstimate",
+					value === null
+						? this.t(msg({ message: "Enter a time such as 45 or 1h 30m", context: "modals.task.timeEstimateInvalid" }))
+						: null
+				);
+			},
 		});
 	}
 
+	private getMetadataFieldContext(): TaskModalMetadataFieldContext {
+		return {
+			app: this.app,
+			plugin: this.plugin,
+			translate: (key) => this.t(key),
+			attachMobileKeyboardScrollGuard: (input) => {
+				this.attachMobileKeyboardScrollGuard(input);
+			},
+		};
+	}
+
 	protected createProjectsField(container: HTMLElement): void {
-		this.projectsList = createTaskModalListField(container, {
-			label: this.t("modals.task.organization.projects"),
-			buttonText: this.t("modals.task.organization.addToProjectButton"),
-			buttonTooltip: this.t("modals.task.projectsTooltip"),
+		this.projectsList = createTaskModalProjectsField(this.getOrganizationFieldContext(), {
+			container,
 			onButtonClick: () => {
 				const modal = new ProjectSelectModal(this.app, this.plugin, (file) => {
 					this.addProject(file);
@@ -951,10 +916,8 @@ export abstract class TaskModal extends Modal {
 	}
 
 	protected createSubtasksField(container: HTMLElement): void {
-		this.subtasksList = createTaskModalListField(container, {
-			label: this.t("modals.task.organization.subtasks"),
-			buttonText: this.t("modals.task.organization.addSubtasksButton"),
-			buttonTooltip: this.t("modals.task.organization.addSubtasksTooltip"),
+		this.subtasksList = createTaskModalSubtasksField(this.getOrganizationFieldContext(), {
+			container,
 			onButtonClick: () => {
 				void this.openSubtaskSelector();
 			},
@@ -964,11 +927,90 @@ export abstract class TaskModal extends Modal {
 		this.renderOrganizationLists();
 	}
 
+	protected createAttachmentsField(container: HTMLElement): void {
+		this.attachmentsField = new TaskModalAttachmentsField({
+			container,
+			label: fieldLabelForId("attachments"),
+			translate: (key, params) => this.t(key, params),
+			getEntries: () => this.attachmentEntries,
+			setEntries: (entries) => {
+				this.attachmentEntries = entries;
+			},
+			pickVaultFile: (onChoose) => {
+				new AttachmentFileSuggestModal(
+					this.app,
+					this.plugin,
+					onChoose,
+					this.getCurrentTaskPath()
+				).open();
+			},
+			openAttachment: (path) => {
+				void this.app.workspace.openLinkText(path, "", "tab");
+			},
+			resolveExists: (path) => this.app.vault.getAbstractFileByPath(path) instanceof TFile,
+			onDuplicate: (name) => {
+				new Notice(
+					this.t(msg({ message: "\"{name}\" is already attached", context: "modals.task.attachments.duplicateNotice" }), { name })
+				);
+			},
+			onUnsupportedName: (name) => {
+				new Notice(
+					this.t(msg({ message: "\"{name}\" can't be attached. Rename it so it has a file extension and no [ ] # or | characters.", context: "modals.task.attachments.unsupportedNameNotice" }), { name })
+				);
+			},
+		});
+	}
+
+	/**
+	 * Copy files picked from disk into the vault. Called only while saving so a
+	 * discarded modal never writes attachment files.
+	 */
+	protected async importPendingAttachments(
+		sourcePath: string
+	): Promise<MaterializedTaskModalAttachments> {
+		try {
+			const imported = await materializeTaskModalAttachments(this.attachmentEntries, {
+				sourcePath,
+				getAvailablePath: (filename, source) =>
+					this.app.fileManager.getAvailablePathForAttachment(filename, source),
+				writeBinary: (path, data) => createVaultBinaryFile(this.app, path, data),
+				trashFile: async (path) => {
+					const file = this.app.vault.getAbstractFileByPath(path);
+					if (file instanceof TFile) await this.app.fileManager.trashFile(file);
+				},
+			});
+			return {
+				references: imported.references,
+				rollback: async () => {
+					await imported.rollback();
+					this.attachmentsField?.render();
+				},
+			};
+		} finally {
+			this.attachmentsField?.render();
+		}
+	}
+
+	private getOrganizationFieldContext(): TaskModalOrganizationFieldContext {
+		return {
+			translate: (key) => this.t(key),
+		};
+	}
+
+	private getUserFieldContext(): TaskModalUserFieldContext {
+		return {
+			app: this.app,
+			plugin: this.plugin,
+			translate: (key, params) => this.t(key, params),
+			attachMobileKeyboardScrollGuard: (input) => {
+				this.attachMobileKeyboardScrollGuard(input);
+			},
+		};
+	}
+
 	protected createBlockedByField(container: HTMLElement): void {
-		this.blockedByList = createTaskModalListField(container, {
-			label: this.t("modals.task.dependencies.blockedBy"),
-			buttonText: this.t("modals.task.dependencies.addTaskButton"),
-			buttonTooltip: this.t("modals.task.dependencies.selectTaskTooltip"),
+		this.blockedByList = createTaskModalBlockedByField(this.getOrganizationFieldContext(), {
+			container,
 			onButtonClick: () => {
 				void this.openBlockedBySelector();
 			},
@@ -979,10 +1021,8 @@ export abstract class TaskModal extends Modal {
 	}
 
 	protected createBlockingField(container: HTMLElement): void {
-		this.blockingList = createTaskModalListField(container, {
-			label: this.t("modals.task.dependencies.blocking"),
-			buttonText: this.t("modals.task.dependencies.addTaskButton"),
-			buttonTooltip: this.t("modals.task.dependencies.selectTaskTooltip"),
+		this.blockingList = createTaskModalBlockingField(this.getOrganizationFieldContext(), {
+			container,
 			onButtonClick: () => {
 				void this.openBlockingSelector();
 			},
@@ -992,696 +1032,265 @@ export abstract class TaskModal extends Modal {
 		this.renderDependencyLists();
 	}
 
-	protected createUserFieldByConfig(container: HTMLElement, fieldConfig: any): void {
-		// Find the user field definition
-		const userField = this.plugin.settings.userFields?.find(
-			(f: any) => f.id === fieldConfig.id
-		);
+	protected createUserFieldByConfig(
+		container: HTMLElement,
+		fieldConfig: ModalFieldConfigLike
+	): void {
+		const userField = this.plugin.settings.userFields?.find((f) => f.id === fieldConfig.id);
 		if (!userField) return;
 
-		// Create the field based on its type (existing logic from createUserFields)
-		const setting = new Setting(container).setName(userField.displayName);
-
-		switch (userField.type) {
-			case "text":
-			case "list": {
-				setting.addText((text) => {
-					const currentValue = this.userFields[userField.key];
-					const displayValue = Array.isArray(currentValue)
-						? currentValue.join(", ")
-						: currentValue || "";
-
-					text.setValue(displayValue).onChange((value) => {
-						if (userField.type === "list") {
-							this.userFields[userField.key] = value
-								.split(",")
-								.map((v) => v.trim())
-								.filter((v) => v.length > 0);
-						} else {
-							this.userFields[userField.key] = value;
-						}
-					});
-
-					// Add autocomplete functionality
-					new UserFieldSuggest(this.app, text.inputEl, this.plugin, userField);
-				});
-				break;
-			}
-			case "number": {
-				setting.addText((text) => {
-					const currentValue = this.userFields[userField.key];
-					text.setValue(currentValue?.toString() || "").onChange((value) => {
-						const numValue = parseFloat(value);
-						this.userFields[userField.key] = isNaN(numValue) ? null : numValue;
-					});
-					text.inputEl.type = "number";
-				});
-				break;
-			}
-			case "date": {
-				setting.addText((text) => {
-					const currentValue = this.userFields[userField.key];
-					text.setValue(currentValue || "").onChange((value) => {
-						this.userFields[userField.key] = value;
-					});
-					text.inputEl.type = "date";
-				});
-				break;
-			}
-			case "boolean": {
-				setting.addToggle((toggle) => {
-					const currentValue = this.userFields[userField.key];
-					toggle.setValue(currentValue === true).onChange((value) => {
-						this.userFields[userField.key] = value;
-					});
-				});
-				break;
-			}
-		}
+		createTaskModalConfiguredUserField(this.getUserFieldContext(), {
+			container,
+			field: userField,
+			values: this.form.values.userFields,
+			inputRefs: this.userFieldInputs,
+			toggleRefs: this.userFieldToggles,
+			onValueChange: (key, value) => {
+				if (!this.isSyncingControls) this.form.editUserField(key, value);
+			},
+		});
 	}
 
-	protected createUserFields(container: HTMLElement): void {
-		const userFieldConfigs = this.plugin.settings?.userFields || [];
-
-		// Add a section separator if there are user fields
-		if (userFieldConfigs.length > 0) {
-			const separator = container.createDiv({ cls: "user-fields-separator" });
-			separator.createDiv({
-				text: this.t("modals.task.customFieldsLabel"),
-				cls: "detail-label-section",
-			});
-		}
-
-		for (const field of userFieldConfigs) {
-			if (!field || !field.key || !field.displayName) continue;
-
-			const currentValue = this.userFields[field.key] || "";
-
-			switch (field.type) {
-				case "boolean":
-					new Setting(container).setName(field.displayName).addToggle((toggle) => {
-						toggle
-							.setValue(currentValue === true || currentValue === "true")
-							.onChange((value) => {
-								this.userFields[field.key] = value;
-							});
-					});
-					break;
-
-				case "number":
-					new Setting(container).setName(field.displayName).addText((text) => {
-						text.setPlaceholder(this.t("modals.task.userFields.numberPlaceholder"))
-							.setValue(currentValue ? String(currentValue) : "")
-							.onChange((value) => {
-								const numValue = parseFloat(value);
-								this.userFields[field.key] = isNaN(numValue) ? null : numValue;
-							});
-					});
-					break;
-
-				case "date":
-					new Setting(container).setName(field.displayName).addText((text) => {
-						text.setPlaceholder(this.t("modals.task.userFields.datePlaceholder"))
-							.setValue(currentValue ? String(currentValue) : "")
-							.onChange((value) => {
-								this.userFields[field.key] = value || null;
-							});
-						// Add date picker button/icon next to the input
-						// Ensure the input and button layout as a single row with proper sizing
-						const parent = text.inputEl.parentElement as HTMLElement | null;
-						if (parent) parent.addClass("tn-date-control");
-						const btn = parent?.createEl("button", {
-							cls: "user-field-date-picker-btn",
-						});
-						if (btn) {
-							btn.setAttribute(
-								"aria-label",
-								this.t("modals.task.userFields.pickDate", {
-									field: field.displayName,
-								})
-							);
-							setIcon(btn, "calendar");
-							btn.addEventListener("click", (e) => {
-								e.preventDefault();
-								const menu = new DateContextMenu({
-									currentValue: text.getValue() || undefined,
-									onSelect: (value) => {
-										text.setValue(value || "");
-										this.userFields[field.key] = value || null;
-									},
-									plugin: this.plugin,
-									app: this.app,
-								});
-								menu.showAtElement(btn);
-							});
-						}
-					});
-					break;
-
-				case "list":
-					new Setting(container).setName(field.displayName).addText((text) => {
-						const displayValue = Array.isArray(currentValue)
-							? currentValue.join(", ")
-							: currentValue
-								? String(currentValue)
-								: "";
-
-						text.setPlaceholder(this.t("modals.task.userFields.listPlaceholder"))
-							.setValue(displayValue)
-							.onChange((value) => {
-								if (!value.trim()) {
-									this.userFields[field.key] = null;
-								} else {
-									this.userFields[field.key] = value
-										.split(",")
-										.map((v) => v.trim())
-										.filter((v) => v);
-								}
-							});
-
-						// Add autocomplete functionality
-						new UserFieldSuggest(this.app, text.inputEl, this.plugin, field);
-						// Remove link preview area: we only want the input value
-						const oldPreview = container.querySelector(".user-field-link-preview");
-						if (oldPreview) oldPreview.detach?.();
-					});
-					break;
-
-				case "text":
-				default:
-					new Setting(container).setName(field.displayName).addText((text) => {
-						text.setPlaceholder(
-							this.t("modals.task.userFields.textPlaceholder", {
-								field: field.displayName,
-							})
-						)
-							.setValue(currentValue ? String(currentValue) : "")
-							.onChange((value) => {
-								this.userFields[field.key] = value || null;
-							});
-
-						// Add autocomplete functionality
-						new UserFieldSuggest(this.app, text.inputEl, this.plugin, field);
-					});
-					break;
-			}
-		}
+	protected updateUserFieldControls(): void {
+		updateTaskModalUserFieldControls({
+			fields: this.plugin.settings?.userFields || [],
+			values: this.form.values.userFields,
+			inputRefs: this.userFieldInputs,
+			toggleRefs: this.userFieldToggles,
+		});
 	}
 
 	protected createActionButtons(container: HTMLElement): void {
-		const buttonContainer = container.createDiv("modal-button-container");
-
-		// Add "Open note" button for edit modals only
-		if (this.isEditMode()) {
-			const openNoteButton = buttonContainer.createEl("button", {
-				cls: "open-note-button",
-				text: this.t("modals.task.buttons.openNote"),
-			});
-
-			openNoteButton.addEventListener("click", async () => {
-				await (this as any).openTaskNote();
-			});
-		}
-
-		// Save button (primary action)
-		const saveButton = buttonContainer.createEl("button", {
-			cls: "mod-cta",
-			text: this.t("modals.task.buttons.save"),
-		});
-
-		saveButton.addEventListener("click", async () => {
-			saveButton.disabled = true;
-			try {
-				await this.handleSave();
+		const buttonBar = createTaskModalActionButtons(this.getActionButtonContext(), {
+			container,
+			leadingButtons: this.getLeadingButtons(),
+			overflowActions: this.getOverflowActions(),
+			onSave: () => {
+				void this.submit();
+			},
+			onCancel: () => {
 				this.close();
-			} finally {
-				saveButton.disabled = false;
-			}
+			},
 		});
+		this.saveButton = buttonBar.querySelector("button.mod-cta");
+	}
 
-		// Cancel button
-		const cancelButton = buttonContainer.createEl("button", {
-			text: this.t("common.cancel"),
-		});
+	protected getLeadingButtons(): TaskModalLeadingButton[] {
+		return [];
+	}
 
-		cancelButton.addEventListener("click", () => {
-			this.close();
-		});
+	protected getOverflowActions(): TaskModalOverflowAction[] {
+		return [];
+	}
+
+	protected getActionButtonContext(): TaskModalActionButtonContext {
+		return {
+			translate: (key: MessageDescriptor) => this.t(key),
+		};
 	}
 
 	protected expandModal(): void {
 		if (this.isExpanded) return;
 
 		this.isExpanded = true;
-		this.detailsContainer.style.display = "block";
-		this.containerEl.addClass("expanded");
-
-		// Also show the right column (details editor) when expanding
-		if (this.splitRightColumn) {
-			this.splitRightColumn.style.display = "";
-		}
-
-		// Animate the expansion
-		this.detailsContainer.style.opacity = "0";
-		this.detailsContainer.style.transform = "translateY(-10px)";
-
-		setTimeout(() => {
-			this.detailsContainer.style.opacity = "1";
-			this.detailsContainer.style.transform = "translateY(0)";
-		}, 50);
+		this.containerEl.classList.add("expanded");
+		setTaskModalDetailsCollapsed(
+			{ detailsContainer: this.detailsContainer, splitRightColumn: this.splitRightColumn },
+			false
+		);
+		// Measured while hidden, the title has no height.
+		if (this.titleInput) resizeTaskModalTitleTextarea(this.titleInput);
 	}
 
-	protected showDateContextMenu(event: UIEvent, type: "due" | "scheduled"): void {
-		const currentValue = type === "due" ? this.dueDate : this.scheduledDate;
-		const title =
-			type === "due"
-				? this.t("modals.task.dateMenu.dueTitle")
-				: this.t("modals.task.dateMenu.scheduledTitle");
-
-		const menu = new DateContextMenu({
-			currentValue: currentValue ? getDatePart(currentValue) : undefined,
-			currentTime: currentValue ? getTimePart(currentValue) : undefined,
-			title: title,
-			plugin: this.plugin,
-			app: this.app,
-			onSelect: (value: string | null, time: string | null) => {
-				if (value) {
-					// Combine date and time if both are provided
-					const finalValue = time ? combineDateAndTime(value, time) : value;
-
-					if (type === "due") {
-						this.dueDate = finalValue;
-					} else {
-						this.scheduledDate = finalValue;
-					}
-				} else {
-					// Clear the date
-					if (type === "due") {
-						this.dueDate = "";
-					} else {
-						this.scheduledDate = "";
-					}
-				}
-				this.updateDateIconState();
-			},
-		});
-
-		menu.show(event);
+	protected showDateContextMenu(_event: UIEvent, type: "due" | "scheduled"): void {
+		showTaskModalDateContextMenu(this.getActionMenuContext(), type);
 	}
 
 	protected showStatusContextMenu(event: UIEvent): void {
-		const menu = new StatusContextMenu({
-			currentValue: this.status,
-			onSelect: (value) => {
-				this.status = value;
-				this.updateStatusIconState();
-			},
-			plugin: this.plugin,
-		});
-
-		menu.show(event);
+		showTaskModalStatusContextMenu(this.getActionMenuContext(), event);
 	}
 
 	protected showPriorityContextMenu(event: UIEvent): void {
-		const menu = new PriorityContextMenu({
-			currentValue: this.priority,
-			onSelect: (value) => {
-				this.priority = value;
-				this.updatePriorityIconState();
-			},
-			plugin: this.plugin,
-		});
-
-		menu.show(event);
+		showTaskModalPriorityContextMenu(this.getActionMenuContext(), event);
 	}
 
 	protected showRecurrenceContextMenu(event: UIEvent): void {
-		const menu = new RecurrenceContextMenu({
-			currentValue: this.recurrenceRule,
-			currentAnchor: this.recurrenceAnchor,
-			scheduledDate: this.scheduledDate,
-			onSelect: (value, anchor) => {
-				this.recurrenceRule = value || "";
-				if (anchor !== undefined) {
-					this.recurrenceAnchor = anchor;
-				}
-				this.updateRecurrenceIconState();
-			},
-			app: this.app,
-			plugin: this.plugin,
-		});
-
-		menu.show(event);
+		showTaskModalRecurrenceContextMenu(this.getActionMenuContext(), event);
 	}
 
 	protected showReminderContextMenu(event: UIEvent): void {
-		// Create a temporary task info object for the context menu
-		const tempTask: TaskInfo = {
-			title: this.title,
-			status: this.status,
-			priority: this.priority,
-			due: this.dueDate,
-			scheduled: this.scheduledDate,
-			path: "", // Will be set when saving
-			archived: false,
-			reminders: this.reminders,
-		};
-
-		const menu = new ReminderContextMenu(
-			this.plugin,
-			tempTask,
-			event.target as HTMLElement,
-			(updatedTask: TaskInfo) => {
-				this.reminders = updatedTask.reminders || [];
-				this.updateReminderIconState();
-			}
-		);
-
-		menu.show(event);
+		showTaskModalReminderContextMenu(this.getActionMenuContext(), event);
 	}
 
-	protected updateDateIconState(): void {
-		this.updateIconStates();
+	protected getActionMenuState(): TaskModalActionMenuState {
+		return createTaskModalActionMenuState({
+			title: this.form.values.title,
+			status: this.form.values.status,
+			priority: this.form.values.priority,
+			dueDate: this.form.values.dueDate,
+			scheduledDate: this.form.values.scheduledDate,
+			recurrenceRule: this.form.values.recurrenceRule,
+			recurrenceAnchor: this.form.values.recurrenceAnchor,
+			reminders: this.form.values.reminders,
+		});
 	}
 
-	protected updateStatusIconState(): void {
-		this.updateIconStates();
-	}
-
-	protected updatePriorityIconState(): void {
-		this.updateIconStates();
-	}
-
-	protected updateRecurrenceIconState(): void {
-		this.updateIconStates();
-	}
-
-	protected updateReminderIconState(): void {
-		this.updateIconStates();
-	}
-
-	protected getDefaultStatus(): string {
-		// Get the first status (lowest order) as default
-		const statusConfigs = this.plugin.settings.customStatuses;
-		if (statusConfigs && statusConfigs.length > 0) {
-			const sortedStatuses = [...statusConfigs].sort((a, b) => a.order - b.order);
-			return sortedStatuses[0].value;
-		}
-		return "open"; // fallback
-	}
-
-	protected getDefaultPriority(): string {
-		// Get the priority with lowest weight as default
-		const priorityConfigs = this.plugin.settings.customPriorities;
-		if (priorityConfigs && priorityConfigs.length > 0) {
-			const sortedPriorities = [...priorityConfigs].sort((a, b) => a.weight - b.weight);
-			return sortedPriorities[0].value;
-		}
-		return "normal"; // fallback
-	}
-
-	protected getRecurrenceDisplayText(): string {
-		if (!this.recurrenceRule) return "";
-
-		// Parse RRULE patterns into human-readable text
-		const rule = this.recurrenceRule;
-
-		if (rule.includes("FREQ=DAILY")) {
-			return "Daily";
-		} else if (rule.includes("FREQ=WEEKLY")) {
-			if (rule.includes("INTERVAL=2")) {
-				return "Every 2 weeks";
-			} else if (rule.includes("BYDAY=MO,TU,WE,TH,FR")) {
-				return "Weekdays";
-			} else if (rule.includes("BYDAY=")) {
-				// Extract day for display
-				const dayMatch = rule.match(/BYDAY=([A-Z]{2})/);
-				if (dayMatch) {
-					const dayMap: Record<string, string> = {
-						SU: "Sunday",
-						MO: "Monday",
-						TU: "Tuesday",
-						WE: "Wednesday",
-						TH: "Thursday",
-						FR: "Friday",
-						SA: "Saturday",
-					};
-					return `Weekly on ${dayMap[dayMatch[1]] || dayMatch[1]}`;
-				}
-				return "Weekly";
-			} else {
-				return "Weekly";
-			}
-		} else if (rule.includes("FREQ=MONTHLY")) {
-			if (rule.includes("INTERVAL=3")) {
-				return "Every 3 months";
-			} else if (rule.includes("BYMONTHDAY=")) {
-				const dayMatch = rule.match(/BYMONTHDAY=(\d+)/);
-				if (dayMatch) {
-					return `Monthly on the ${this.getOrdinal(parseInt(dayMatch[1]))}`;
-				}
-				return "Monthly";
-			} else if (rule.includes("BYDAY=")) {
-				return "Monthly (by weekday)";
-			} else {
-				return "Monthly";
-			}
-		} else if (rule.includes("FREQ=YEARLY")) {
-			if (rule.includes("BYMONTH=") && rule.includes("BYMONTHDAY=")) {
-				const monthMatch = rule.match(/BYMONTH=(\d+)/);
-				const dayMatch = rule.match(/BYMONTHDAY=(\d+)/);
-				if (monthMatch && dayMatch) {
-					const monthNames = [
-						"",
-						"January",
-						"February",
-						"March",
-						"April",
-						"May",
-						"June",
-						"July",
-						"August",
-						"September",
-						"October",
-						"November",
-						"December",
-					];
-					const month = monthNames[parseInt(monthMatch[1])];
-					const day = this.getOrdinal(parseInt(dayMatch[1]));
-					return `Yearly on ${month} ${day}`;
-				}
-			}
-			return "Yearly";
-		}
-
-		// Check for end conditions
-		let endText = "";
-		if (rule.includes("COUNT=")) {
-			const countMatch = rule.match(/COUNT=(\d+)/);
-			if (countMatch) {
-				endText = ` (${countMatch[1]} times)`;
-			}
-		} else if (rule.includes("UNTIL=")) {
-			const untilMatch = rule.match(/UNTIL=(\d{8})/);
-			if (untilMatch) {
-				const date = untilMatch[1];
-				const formatted = `${date.slice(0, 4)}-${date.slice(4, 6)}-${date.slice(6, 8)}`;
-				endText = ` (until ${formatted})`;
-			}
-		}
-
-		// Fallback for custom patterns
-		return "Custom" + endText;
-	}
-
-	private getOrdinal(n: number): string {
-		const s = ["th", "st", "nd", "rd"];
-		const v = n % 100;
-		return n + (s[(v - 20) % 10] || s[v] || s[0]);
+	protected getActionMenuContext(): TaskModalActionMenuContext {
+		return createTaskModalActionMenuContext({
+			app: this.app,
+			plugin: this.plugin,
+			translate: (key, params) => this.t(key, params),
+			getState: () => this.getActionMenuState(),
+			setDueDate: (value) => {
+				this.form.edit("dueDate", value);
+			},
+			setScheduledDate: (value) => {
+				this.form.edit("scheduledDate", value);
+			},
+			setStatus: (value) => {
+				this.form.edit("status", value);
+			},
+			setPriority: (value) => {
+				this.form.edit("priority", value);
+			},
+			setRecurrenceRule: (value) => {
+				this.form.edit("recurrenceRule", value);
+			},
+			setRecurrenceAnchor: (anchor) => {
+				this.form.edit("recurrenceAnchor", anchor);
+			},
+			setReminders: (reminders) => {
+				this.form.edit("reminders", reminders);
+			},
+			onChange: () => this.updateIconStates(),
+		});
 	}
 
 	protected updateIconStates(): void {
-		if (!this.actionBar) return;
+		const actionMenuState = this.getActionMenuState();
 
-		// Update due date icon
-		const dueDateIcon = this.actionBar.querySelector('[data-type="due-date"]') as HTMLElement;
-		if (dueDateIcon) {
-			if (this.dueDate) {
-				dueDateIcon.classList.add("has-value");
-				setTooltip(
-					dueDateIcon,
-					this.t("modals.task.tooltips.dueValue", { value: this.dueDate }),
-					{ placement: "top" }
-				);
-			} else {
-				dueDateIcon.classList.remove("has-value");
-				setTooltip(dueDateIcon, this.t("modals.task.actions.due"), { placement: "top" });
+		updateTaskModalActionIconStates(
+			this.actionBar,
+			{ translate: (key, params) => this.t(key, params) },
+			buildTaskModalActionIconState(actionMenuState, {
+				statusConfigs: this.plugin.settings.customStatuses || [],
+				priorityConfigs: this.plugin.settings.customPriorities || [],
+				timeFormat: this.plugin.settings.calendarViewSettings?.timeFormat,
+			})
+		);
+	}
+
+	/** Bring every control in line with the form. Runs after each form change. */
+	protected syncFormControls(): void {
+		const { values } = this.form;
+		this.isSyncingControls = true;
+		try {
+			if (this.titleInput && this.titleInput.value !== values.title) {
+				this.titleInput.value = values.title;
+				resizeTaskModalTitleTextarea(this.titleInput);
 			}
-		}
-
-		// Update scheduled date icon
-		const scheduledDateIcon = this.actionBar.querySelector(
-			'[data-type="scheduled-date"]'
-		) as HTMLElement;
-		if (scheduledDateIcon) {
-			if (this.scheduledDate) {
-				scheduledDateIcon.classList.add("has-value");
-				setTooltip(
-					scheduledDateIcon,
-					this.t("modals.task.tooltips.scheduledValue", { value: this.scheduledDate }),
-					{ placement: "top" }
-				);
-			} else {
-				scheduledDateIcon.classList.remove("has-value");
-				setTooltip(scheduledDateIcon, this.t("modals.task.actions.scheduled"), {
-					placement: "top",
-				});
+			if (this.detailsMarkdownEditor && this.detailsMarkdownEditor.value !== values.details) {
+				setTaskModalDetailsEditorValue(this.detailsMarkdownEditor, values.details);
 			}
-		}
-
-		// Update status icon
-		const statusIcon = this.actionBar.querySelector('[data-type="status"]') as HTMLElement;
-		if (statusIcon) {
-			// Find the status config to get the label and color
-			const statusConfig = this.plugin.settings.customStatuses.find(
-				(s) => s.value === this.status
-			);
-			const statusLabel = statusConfig ? statusConfig.label : this.status;
-
-			if (this.status && statusConfig && statusConfig.value !== this.getDefaultStatus()) {
-				statusIcon.classList.add("has-value");
-				setTooltip(
-					statusIcon,
-					this.t("modals.task.tooltips.statusValue", { value: statusLabel }),
-					{ placement: "top" }
-				);
-			} else {
-				statusIcon.classList.remove("has-value");
-				setTooltip(statusIcon, this.t("modals.task.actions.status"), { placement: "top" });
-			}
-
-			// Apply status color to the icon
-			const iconEl = statusIcon.querySelector(".icon") as HTMLElement;
-			if (iconEl && statusConfig && statusConfig.color) {
-				iconEl.style.color = statusConfig.color;
-			} else if (iconEl) {
-				iconEl.style.color = ""; // Reset to default
-			}
-		}
-
-		// Update priority icon
-		const priorityIcon = this.actionBar.querySelector('[data-type="priority"]') as HTMLElement;
-		if (priorityIcon) {
-			// Find the priority config to get the label and color
-			const priorityConfig = this.plugin.settings.customPriorities.find(
-				(p) => p.value === this.priority
-			);
-			const priorityLabel = priorityConfig ? priorityConfig.label : this.priority;
-
+			// Leave a focused list field alone: the stored value drops a trailing
+			// separator, so writing it back mid-typing would erase the comma.
+			syncUnfocusedInput(this.contextsInput, values.contexts);
+			syncUnfocusedInput(this.tagsInput, values.tags);
+			// The field may hold text being typed ("1h") or text that failed to parse.
 			if (
-				this.priority &&
-				priorityConfig &&
-				priorityConfig.value !== this.getDefaultPriority()
+				this.timeEstimateInput &&
+				this.timeEstimateInput !== this.timeEstimateInput.ownerDocument.activeElement &&
+				!this.form.getError("timeEstimate")
 			) {
-				priorityIcon.classList.add("has-value");
-				setTooltip(
-					priorityIcon,
-					this.t("modals.task.tooltips.priorityValue", { value: priorityLabel }),
-					{ placement: "top" }
-				);
-			} else {
-				priorityIcon.classList.remove("has-value");
-				setTooltip(priorityIcon, this.t("modals.task.actions.priority"), {
-					placement: "top",
-				});
+				this.timeEstimateInput.value = formatTaskModalTimeEstimate(values.timeEstimate);
 			}
-
-			// Apply priority color to the icon
-			const iconEl = priorityIcon.querySelector(".icon") as HTMLElement;
-			if (iconEl && priorityConfig && priorityConfig.color) {
-				iconEl.style.color = priorityConfig.color;
-			} else if (iconEl) {
-				iconEl.style.color = ""; // Reset to default
-			}
-		}
-
-		// Update recurrence icon
-		const recurrenceIcon = this.actionBar.querySelector(
-			'[data-type="recurrence"]'
-		) as HTMLElement;
-		if (recurrenceIcon) {
-			if (this.recurrenceRule && this.recurrenceRule.trim()) {
-				recurrenceIcon.classList.add("has-value");
-				setTooltip(
-					recurrenceIcon,
-					this.t("modals.task.tooltips.recurrenceValue", {
-						value: this.getRecurrenceDisplayText(),
-					}),
-					{ placement: "top" }
-				);
-			} else {
-				recurrenceIcon.classList.remove("has-value");
-				setTooltip(recurrenceIcon, this.t("modals.task.actions.recurrence"), {
-					placement: "top",
-				});
-			}
-		}
-
-		// Update reminder icon
-		const reminderIcon = this.actionBar.querySelector('[data-type="reminders"]') as HTMLElement;
-		if (reminderIcon) {
-			if (this.reminders && this.reminders.length > 0) {
-				reminderIcon.classList.add("has-value");
-				const count = this.reminders.length;
-				const tooltip =
-					count === 1
-						? this.t("modals.task.tooltips.remindersSingle")
-						: this.t("modals.task.tooltips.remindersPlural", { count });
-				setTooltip(reminderIcon, tooltip, { placement: "top" });
-			} else {
-				reminderIcon.classList.remove("has-value");
-				setTooltip(reminderIcon, this.t("modals.task.actions.reminders"), {
-					placement: "top",
-				});
-			}
+			this.updateUserFieldControls();
+			this.updateIconStates();
+			this.renderFieldError("title", this.getTitleErrorAnchor());
+			this.renderFieldError("timeEstimate", this.getTimeEstimateErrorAnchor());
+		} finally {
+			this.isSyncingControls = false;
 		}
 	}
 
-	protected focusTitleInput(): void {
-		setTimeout(() => {
-			this.titleInput.focus();
-			this.titleInput.select();
-		}, 100);
+	protected getTitleErrorAnchor(): HTMLElement | null {
+		return this.titleInput ?? null;
 	}
 
-	protected addProject(file: TAbstractFile): void {
-		// Avoid duplicates
-		if (this.selectedProjectItems.some((existing) => existing.file?.path === file.path)) {
+	private getTimeEstimateErrorAnchor(): HTMLElement | null {
+		return this.timeEstimateInput?.closest<HTMLElement>(".setting-item") ?? null;
+	}
+
+	private renderFieldError(field: TaskFormErrorField, anchor: HTMLElement | null): void {
+		const message = this.form.getError(field);
+		const existing = this.fieldErrorEls.get(field);
+		if (!message || !anchor) {
+			existing?.remove();
+			this.fieldErrorEls.delete(field);
 			return;
 		}
 
-		if (file instanceof TFile) {
-			this.selectedProjectItems.push({
-				file,
-				name: file.basename,
-				link: this.buildProjectReference(file, this.getCurrentTaskPath() || ""),
+		const errorEl =
+			existing ??
+			anchor.ownerDocument.win.createDiv({
+				cls: "tn-task-modal__field-error",
+				attr: { role: "alert" },
 			});
+		if (!existing) {
+			anchor.insertAdjacentElement("afterend", errorEl);
+			this.fieldErrorEls.set(field, errorEl);
+		}
+		errorEl.textContent = message;
+	}
+
+	protected focusTitleInput(): void {
+		if (this.titleInput) this.focusGuards.focusTitleInput(this.titleInput);
+	}
+
+	protected scheduleInitialFocus(applyFocus: () => void): void {
+		this.focusGuards.scheduleInitialFocus(applyFocus);
+	}
+
+	protected isMobileLikeEnvironment(): boolean {
+		return this.focusGuards.isMobileLikeEnvironment();
+	}
+
+	private attachTitleFocusScrollGuard(input: TaskModalTitleInputElement): void {
+		this.focusGuards.attachTitleFocusScrollGuard(input);
+	}
+
+	protected attachMobileKeyboardScrollGuard(
+		input: HTMLElement,
+		options?: TaskModalMobileKeyboardScrollGuardOptions
+	): void {
+		this.focusGuards.attachMobileKeyboardScrollGuard(input, options);
+	}
+
+	protected addProject(file: TAbstractFile): void {
+		if (file instanceof TFile) {
+			const projectItem = createTaskModalProjectItemFromFile(
+				file,
+				this.buildProjectReference(file, this.getCurrentTaskPath() || "")
+			);
+
+			if (hasTaskModalProjectItem(this.selectedProjectItems, projectItem)) {
+				return;
+			}
+
+			this.selectedProjectItems.push(projectItem);
 		}
 		this.updateProjectsFromFiles();
 		this.renderProjectsList();
 	}
 
-	protected removeProject(item: ProjectItem): void {
-		this.selectedProjectItems = this.selectedProjectItems.filter(
-			(existing) => existing !== item
-		);
+	protected removeProject(item: TaskModalProjectItem): void {
+		this.selectedProjectItems = removeTaskModalProjectItem(this.selectedProjectItems, item);
 		this.updateProjectsFromFiles();
 		this.renderProjectsList();
 	}
 
 	protected updateProjectsFromFiles(): void {
-		// Update the projects string from selected items
-		this.projects = this.selectedProjectItems.map((item) => item.link).join(", ");
+		this.form.values.projects = getTaskModalProjectsValue(this.selectedProjectItems);
 	}
 
 	protected buildProjectReference(targetFile: TFile, sourcePath: string): string {
@@ -1696,255 +1305,105 @@ export abstract class TaskModal extends Modal {
 	}
 
 	protected initializeProjectsFromStrings(projects: string[]): void {
-		// Convert project string to ProjectItem objects
-		// This handles both old plain string projects and new [[link]] format
 		this.selectedProjectItems = [];
+		this.addProjectsFromStrings(projects);
+		// Don't render immediately - let the caller decide when to render
+	}
 
-		// Use the task's path as the source for resolving relative links
-		const sourcePath = this.getCurrentTaskPath() || "";
-
-		for (const projectString of projects) {
-			// Skip null, undefined, or empty strings
-			if (
-				!projectString ||
-				typeof projectString !== "string" ||
-				projectString.trim() === ""
-			) {
-				continue;
-			}
-
-			// Check if it's a wiki link format
-			const linkMatch = projectString.match(/^\[\[([^\]]+)\]\]$/);
-			if (linkMatch) {
-				const linkPath = linkMatch[1];
-				const file = this.resolveLink(linkPath, sourcePath);
-				if (file) {
-					// Resolved link
-					this.selectedProjectItems.push({
-						file,
-						name: file.basename,
-						link: projectString,
-					});
-				} else {
-					// Unresolved link - still add it!
-					const displayName = linkPath.split("|")[0]; // Strip alias if present
-					this.selectedProjectItems.push({
-						name: displayName,
-						link: projectString,
-						unresolved: true,
-					});
-				}
-			} else {
-				// Check if it's a markdown link format [text](path)
-				const markdownMatch = projectString.match(/^\[([^\]]*)\]\(([^)]+)\)$/);
-				if (markdownMatch) {
-					const linkPath = parseLinkToPath(projectString);
-					const file = this.resolveLink(linkPath, sourcePath);
-					if (file) {
-						// Resolved markdown link
-						this.selectedProjectItems.push({
-							file,
-							name: file.basename,
-							link: projectString,
-						});
-					} else {
-						// Unresolved markdown link
-						const displayName = markdownMatch[1] || linkPath;
-						this.selectedProjectItems.push({
-							name: displayName,
-							link: projectString,
-							unresolved: true,
-						});
-					}
-				} else {
-					// For backwards compatibility, try to find a file with this name
-					const files = this.getMarkdownFiles();
-					const matchingFile = files.find(
-						(f) => f.basename === projectString || f.name === projectString + ".md"
-					);
-					if (matchingFile) {
-						this.selectedProjectItems.push({
-							file: matchingFile,
-							name: matchingFile.basename,
-							link: `[[${matchingFile.basename}]]`,
-						});
-					} else {
-						// Plain text - preserve as-is
-						this.selectedProjectItems.push({
-							name: projectString,
-							link: projectString,
-							unresolved: true,
-						});
-					}
-				}
-			}
-		}
+	protected addProjectsFromStrings(projects: string[]): void {
+		this.selectedProjectItems = addTaskModalProjectItemsFromStrings(
+			this.selectedProjectItems,
+			projects,
+			this.getProjectStringContext()
+		);
 		this.updateProjectsFromFiles();
 		// Don't render immediately - let the caller decide when to render
 	}
 
+	private getProjectStringContext(): TaskModalProjectStringContext {
+		return {
+			sourcePath: this.getCurrentTaskPath() || "",
+			getMarkdownFiles: () => this.getMarkdownFiles(),
+			resolveLink: (linkPath, sourcePath) => this.resolveLink(linkPath, sourcePath),
+		};
+	}
+
 	protected renderProjectsList(): void {
-		if (!this.projectsList) return;
-
-		this.projectsList.empty();
-
-		if (this.selectedProjectItems.length === 0) {
-			return;
-		}
-
-		this.selectedProjectItems.forEach((item) => {
-			const projectItem = this.projectsList.createDiv({ cls: "task-project-item" });
-
-			// Add unresolved class if needed (same as dependencies)
-			if (item.unresolved) {
-				projectItem.addClass("task-project-item--unresolved");
-			}
-
-			const infoEl = projectItem.createDiv({ cls: "task-project-info" });
-			const nameEl = infoEl.createDiv({ cls: "task-project-name clickable-project" });
-
-			if (item.file) {
-				// Resolved project -- render as link
-				const projectAsWikilink = generateLinkWithDisplay(
-					this.app,
-					item.file,
-					this.getCurrentTaskPath() || "",
-					item.file.name
-				);
-				this.renderProjectLinksWithoutPrefix(nameEl, [projectAsWikilink]);
-
-				if (item.file.path !== item.file.name) {
-					const pathEl = infoEl.createDiv({ cls: "task-project-path" });
-					pathEl.textContent = item.file.path;
-				}
-			} else {
-				// Unresolved project - render as plain text
-				nameEl.textContent = item.name;
-				setTooltip(
-					nameEl,
-					this.t("contextMenus.task.dependencies.notices.unresolved", {
-						name: item.name,
-					}),
-					{ placement: "top" }
-				);
-			}
-			const removeBtn = projectItem.createEl("button", {
-				cls: "task-project-remove",
-				text: "×",
-			});
-			setTooltip(removeBtn, this.t("modals.task.projectsRemoveTooltip"), {
-				placement: "top",
-			});
-			removeBtn.addEventListener("click", () => {
-				this.removeProject(item);
-			});
+		renderTaskModalProjectsList({
+			app: this.app,
+			listEl: this.projectsList,
+			items: this.selectedProjectItems,
+			sourcePath: this.getCurrentTaskPath() || "",
+			translate: (key, params) => this.t(key, params),
+			onRemove: (item) => this.removeProject(item),
 		});
 	}
 
 	// Subtask management methods
 	protected async openSubtaskSelector(): Promise<void> {
-		try {
-			const cacheManager: any = this.plugin.cacheManager;
-			const allTasks: TaskInfo[] = (await cacheManager?.getAllTasks?.()) ?? [];
+		const parentPath = this.getCurrentTaskPath();
+		const parentFile = parentPath ? this.app.vault.getAbstractFileByPath(parentPath) : null;
+		const parentTask = parentPath
+			? await this.plugin.cacheManager.getTaskInfo(parentPath)
+			: null;
+		const creationDefaults =
+			parentFile instanceof TFile && parentTask
+				? buildSubtaskCreationPrePopulatedValues(this.plugin, parentTask, parentFile)
+				: undefined;
 
-			// Filter out tasks that are already subtasks and the current task (if editing)
-			const currentTaskPath = this.isEditMode() ? (this as any).task?.path : undefined;
-			const candidates = allTasks.filter((candidate) => {
-				if (currentTaskPath && candidate.path === currentTaskPath) return false;
-				return !this.selectedSubtaskFiles.some(
-					(existing) => existing.path === candidate.path
-				);
-			});
-
-			if (candidates.length === 0) {
-				new Notice(this.t("modals.task.organization.notices.noEligibleSubtasks"));
-				return;
-			}
-
-			openTaskSelector(this.plugin, candidates, async (subtask) => {
-				if (!subtask) return;
+		await openTaskModalTaskSelector({
+			plugin: this.plugin,
+			selectorOptions: creationDefaults ? { creationDefaults } : undefined,
+			getCandidates: (allTasks) =>
+				getTaskModalSubtaskCandidates(
+					allTasks,
+					this.selectedSubtaskFiles,
+					this.getCurrentTaskPath()
+				),
+			onSelect: (subtask) => {
 				const file = this.app.vault.getAbstractFileByPath(subtask.path);
 				if (file) {
 					this.addSubtask(file);
 				}
-			});
-		} catch (error) {
-			console.error("Failed to open subtask selector:", error);
-			new Notice(this.t("modals.task.organization.notices.subtaskSelectFailed"));
-		}
+			},
+			translate: (key) => this.t(key),
+			noEligibleTasksMessageKey: msg({ message: "No eligible tasks available to assign as subtasks", context: "modals.task.organization.notices.noEligibleSubtasks" }),
+			openFailedMessageKey: msg({ message: "Failed to open subtask selector", context: "modals.task.organization.notices.subtaskSelectFailed" }),
+			logOperation: "open-subtask-selector",
+		});
 	}
 
 	protected addSubtask(file: TAbstractFile): void {
-		// Avoid duplicates
-		if (this.selectedSubtaskFiles.some((existing) => existing.path === file.path)) {
+		const nextSubtaskFiles = addTaskModalSubtaskFile(this.selectedSubtaskFiles, file);
+		if (nextSubtaskFiles.length === this.selectedSubtaskFiles.length) {
 			return;
 		}
 
-		this.selectedSubtaskFiles.push(file);
+		this.selectedSubtaskFiles = nextSubtaskFiles;
 		void this.renderSubtasksList();
 	}
 
 	protected removeSubtask(file: TAbstractFile): void {
-		this.selectedSubtaskFiles = this.selectedSubtaskFiles.filter(
-			(existing) => existing.path !== file.path
-		);
+		this.selectedSubtaskFiles = removeTaskModalSubtaskFile(this.selectedSubtaskFiles, file);
 		void this.renderSubtasksList();
 	}
 
 	protected async renderSubtasksList(): Promise<void> {
-		if (!this.subtasksList) return;
-
-		this.subtasksList.empty();
-
-		if (this.selectedSubtaskFiles.length === 0) {
-			return;
-		}
-
-		for (const file of this.selectedSubtaskFiles) {
-			if (!(file instanceof TFile)) return;
-
-			const subtaskItem = this.subtasksList.createDiv({
-				cls: "task-project-item task-project-item--task-card",
-			});
-			const cardHost = subtaskItem.createDiv({ cls: "task-project-card-host" });
-
-			const taskInfo = await this.plugin.cacheManager.getCachedTaskInfo(file.path);
-			if (taskInfo) {
-				const taskCard = createTaskCard(taskInfo, this.plugin, undefined, {
+		await renderTaskModalSubtasksList({
+			app: this.app,
+			listEl: this.subtasksList,
+			files: this.selectedSubtaskFiles,
+			sourcePath: this.getCurrentTaskPath() || "",
+			getCachedTaskInfo: (path) => this.plugin.cacheManager.getCachedTaskInfo(path),
+			createTaskCard: (taskInfo) =>
+				createTaskCard(taskInfo, this.plugin, undefined, {
 					layout: "default",
 					showSecondaryBadges: false,
 					enableHoverPreview: false,
-				});
-				cardHost.appendChild(taskCard);
-			} else {
-				const infoEl = cardHost.createDiv({ cls: "task-project-info" });
-				const nameEl = infoEl.createDiv({ cls: "task-project-name clickable-project" });
-
-				const taskLink = generateLinkWithDisplay(
-					this.app,
-					file,
-					this.getCurrentTaskPath() || "",
-					file.name
-				);
-				this.renderProjectLinksWithoutPrefix(nameEl, [taskLink]);
-
-				if (file.path !== file.name) {
-					const pathEl = infoEl.createDiv({ cls: "task-project-path" });
-					pathEl.textContent = file.path;
-				}
-			}
-
-			const removeBtn = subtaskItem.createEl("button", {
-				cls: "task-project-remove",
-				text: "×",
-			});
-			setTooltip(removeBtn, this.t("modals.task.organization.removeSubtaskTooltip"), {
-				placement: "top",
-			});
-			removeBtn.addEventListener("click", () => {
-				this.removeSubtask(file);
-			});
-		}
+				}),
+			translate: (key, params) => this.t(key, params),
+			onRemove: (file) => this.removeSubtask(file),
+		});
 	}
 
 	protected renderOrganizationLists(): void {
@@ -1952,371 +1411,65 @@ export abstract class TaskModal extends Modal {
 		void this.renderSubtasksList();
 	}
 
-	protected renderProjectLinksWithoutPrefix(container: HTMLElement, links: string[]): void {
-		const linkServices: LinkServices = {
-			metadataCache: this.app.metadataCache,
-			workspace: this.app.workspace,
-		};
-
-		renderProjectLinks(container, links, linkServices);
-
-		Array.from(container.childNodes).forEach((node) => {
-			if (node.nodeType === Node.TEXT_NODE && node.textContent?.trim() === "+") {
-				node.remove();
-			}
-		});
-	}
-
-	protected toggleProjectsList(): void {
-		if (!this.projectsList) return;
-		this.projectsList.toggleClass("collapsed", !this.projectsList.hasClass("collapsed"));
-	}
-
-	protected toggleSubtasksList(): void {
-		if (!this.subtasksList) return;
-		this.subtasksList.toggleClass("collapsed", !this.subtasksList.hasClass("collapsed"));
-	}
-
+	/** Shows problems on their fields. A field the modal hides reports through a notice. */
 	protected validateForm(): boolean {
-		return this.title.trim().length > 0;
+		const titleError = this.form.values.title.trim()
+			? null
+			: this.t(msg({ message: "Please enter a task title", context: "modals.taskCreation.notices.titleRequired" }));
+		this.form.setError("title", titleError);
+		if (titleError && !this.getTitleErrorAnchor()) {
+			new Notice(titleError);
+		}
+		if (this.form.getError("timeEstimate")) {
+			this.expandModal();
+		}
+		return !this.form.hasErrors();
 	}
 
-	protected focusNextField(): void {
+	protected focusNextField(): boolean {
 		// Try to focus the contexts input as the next field after details
-		setTimeout(() => {
-			if (this.contextsInput) {
-				this.contextsInput.focus();
-			} else if (this.tagsInput) {
-				this.tagsInput.focus();
-			} else if (this.timeEstimateInput) {
-				this.timeEstimateInput.focus();
-			}
+		const nextField = this.contextsInput || this.tagsInput || this.timeEstimateInput;
+		if (!nextField) {
+			return false;
+		}
+
+		window.setTimeout(() => {
+			nextField.focus();
 		}, 50);
+		return true;
+	}
+
+	protected focusPreviousField(): boolean {
+		if (!this.titleInput) {
+			return false;
+		}
+
+		window.setTimeout(() => {
+			this.titleInput?.focus();
+		}, 50);
+		return true;
 	}
 
 	onClose(): void {
+		this.isModalOpen = false;
+		this.unsubscribeForm?.();
+		this.unsubscribeForm = null;
+
 		// Clean up keyboard handler
 		if (this.keyboardHandler) {
 			this.containerEl.removeEventListener("keydown", this.keyboardHandler);
 			this.keyboardHandler = null;
 		}
+		this.focusGuards.destroy();
 
-		// Clean up markdown editor if it exists
-		if (this.detailsMarkdownEditor) {
-			this.detailsMarkdownEditor.destroy();
-			this.detailsMarkdownEditor = null;
-		}
+		destroyTaskModalDetailsEditor(this.detailsMarkdownEditor);
+		this.detailsMarkdownEditor = null;
 		super.onClose();
 	}
 }
 
-/**
- * Context suggestion object for compatibility with other plugins
- */
-interface ContextSuggestion {
-	value: string;
-	display: string;
-	type: "context";
-	toString(): string;
-}
-
-/**
- * Context suggestion provider using AbstractInputSuggest
- */
-class ContextSuggest extends AbstractInputSuggest<ContextSuggestion> {
-	private plugin: TaskNotesPlugin;
-	private input: HTMLInputElement;
-
-	constructor(app: App, inputEl: HTMLInputElement, plugin: TaskNotesPlugin) {
-		super(app, inputEl);
-		this.plugin = plugin;
-		this.input = inputEl;
-	}
-
-	protected async getSuggestions(_: string): Promise<ContextSuggestion[]> {
-		// Handle comma-separated values
-		const currentValues = this.input.value.split(",").map((v: string) => v.trim());
-		const currentQuery = currentValues[currentValues.length - 1];
-
-		const contexts = this.plugin.cacheManager.getAllContexts();
-		const alreadySelected = currentValues.slice(0, -1);
-		return contexts
-			.filter((context) => context && typeof context === "string")
-			.filter(
-				(context) =>
-					!alreadySelected.includes(context) &&
-					(!currentQuery || context.toLowerCase().includes(currentQuery.toLowerCase()))
-			)
-			.slice(0, 10)
-			.map((context) => ({
-				value: context,
-				display: context,
-				type: "context" as const,
-				toString() {
-					return this.value;
-				},
-			}));
-	}
-
-	public renderSuggestion(contextSuggestion: ContextSuggestion, el: HTMLElement): void {
-		el.textContent = contextSuggestion.display;
-	}
-
-	public selectSuggestion(contextSuggestion: ContextSuggestion): void {
-		const currentValues = this.input.value.split(",").map((v: string) => v.trim());
-		currentValues[currentValues.length - 1] = contextSuggestion.value;
-		this.input.value = currentValues.join(", ") + ", ";
-
-		// Trigger input event to update internal state
-		this.input.dispatchEvent(new Event("input", { bubbles: true }));
-		this.input.focus();
-	}
-}
-
-/**
- * Tag suggestion object for compatibility with other plugins
- */
-interface TagSuggestion {
-	value: string;
-	display: string;
-	type: "tag";
-	toString(): string;
-}
-
-/**
- * Tag suggestion provider using AbstractInputSuggest
- */
-class TagSuggest extends AbstractInputSuggest<TagSuggestion> {
-	private plugin: TaskNotesPlugin;
-	private input: HTMLInputElement;
-
-	constructor(app: App, inputEl: HTMLInputElement, plugin: TaskNotesPlugin) {
-		super(app, inputEl);
-		this.plugin = plugin;
-		this.input = inputEl;
-	}
-
-	protected async getSuggestions(_: string): Promise<TagSuggestion[]> {
-		// Handle comma-separated values
-		const currentValues = this.input.value.split(",").map((v: string) => v.trim());
-		const currentQuery = currentValues[currentValues.length - 1];
-
-		const tags = this.plugin.cacheManager.getAllTags();
-		const alreadySelected = currentValues.slice(0, -1);
-		return tags
-			.filter((tag) => tag && typeof tag === "string")
-			.filter(
-				(tag) =>
-					!alreadySelected.includes(tag) &&
-					(!currentQuery || tag.toLowerCase().includes(currentQuery.toLowerCase()))
-			)
-			.slice(0, 10)
-			.map((tag) => ({
-				value: tag,
-				display: tag,
-				type: "tag" as const,
-				toString() {
-					return this.value;
-				},
-			}));
-	}
-
-	public renderSuggestion(tagSuggestion: TagSuggestion, el: HTMLElement): void {
-		el.textContent = tagSuggestion.display;
-	}
-
-	public selectSuggestion(tagSuggestion: TagSuggestion): void {
-		const currentValues = this.input.value.split(",").map((v: string) => v.trim());
-		currentValues[currentValues.length - 1] = tagSuggestion.value;
-		this.input.value = currentValues.join(", ") + ", ";
-
-		// Trigger input event to update internal state
-		this.input.dispatchEvent(new Event("input", { bubbles: true }));
-		this.input.focus();
-	}
-}
-
-/**
- * User field suggestion object
- */
-interface UserFieldSuggestion {
-	value: string;
-	display: string;
-	type: "user-field";
-	fieldKey: string;
-	toString(): string;
-}
-
-/**
- * User field suggestion provider using AbstractInputSuggest
- */
-class UserFieldSuggest extends AbstractInputSuggest<UserFieldSuggestion> {
-	private plugin: TaskNotesPlugin;
-	private input: HTMLInputElement;
-	private fieldConfig: any; // UserMappedField from settings
-
-	constructor(app: App, inputEl: HTMLInputElement, plugin: TaskNotesPlugin, fieldConfig: any) {
-		super(app, inputEl);
-		this.plugin = plugin;
-		this.input = inputEl;
-		this.fieldConfig = fieldConfig;
-	}
-
-	protected async getSuggestions(_: string): Promise<UserFieldSuggestion[]> {
-		const isListField = this.fieldConfig.type === "list";
-
-		// Get current token or full value
-		let currentQuery = "";
-		let currentValues: string[] = [];
-		if (isListField) {
-			currentValues = this.input.value.split(",").map((v: string) => v.trim());
-			currentQuery = currentValues[currentValues.length - 1] || "";
-		} else {
-			currentQuery = this.input.value.trim();
-		}
-		if (!currentQuery) return [];
-
-		// Detect wikilink trigger [[... and delegate to file suggester
-		const wikiMatch = currentQuery.match(/\[\[([^\]]*)$/);
-		if (wikiMatch) {
-			const partial = wikiMatch[1] || "";
-			const { FileSuggestHelper } = await import("../suggest/FileSuggestHelper");
-			// Apply custom field filter if configured, otherwise show all files
-			const list = await FileSuggestHelper.suggest(
-				this.plugin,
-				partial,
-				20,
-				this.fieldConfig.autosuggestFilter
-			);
-			return list.map((item) => ({
-				value: item.insertText,
-				display: item.displayText,
-				type: "user-field" as const,
-				fieldKey: this.fieldConfig.key,
-				toString() {
-					return this.value;
-				},
-			}));
-		}
-
-		// Fallback to existing-values suggestion
-		const existingValues = await this.getExistingUserFieldValues(this.fieldConfig.key);
-		return existingValues
-			.filter((value) => value && typeof value === "string")
-			.filter(
-				(value) =>
-					value.toLowerCase().includes(currentQuery.toLowerCase()) &&
-					(!isListField || !currentValues.slice(0, -1).includes(value))
-			)
-			.slice(0, 10)
-			.map((value) => ({
-				value: value,
-				display: value,
-				type: "user-field" as const,
-				fieldKey: this.fieldConfig.key,
-				toString() {
-					return this.value;
-				},
-			}));
-	}
-
-	private async getExistingUserFieldValues(fieldKey: string): Promise<string[]> {
-		const run = async (): Promise<string[]> => {
-			try {
-				// Get all files and extract unique values for this field
-				const allFiles = this.plugin.app.vault.getMarkdownFiles();
-				const values = new Set<string>();
-
-				// Process all files, but with early termination for performance
-				for (const file of allFiles) {
-					try {
-						const metadata = this.plugin.app.metadataCache.getFileCache(file);
-						const frontmatter = metadata?.frontmatter;
-
-						if (frontmatter && frontmatter[fieldKey] !== undefined) {
-							const value = frontmatter[fieldKey];
-
-							if (Array.isArray(value)) {
-								// Handle list fields
-								value.forEach((v) => {
-									if (typeof v === "string" && v.trim()) {
-										values.add(v.trim());
-									}
-								});
-							} else if (typeof value === "string" && value.trim()) {
-								values.add(value.trim());
-							} else if (typeof value === "number") {
-								values.add(value.toString());
-							} else if (typeof value === "boolean") {
-								values.add(value.toString());
-							}
-						}
-
-						// Early termination: stop after finding many unique values for performance
-						// This ensures we get comprehensive suggestions without processing every file
-						if (values.size >= 200) {
-							break;
-						}
-					} catch (error) {
-						// Skip files with errors
-						continue;
-					}
-				}
-
-				return Array.from(values).sort();
-			} catch (error) {
-				console.error("Error getting user field values:", error);
-				return [];
-			}
-		};
-
-		// Use debouncing for performance in large vaults (same pattern as FileSuggestHelper)
-		const debounceMs = this.plugin.settings?.suggestionDebounceMs ?? 0;
-		if (!debounceMs) {
-			return run();
-		}
-
-		return new Promise<string[]>((resolve) => {
-			const anyPlugin = this.plugin as unknown as { __userFieldSuggestTimer?: number };
-			if (anyPlugin.__userFieldSuggestTimer) {
-				clearTimeout(anyPlugin.__userFieldSuggestTimer);
-			}
-			anyPlugin.__userFieldSuggestTimer = setTimeout(async () => {
-				const results = await run();
-				resolve(results);
-			}, debounceMs) as unknown as number;
-		});
-	}
-
-	public renderSuggestion(suggestion: UserFieldSuggestion, el: HTMLElement): void {
-		el.textContent = suggestion.display;
-	}
-
-	public selectSuggestion(suggestion: UserFieldSuggestion): void {
-		const isListField = this.fieldConfig.type === "list";
-
-		if (isListField) {
-			// Replace last token with the selected suggestion. If user is typing a
-			// wikilink region ([[...), replace that partial region; otherwise
-			// replace the token entirely with the suggestion value.
-			const parts = this.input.value.split(",");
-			const last = parts.pop() ?? "";
-			const before = parts.join(",");
-			const trimmed = last.trim();
-			const replacement = /\[\[/.test(trimmed)
-				? trimmed.replace(/\[\[[^\]]*$/, `[[${suggestion.value}]]`)
-				: suggestion.value;
-			const rebuilt = (before ? before + ", " : "") + replacement;
-			this.input.value = rebuilt.endsWith(",") ? rebuilt + " " : rebuilt + ", ";
-		} else {
-			// Replace the active [[... region or entire value
-			const val = this.input.value;
-			const replaced = val.replace(/\[\[[^\]]*$/, `[[${suggestion.value}]]`);
-			this.input.value = replaced === val ? suggestion.value : replaced;
-		}
-
-		// Trigger input event to update internal state
-		this.input.dispatchEvent(new Event("input", { bubbles: true }));
-		this.input.focus();
+function syncUnfocusedInput(input: HTMLInputElement | undefined, value: string): void {
+	if (input && input !== input.ownerDocument.activeElement && input.value !== value) {
+		input.value = value;
 	}
 }

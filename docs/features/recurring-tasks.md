@@ -1,7 +1,7 @@
 # Recurring Tasks
 
 
-TaskNotes recurring tasks use RFC 5545 RRule strings with `DTSTART` support and dynamic next-occurrence scheduling. The model separates recurrence patterns from the next planned instance.
+TaskNotes recurring tasks use RFC 5545 RRule strings with `DTSTART` support and dynamic next-occurrence scheduling. The model separates recurrence patterns from the next planned instance, and can also create normal task notes for individual occurrences when an instance needs its own content.
 
 If you are new to recurring tasks in TaskNotes, think of the recurrence rule as the long-term plan and the `scheduled` field as the next concrete commitment. Most day-to-day editing affects `scheduled`, while recurrence editing changes the plan itself.
 
@@ -11,6 +11,7 @@ Recurring tasks operate on two independent levels:
 
 1. **Recurring Pattern**: Defines when pattern instances appear (controlled by `DTSTART` in the recurrence rule)
 2. **Next Occurrence**: The specific date/time when you plan to work on the next instance (controlled by the `scheduled` field)
+3. **Materialized Occurrence Notes**: Optional child task notes for specific occurrence dates, used when an occurrence needs its own checklist, status, time tracking, or body content
 
 This separation lets you reschedule the next occurrence without changing the pattern.
 
@@ -32,6 +33,11 @@ Recurring tasks require:
 
 - **Recurrence Rule**: RRule string with `DTSTART`
 - **Scheduled Date**: Next occurrence date (independent from the pattern)
+
+Materialized occurrence notes add two system fields to the occurrence note:
+
+- `recurrence_parent`: link/path back to the recurring parent task
+- `occurrence_date`: the occurrence date represented by the note
 
 ### DTSTART Integration
 
@@ -68,6 +74,9 @@ DTSTART:20250804T140000Z;FREQ=WEEKLY;BYDAY=MO,WE,FR
 DTSTART:20250815;FREQ=MONTHLY;BYMONTHDAY=15
 → 15th of each month (all-day), starting August 15, 2025
 
+DTSTART:20250831;FREQ=MONTHLY;BYMONTHDAY=-1
+→ Last day of each month (all-day), starting August 31, 2025
+
 DTSTART:20250801T100000Z;FREQ=MONTHLY;BYDAY=-1FR
 → Last Friday of each month at 10:00 AM, starting August 1, 2025
 ```
@@ -82,6 +91,86 @@ The `scheduled` field automatically tracks the next uncompleted occurrence:
 4. Can be manually rescheduled independently
 
 This behavior keeps recurring tasks practical in real planning: you can preserve a stable weekly/monthly pattern while still adapting the immediate next occurrence to calendar realities.
+
+## Materialized Occurrence Notes
+
+Most recurring tasks can remain virtual: the parent task stores `complete_instances` and `skipped_instances`, and TaskNotes renders each calendar/list instance from that parent. Materialized occurrence notes are for heavier instances where the date-specific work needs its own note.
+
+Good uses include:
+
+- A weekly review where each week needs a separate agenda and notes
+- A maintenance task where each visit needs photos, links, or a checklist
+- A recurring meeting where every occurrence should have its own time entries and completion state
+
+To create one manually, right-click a recurring task card or calendar occurrence and choose **Open or create occurrence note**. The Task Action Palette also exposes **Open or create occurrence note** for recurring tasks. If a matching note already exists for the same parent and date, TaskNotes opens it instead of creating a duplicate.
+
+An occurrence note is an ordinary TaskNotes task. It appears in views, can be edited like any other task, and shows an occurrence pill that links back to the recurring parent. On the calendar, a materialized occurrence replaces the matching virtual parent occurrence for the same parent/date pair, so you do not see both the generated instance and the note-backed instance at the same time.
+
+Its frontmatter includes:
+
+```yaml
+recurrence_parent: "[[Tasks/Weekly review]]"
+occurrence_date: "2026-06-01"
+scheduled: "2026-06-01T09:30"
+timeEstimate: 45
+```
+
+When TaskNotes creates an occurrence note, it copies the parent fields that describe how that instance should be planned: title, priority, scheduled time, due offset, contexts, projects, tags, reminders, dependencies, details, custom properties, and time estimate. Date-like fields are rebased onto the occurrence date, so a parent scheduled at `09:30` creates an occurrence scheduled at `09:30` on the selected date, and a due date one day after the parent scheduled date stays one day after the occurrence scheduled date.
+
+Occurrence notes can use a separate template from regular new tasks. Set `occurrence_template` on the recurring parent to point at a template note, or configure **Settings → Features → Body template → Occurrence note template file** as a global fallback. Parent-level `occurrence_template` wins over the global fallback. If neither occurrence-specific template is configured, occurrence note creation keeps the normal body template behavior.
+
+The parent task remains the source of the recurrence rule and series history. Occurrence notes do not copy the parent's `recurrence`, `complete_instances`, `skipped_instances`, `completedDate`, calendar provider IDs, or `timeEntries`. New time entries belong to the occurrence note once you track time there.
+
+### Occurrence Filenames
+
+By default, materialized occurrence notes use the existing filename behavior: the parent title followed by a numeric suffix. To opt in to custom filenames, set **Occurrence filename template** under **Settings → Task Properties → Title**. For example, `{{title}} — {{occurrenceDate}}` produces `Weekly review — 2026-08-01.md`.
+
+Occurrence filename templates support all regular filename variables plus these occurrence-specific variables:
+
+- `{{occurrenceDate}}` - occurrence date, such as `2026-08-01`
+- `{{occurrenceWeek}}` - ISO week, such as `2026-W31`
+- `{{occurrenceMonth}}` - month, such as `2026-08`
+- `{{occurrenceYear}}` - year, such as `2026`
+- `{{occurrenceMonthName}}` - full month name, such as `August`
+
+Choose the date granularity explicitly in the template; TaskNotes does not infer it from the recurrence rule. A recurring parent can override the global template with the frontmatter property configured by **Occurrence template override property** (by default, `occurrenceFilenameTemplate`):
+
+```yaml
+occurrenceFilenameTemplate: "{{title}} ({{occurrenceWeek}})"
+```
+
+Leaving the global template empty preserves the existing filename behavior. TaskNotes never renames existing occurrence notes, and filename collisions continue to receive a numeric suffix.
+
+### Occurrence Note Policies
+
+Each recurring parent has an **Occurrence notes** submenu under its recurrence menu:
+
+- **Create manually**: occurrence notes are only created by explicit action.
+- **Create next after completion**: after you complete a materialized occurrence note, TaskNotes creates the next occurrence note.
+- **Rolling window**: defined by the TaskNotes spec, but not automated in the plugin yet.
+
+When **Create next after completion** is enabled, creating the first occurrence is still a deliberate action. After that, completing the occurrence note advances the parent recurrence state and materializes the next scheduled occurrence.
+
+HTTP API and MCP clients can create occurrence notes without using the desktop context menu. Use `POST /api/tasks/:id/materialize-occurrence` or the MCP `tasknotes_materialize_occurrence` tool with a parent task path and occurrence date. Completing a recurring instance through the API or MCP also respects existing occurrence notes and the **Create next after completion** policy.
+
+The same submenu also controls the next-note trigger:
+
+- **Completion only**: create the next occurrence note only when the current occurrence is completed.
+- **Completion or skip**: create the next occurrence note when the current occurrence is completed or skipped.
+
+Skip/unskip controls appear on materialized occurrence notes when a skipped status is configured. Skipping an occurrence preserves the note, updates its status, and reconciles the parent `skipped_instances` list.
+
+### Completion Reconciliation
+
+When a materialized occurrence note is completed, TaskNotes updates both sides of the relationship:
+
+- The occurrence note is completed like a normal task.
+- The parent adds the occurrence date to `complete_instances`.
+- The parent removes that date from `skipped_instances` if needed.
+- The parent recalculates `scheduled` to the next uncompleted occurrence.
+- If the parent policy is **Create next after completion**, TaskNotes creates the next occurrence note idempotently.
+
+Uncompleting an occurrence note removes the date from the parent's `complete_instances` list, but it does not delete later occurrence notes that were already created.
 
 ### Example Behavior
 
@@ -102,6 +191,24 @@ scheduled: "2025-08-05T14:30"
 complete_instances: ["2025-08-04"]
 ```
 
+### Rescheduling a virtual occurrence
+
+Moving the next occurrence of a **scheduled-anchored** native recurring task replaces its original calendar placement; it does not create an extra occurrence or change the series cadence. TaskNotes retains the original rule date as the occurrence's identity:
+
+```yaml
+scheduled: 2026-10-12
+recurrence: DTSTART:20261018;FREQ=YEARLY
+recurrence_original_date: 2026-10-18
+```
+
+This occurrence appears on 12 October, not again on 18 October. Completing or skipping it records **18 October** in `complete_instances` or `skipped_instances`, and advances to the next unprocessed rule occurrence. Completed/skipped history remains keyed to the original rule dates, not to the day the work was performed. The completion notice and **Undo** refer to that same identity; Undo restores the moved schedule and its identity together.
+
+If a move lands on another actual rule date, the two commitments remain distinct even though they share a placement. The ordinary task checkbox acts on the pending moved occurrence; an explicitly selected calendar pattern instance acts on its own rule date. API callers can omit the action date to select the pending occurrence, or pass its original identity. An off-pattern moved execution date also resolves to that known identity; an explicit pattern date is never reassigned to another occurrence.
+
+`recurrence_original_date` is an optional, provider-independent `YYYY-MM-DD` system property. Moving the pending occurrence again retains its first original date. Returning it to its original day removes the property. A time-only edit does not change its day identity. TaskNotes removes the property when a next occurrence is selected (even if it shares the moved placement date) or the recurrence rule/anchor changes; an exhausted series whose schedule cannot advance keeps it so the last occurrence does not reappear as incomplete. Materializing a moved occurrence gives its note the original `occurrence_date` and the moved `scheduled` placement.
+
+TaskNotes captures this identity when rescheduling through its controls or task service/API. Existing off-pattern notes without an original-date marker are not assigned a guessed identity. When editing YAML directly, retain/set `recurrence_original_date` explicitly if you know which original rule occurrence is being moved; remove it when intentionally replacing the series. Existing Google Calendar exception fields retain their legacy behavior and are not rewritten into the new format. Completion-anchored recurrences keep their existing re-anchoring behavior.
+
 ## Calendar Drag and Drop
 
 Calendar interactions follow the same model distinction: drag the concrete next item to reschedule execution, or drag a pattern instance to redefine the recurrence anchor.
@@ -110,12 +217,27 @@ Recurring tasks can show:
 
 - **Next occurrence** (solid border): dragging updates only `scheduled`
 - **Pattern instances** (dashed border): dragging updates `DTSTART` and future pattern instances
+- **Materialized occurrence notes**: dragging updates the occurrence note's own `scheduled` or `due` date like a normal task, without changing the parent's recurrence rule
+
+In list mode and the Agenda, the card for a pattern instance shows that instance's scheduled date as read-only text and leaves out the task's due date. To give one instance its own dates, create an occurrence note for it.
 
 ![Recurring tasks in calendar week view](../assets/views-calendar-week.png)
 
+Materialized occurrence notes keep `occurrence_date` as their identity. If you drag the note for the June 1 occurrence to June 2, it is still the June 1 recurrence instance, now scheduled for June 2. TaskNotes suppresses the June 1 virtual parent event and leaves the June 2 virtual occurrence alone unless that date also has its own materialized note.
+
 ## Completion Tracking
 
-Each occurrence can be completed independently (task cards, calendar menus, task edit modal completion calendar).
+Each occurrence can be completed or skipped independently (task cards, calendar menus, task edit modal completion calendar).
+
+Checking off a recurring task shows a notification with the occurrence date and the next scheduled date, both including the year. **Undo** remains available for 15 seconds and reverses that specific checkoff, including its scheduling changes and any checklist reset. Undo refuses to overwrite later changes to the occurrence or schedule. Materialized occurrence notes are retained when undoing their completion, as with manually marking them incomplete. Notifications and Undo apply to interactive recurring checkoffs, not API calls.
+
+Dropping a recurring task on a status marked **Completed** in a Kanban or Task List view does the same as checking it off: it completes the occurrence shown on the card instead of setting the task to that status. To change the task's own status, use the context menu or edit modal.
+
+When you complete an occurrence from the context menu, you can choose which date it is recorded against — today, the occurrence's scheduled date, its due date, or a date you pick (see [Completing Tasks](task-management.md#completing-tasks)). Completion-anchored recurrences resolve *on schedule* to the newly scheduled date, an explicit re-anchor.
+
+With **Reset status after each occurrence** turned on under [Settings → Features → Recurring Tasks](../settings/features.md#recurring-tasks), completing or skipping an occurrence moves the series to the **Next status** of the first status marked **Completed** under [Settings → Task Properties](../settings/task-properties.md), so a status reached during one occurrence does not carry into the next. The setting is on in new setups, where TaskNotes' built-in Done status moves on to Open, and off in setups saved before it existed. **Undo** restores the previous status. With the setting off, or without a Next status on that completed status, the series keeps its status, and a task already in a completed status keeps it.
+
+With the reset on and a Next status set, clicking a recurring task's status indicator follows the status cycle, as it does for other tasks: it moves the series to the next status, and when that status is marked **Completed** it completes the occurrence shown on the card instead. Otherwise, the click completes the occurrence directly and keeps the series' status. On a completed occurrence, the click reopens it.
 
 Completed instances are stored in:
 
@@ -123,9 +245,19 @@ Completed instances are stored in:
 complete_instances: ["2025-08-04", "2025-08-06", "2025-08-08"]
 ```
 
-When completion changes, `scheduled` updates to the next uncompleted instance.
+Skipped instances are stored in:
+
+```yaml
+skipped_instances: ["2025-08-05"]
+```
+
+When completion changes, `scheduled` updates to the next uncompleted instance. If a materialized occurrence note exists for a date, that note's own status takes precedence for that occurrence, and TaskNotes reconciles the parent compatibility lists during completion, uncompletion, skip, and unskip actions.
 
 This means completion history and next-action planning stay synchronized automatically, without manually advancing recurring tasks.
+
+### Rescheduling clears later instances
+
+When you change a recurring task's scheduled date (from the context menu or the scheduled-date field), TaskNotes restarts the timeline from the new date: it clears every completed and skipped instance dated **on or after** that date, while keeping older instances as history. This reactivates occurrences you had completed or skipped off-schedule so they can be acted on again. Because clearing is destructive, TaskNotes asks you to confirm first — listing the dates that will be cleared — and cancelling leaves both the schedule and the recorded instances untouched.
 
 ## Flexible Scheduling
 
@@ -136,7 +268,7 @@ The next occurrence can be:
 - Before `DTSTART`
 - Outside the pattern day
 - At a different time than pattern instances
-- Far ahead while pattern continues unchanged
+- Far ahead while the other pattern occurrences continue unchanged
 
 ### Examples
 
@@ -161,7 +293,9 @@ Recurring task logic uses a UTC anchor approach:
 - Display adapts to local timezone
 - Prevents common off-by-one date issues
 
-In other words, calculations stay stable internally while display remains local, which avoids drift when traveling or sharing vaults across timezones.
+The recurrence editor preserves the anchor's calendar date and clock components when opening and saving a rule; it does not reinterpret an existing anchor through the device's timezone. Timed anchors are serialized as `YYYYMMDDTHHMMSSZ`, including seconds. Existing anchors without `Z` are normalized on save using the same clock components, rather than silently shifting their time.
+
+Completing an instance of a **completion-anchored** task moves the anchor to the selected completion day while retaining its existing clock components. Date-only anchors remain date-only. Completing a **scheduled-anchored** task leaves its anchor unchanged. This time-preserving behavior applies to instance completion; explicitly replacing the recurrence rule can still remove or change its time.
 
 ## Backward Compatibility
 

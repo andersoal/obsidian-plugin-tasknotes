@@ -1,3 +1,4 @@
+import { msg } from "@lingui/core/macro";
 import {
 	App,
 	FuzzySuggestModal,
@@ -11,6 +12,12 @@ import { ProjectMetadataResolver, ProjectEntry } from "../utils/projectMetadataR
 import { parseDisplayFieldsRow } from "../utils/projectAutosuggestDisplayFieldsParser";
 import { getProjectPropertyFilter, matchesProjectProperty } from "../utils/projectFilterUtils";
 import { FilterUtils } from "../utils/FilterUtils";
+import { collectCacheTags } from "../utils/tagExtraction";
+import { getActiveFolderPath, isPathInIncludedFolders } from "../suggest/FileSuggestHelper";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+import { isPathInExcludedFolder, parseExcludedFolders } from "../utils/pathExclusions";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Modals/ProjectSelectModal" });
 
 /**
  * Modal for selecting project notes using fuzzy search
@@ -24,28 +31,42 @@ export class ProjectSelectModal extends FuzzySuggestModal<TAbstractFile> {
 		super(app);
 		this.plugin = plugin;
 		this.onChoose = onChoose;
-		this.setPlaceholder("Type to search for project notes...");
+		this.setPlaceholder(this.plugin.i18n.translate(msg({ message: "Type to search for project notes...", context: "modals.projectSelector.placeholder" })));
 		this.setInstructions([
-			{ command: "↑↓", purpose: "to navigate" },
-			{ command: "↵", purpose: "to select" },
-			{ command: "esc", purpose: "to cancel" },
+			{
+				command: "↑↓",
+				purpose: this.plugin.i18n.translate(
+					msg({ message: "to navigate", context: "modals.unscheduledTasksSelector.instructions.navigate" })
+				),
+			},
+			{
+				command: "↵",
+				purpose: this.plugin.i18n.translate(msg({ message: "to select", context: "modals.taskSelector.instructions.select" })),
+			},
+			{
+				command: "esc",
+				purpose: this.plugin.i18n.translate(msg({ message: "to cancel", context: "modals.taskSelector.instructions.dismiss" })),
+			},
 		]);
 	}
 
 	getItems(): TAbstractFile[] {
+		const excludedFolders = parseExcludedFolders(this.plugin.settings?.excludedFolders);
 		const allFiles = this.app.vault
 			.getAllLoadedFiles()
 			.filter(
 				(file) =>
 					file instanceof TFile &&
 					file.extension === "md" &&
-					!file.path.includes(".trash")
+					!file.path.includes(".trash") &&
+					!isPathInExcludedFolder(file.path, excludedFolders)
 			);
 
 		// Get filtering settings
 		const requiredTags = this.plugin.settings?.projectAutosuggest?.requiredTags ?? [];
 		const includeFolders = this.plugin.settings?.projectAutosuggest?.includeFolders ?? [];
 		const propertyFilter = getProjectPropertyFilter(this.plugin.settings?.projectAutosuggest);
+		const activeFolder = getActiveFolderPath(this.plugin);
 
 		// Apply filtering if any filters are configured
 		if (requiredTags.length === 0 && includeFolders.length === 0 && !propertyFilter.enabled) {
@@ -59,28 +80,15 @@ export class ProjectSelectModal extends FuzzySuggestModal<TAbstractFile> {
 
 			// Apply tag filtering - use FilterUtils for consistent hierarchical tag matching
 			if (requiredTags.length > 0) {
-				// Get tags from both native tag detection and frontmatter
-				const nativeTags = cache?.tags?.map((t) => t.tag.replace("#", "")) || [];
-				const frontmatterTags = cache?.frontmatter?.tags || [];
-				const allTags = [
-					...nativeTags,
-					...(Array.isArray(frontmatterTags)
-						? frontmatterTags
-						: [frontmatterTags].filter(Boolean)),
-				];
-
 				// Use FilterUtils.matchesTagConditions for hierarchical matching and exclusion support
-				if (!FilterUtils.matchesTagConditions(allTags, requiredTags)) {
+				if (!FilterUtils.matchesTagConditions(collectCacheTags(cache), requiredTags)) {
 					return false; // Skip this file
 				}
 			}
 
 			// Apply folder filtering
 			if (includeFolders.length > 0) {
-				const isInIncludedFolder = includeFolders.some(
-					(folder) => file.path.startsWith(folder) || file.path.startsWith(folder + "/")
-				);
-				if (!isInIncludedFolder) {
+				if (!isPathInIncludedFolders(file.path, includeFolders, activeFolder)) {
 					return false; // Skip this file
 				}
 			}
@@ -112,7 +120,7 @@ export class ProjectSelectModal extends FuzzySuggestModal<TAbstractFile> {
 			try {
 				const tokens = parseDisplayFieldsRow(row);
 				for (const token of tokens) {
-					if ((token as any).searchable && !token.property.startsWith("literal:")) {
+					if (token.searchable && !token.property.startsWith("literal:")) {
 						searchableFields.add(token.property);
 					}
 				}
@@ -213,7 +221,7 @@ export class ProjectSelectModal extends FuzzySuggestModal<TAbstractFile> {
 			const title = typeof mapped.title === "string" ? mapped.title : "";
 			const aliasesFm = parseFrontMatterAliases(frontmatter) || [];
 			const aliases = Array.isArray(aliasesFm)
-				? (aliasesFm.filter((a) => typeof a === "string") as string[])
+				? aliasesFm.filter((a) => typeof a === "string")
 				: [];
 
 			const fileData: ProjectEntry = {
@@ -234,13 +242,21 @@ export class ProjectSelectModal extends FuzzySuggestModal<TAbstractFile> {
 			container.createDiv({ cls: "project-name", text: file.basename });
 
 			// Render configured rows using shared utility
-			const metadataRows = resolver.buildMetadataRows(rowConfigs, fileData, parseDisplayFieldsRow);
+			const metadataRows = resolver.buildMetadataRows(
+				rowConfigs,
+				fileData,
+				parseDisplayFieldsRow
+			);
 			for (const line of metadataRows) {
 				const metaEl = container.createDiv({ cls: "project-meta" });
 				metaEl.textContent = line;
 			}
 		} catch (error) {
-			console.error("Error rendering project suggestion:", error);
+			tasknotesLogger.error("Error rendering project suggestion:", {
+				category: "internal",
+				operation: "rendering-project-suggestion",
+				error: error,
+			});
 			// Fallback to simple display
 			container.createSpan({ cls: "project-name", text: file.basename });
 		}

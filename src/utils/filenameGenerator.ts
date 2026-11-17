@@ -1,6 +1,27 @@
+import { formatStableDate } from "../i18n/formatters";
 import { format } from "date-fns";
-import { normalizePath } from "obsidian";
+import type { Vault } from "obsidian";
 import { TaskNotesSettings } from "../types/settings";
+import { getProjectDisplayName } from "./linkUtils";
+import { createTaskNotesLogger } from "./tasknotesLogger";
+import { parseDateToLocal } from "./dateUtils";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Utils/FilenameGenerator" });
+
+function normalizeVaultPath(path: string): string {
+	return path
+		.replace(/\\/g, "/")
+		.replace(/\/+/g, "/")
+		.replace(/^\/+/, "");
+}
+
+async function vaultPathExists(vault: Vault, path: string): Promise<boolean> {
+	if (vault.getAbstractFileByPath(path)) {
+		return true;
+	}
+
+	return vault.adapter.exists(path, false);
+}
 
 export interface FilenameContext {
 	title: string;
@@ -11,6 +32,7 @@ export interface FilenameContext {
 	scheduledDate?: string; // YYYY-MM-DD format
 	// Additional body template variables (optional for backwards compatibility)
 	contexts?: string[];
+	projects?: string[];
 	tags?: string[];
 	timeEstimate?: number;
 	details?: string;
@@ -22,6 +44,11 @@ export interface ICSFilenameContext extends FilenameContext {
 	icsEventLocation?: string;
 	icsEventDescription?: string;
 }
+
+export type TaskFilenameSettings = Pick<
+	TaskNotesSettings,
+	"storeTitleInFilename" | "taskFilenameFormat" | "customFilenameTemplate"
+>;
 
 /**
  * Generates a filename for ICS event notes based on the configured format and context
@@ -79,7 +106,7 @@ export function generateICSNoteFilename(
 							: "",
 						// Add formatted title with date for users who want the full context
 						icsEventTitleWithDate: sanitizeForFilename(
-							`${context.icsEventTitle || context.title} - ${format(now, "PPP")}`
+							`${context.icsEventTitle || context.title} - ${formatStableDate(now, "PPP")}`
 						),
 					};
 					return generateCustomFilename(
@@ -99,7 +126,11 @@ export function generateICSNoteFilename(
 		// Fallback to title format if no ICS settings
 		return sanitizeForFilename(context.title);
 	} catch (error) {
-		console.error("Error generating ICS note filename:", error);
+		tasknotesLogger.error("Error generating ICS note filename:", {
+			category: "provider",
+			operation: "generating-ics-note-filename",
+			error: error,
+		});
 		// Fallback to safe title format
 		return sanitizeForFilename(context.title);
 	}
@@ -110,7 +141,7 @@ export function generateICSNoteFilename(
  */
 export function generateTaskFilename(
 	context: FilenameContext,
-	settings: TaskNotesSettings
+	settings: TaskFilenameSettings
 ): string {
 	// Validate inputs
 	if (!context || !settings) {
@@ -148,6 +179,9 @@ export function generateTaskFilename(
 			case "timestamp":
 				return generateTimestampFilename(now);
 
+			case "uuid":
+				return generateUUIDFilename();
+
 			case "custom":
 				return generateCustomFilename(context, settings.customFilenameTemplate, now);
 
@@ -156,10 +190,53 @@ export function generateTaskFilename(
 				return generateZettelId(now);
 		}
 	} catch (error) {
-		console.error("Error generating filename:", error);
+		tasknotesLogger.error("Error generating filename:", {
+			category: "persistence",
+			operation: "generating-filename",
+			error: error,
+		});
 		// Fallback to safe zettel format
 		return generateZettelId(now);
 	}
+}
+
+export function isTitleRepresentedByFilename(
+	title: string,
+	filenameTitle: string,
+	actualFilename: string,
+	expectedFilename = filenameTitle
+): boolean {
+	return actualFilename === expectedFilename && title === filenameTitle;
+}
+
+type TaskFilenameNoticeSettings = Pick<
+	TaskNotesSettings,
+	"storeTitleInFilename" | "taskFilenameFormat"
+>;
+
+export type TaskFilenameNotice = "shortened" | "sanitized" | null;
+
+/**
+ * Says how a title-based filename departs from the title: replaced by a
+ * fallback name ("shortened"), or stripped of characters that filenames
+ * cannot contain, such as / or : ("sanitized"). The title property keeps the
+ * full title, but Obsidian shows the filename in tabs, search and links.
+ */
+export function getTaskFilenameNotice(
+	settings: TaskFilenameNoticeSettings,
+	title: string,
+	actualFilename: string
+): TaskFilenameNotice {
+	if (!settings.storeTitleInFilename && settings.taskFilenameFormat !== "title") {
+		return null;
+	}
+
+	const expectedFilename = sanitizeForFilename(title);
+	if (actualFilename.startsWith("task-") && actualFilename !== expectedFilename) {
+		return "shortened";
+	}
+	// Collapsed whitespace is not worth a warning; removed characters are.
+	return expectedFilename !== title.trim().replace(/\s+/g, " ") ? "sanitized" : null;
 }
 
 /**
@@ -184,6 +261,53 @@ function generateZettelId(date: Date): string {
  */
 function generateTimestampFilename(date: Date): string {
 	return format(date, "yyyy-MM-dd-HHmmss");
+}
+
+function generateUUIDFilename(): string {
+	const cryptoProvider = typeof window !== "undefined" ? window.crypto : undefined;
+
+	if (typeof cryptoProvider?.randomUUID === "function") {
+		return cryptoProvider.randomUUID();
+	}
+
+	const bytes = new Uint8Array(16);
+	if (typeof cryptoProvider?.getRandomValues === "function") {
+		cryptoProvider.getRandomValues(bytes);
+	} else {
+		for (let i = 0; i < bytes.length; i++) {
+			bytes[i] = Math.floor(Math.random() * 256);
+		}
+	}
+
+	bytes[6] = (bytes[6] & 0x0f) | 0x40;
+	bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+	const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0"));
+	return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex
+		.slice(6, 8)
+		.join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10, 16).join("")}`;
+}
+
+function getProjectFilenameValues(projects: string[] | undefined): string[] {
+	if (!Array.isArray(projects)) {
+		return [];
+	}
+
+	return projects
+		.map((project) => getProjectDisplayName(project).trim())
+		.filter((project) => project.length > 0)
+		.map((project) => sanitizeForFilename(project));
+}
+
+function getProjectId(projectName: string | undefined): string {
+	if (!projectName) {
+		return "";
+	}
+
+	return projectName
+		.replace(/[^a-zA-Z0-9]/g, "")
+		.substring(0, 4)
+		.toUpperCase();
 }
 
 /**
@@ -215,12 +339,11 @@ function generateCustomFilename(
 			context.priority && ["low", "normal", "medium", "high"].includes(context.priority)
 				? context.priority
 				: "normal";
-		const sanitizedStatus = context.status
-			? sanitizeForFilename(context.status)
-			: "open";
+		const sanitizedStatus = context.status ? sanitizeForFilename(context.status) : "open";
 
 		// Process array values for contexts and tags
 		const contexts = Array.isArray(context.contexts) ? context.contexts : [];
+		const projects = getProjectFilenameValues(context.projects);
 		const tags = Array.isArray(context.tags) ? context.tags : [];
 
 		const variables: Record<string, string> = {
@@ -242,6 +365,9 @@ function generateCustomFilename(
 			// Body template variables (contexts, tags, etc.)
 			context: contexts[0] ? sanitizeForFilename(contexts[0]) : "",
 			contexts: contexts.map((c) => sanitizeForFilename(c)).join("/"),
+			project: projects[0] || "",
+			projects: projects.join("/"),
+			projectId: getProjectId(projects[0]),
 			tags: tags.map((t) => sanitizeForFilename(t)).join(", "),
 			hashtags: tags.map((t) => `#${sanitizeForFilename(t)}`).join(" "),
 			timeEstimate: context.timeEstimate?.toString() || "",
@@ -250,18 +376,18 @@ function generateCustomFilename(
 			// New date format variations
 			shortDate: format(date, "yyMMdd"),
 			shortYear: format(date, "yy"),
-			monthName: format(date, "MMMM"),
-			monthNameShort: format(date, "MMM"),
-			dayName: format(date, "EEEE"),
-			dayNameShort: format(date, "EEE"),
+			monthName: formatStableDate(date, "MMMM"),
+			monthNameShort: formatStableDate(date, "MMM"),
+			dayName: formatStableDate(date, "EEEE"),
+			dayNameShort: formatStableDate(date, "EEE"),
 			week: format(date, "ww"),
 			quarter: format(date, "q"),
 			// Time variations
-			time12: format(date, "hh:mm a"),
+			time12: formatStableDate(date, "hh:mm a"),
 			time24: format(date, "HH:mm"),
 			hourPadded: format(date, "HH"),
 			hour12: format(date, "hh"),
-			ampm: format(date, "a"),
+			ampm: formatStableDate(date, "a"),
 			// Unix timestamp
 			unix: Math.floor(date.getTime() / 1000).toString(),
 			unixMs: date.getTime().toString(),
@@ -291,6 +417,7 @@ function generateCustomFilename(
 				.replace(/\s+/g, ""),
 			// Date-based identifiers
 			zettel: generateZettelId(date),
+			uuid: generateUUIDFilename(),
 			nano: Date.now().toString() + Math.random().toString(36).substring(2, 7),
 
 			// Merge any additional variables
@@ -316,7 +443,11 @@ function generateCustomFilename(
 				const singleRegex = new RegExp(`\\{${key}\\}`, "g");
 				result = result.replace(singleRegex, value);
 			} catch (regexError) {
-				console.warn(`Error replacing template variable ${key}:`, regexError);
+				tasknotesLogger.warn(`Error replacing template variable ${key}:`, {
+					category: "persistence",
+					operation: "replacing-template-variable",
+					error: regexError,
+				});
 			}
 		});
 
@@ -331,7 +462,11 @@ function generateCustomFilename(
 
 		return sanitizeForFilename(result);
 	} catch (error) {
-		console.error("Error generating custom filename:", error);
+		tasknotesLogger.error("Error generating custom filename:", {
+			category: "persistence",
+			operation: "generating-custom-filename",
+			error: error,
+		});
 		// Fallback to safe title-based filename
 		return sanitizeForFilename(context.title) || generateZettelId(date);
 	}
@@ -399,7 +534,11 @@ export function sanitizeForFilename(input: string): string {
 
 		return sanitized;
 	} catch (error) {
-		console.error("Error sanitizing filename:", error);
+		tasknotesLogger.error("Error sanitizing filename:", {
+			category: "persistence",
+			operation: "sanitizing-filename",
+			error: error,
+		});
 		return "untitled";
 	}
 }
@@ -447,7 +586,7 @@ export function validateFilename(filename: string): {
 export async function generateUniqueFilename(
 	baseFilename: string,
 	folderPath: string,
-	vault: any // Obsidian Vault
+	vault: Vault
 ): Promise<string> {
 	// Validate inputs
 	if (!baseFilename || typeof baseFilename !== "string") {
@@ -472,7 +611,7 @@ export async function generateUniqueFilename(
 	const sanitizedFolderPath = folderPath.replace(/\.\./g, "").trim();
 
 	try {
-		const basePath = normalizePath(`${sanitizedFolderPath}/${sanitizedFilename}.md`);
+		const basePath = normalizeVaultPath(`${sanitizedFolderPath}/${sanitizedFilename}.md`);
 
 		// Validate path length
 		if (basePath.length > 260) {
@@ -481,21 +620,21 @@ export async function generateUniqueFilename(
 		}
 
 		// Check if the base filename is available
-		if (!vault.getAbstractFileByPath(basePath)) {
+		if (!(await vaultPathExists(vault, basePath))) {
 			return sanitizedFilename;
 		}
 
 		// If not, try appending numbers
 		for (let i = 2; i <= 999; i++) {
 			const candidateFilename = `${sanitizedFilename}-${i}`;
-			const candidatePath = normalizePath(`${sanitizedFolderPath}/${candidateFilename}.md`);
+			const candidatePath = normalizeVaultPath(`${sanitizedFolderPath}/${candidateFilename}.md`);
 
 			// Check path length for each candidate
 			if (candidatePath.length > 260) {
 				break; // Stop if paths become too long
 			}
 
-			if (!vault.getAbstractFileByPath(candidatePath)) {
+			if (!(await vaultPathExists(vault, candidatePath))) {
 				return candidateFilename;
 			}
 		}
@@ -506,9 +645,59 @@ export async function generateUniqueFilename(
 
 		return sanitizeForFilename(fallbackFilename);
 	} catch (error) {
-		console.error("Error generating unique filename:", error);
+		tasknotesLogger.error("Error generating unique filename:", {
+			category: "persistence",
+			operation: "generating-unique-filename",
+			error: error,
+		});
 		// Final fallback with timestamp
 		const timestamp = Date.now().toString(36);
 		return `task-${timestamp}`;
+	}
+}
+
+/**
+ * Builds the template variables derived from a materialized occurrence's date.
+ */
+export function buildOccurrenceFilenameVariables(occurrenceDate: string): Record<string, string> {
+	const date = parseDateToLocal(occurrenceDate);
+	if (!(date instanceof Date) || isNaN(date.getTime())) {
+		throw new Error(`Invalid occurrence date: ${occurrenceDate}`);
+	}
+	const variables: Record<string, string> = {
+		occurrenceDate: format(date, "yyyy-MM-dd"),
+		occurrenceWeek: format(date, "RRRR-'W'II"),
+		occurrenceMonth: format(date, "yyyy-MM"),
+		occurrenceYear: format(date, "yyyy"),
+		occurrenceMonthName: formatStableDate(date, "MMMM"),
+	};
+	return variables;
+}
+
+/**
+ * Generates the filename for a materialized occurrence from a template.
+ * Falls back to the sanitized parent title on any error (a bad template must
+ * never break materialization).
+ */
+export function generateOccurrenceFilename(
+	context: FilenameContext,
+	template: string,
+	occurrenceDate: string
+): string {
+	try {
+		const occurrenceVariables = buildOccurrenceFilenameVariables(occurrenceDate);
+		return generateCustomFilename(
+			context,
+			template,
+			context.date || new Date(),
+			occurrenceVariables
+		);
+	} catch (error) {
+		tasknotesLogger.error("Error generating occurrence filename:", {
+			category: "persistence",
+			operation: "generating-occurrence-filename",
+			error: error,
+		});
+		return sanitizeForFilename(context.title);
 	}
 }

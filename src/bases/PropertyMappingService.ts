@@ -1,6 +1,5 @@
-import TaskNotesPlugin from "../main";
 import { FieldMapper } from "../services/FieldMapper";
-import type { FrontmatterPropertyName, TaskCardPropertyId } from "../types";
+import type { TaskCardPropertyId } from "../types";
 
 /**
  * PropertyMappingService - Centralized property name mapping for Bases integration
@@ -30,10 +29,13 @@ import type { FrontmatterPropertyName, TaskCardPropertyId } from "../types";
  * - "file.tasks" / "formula.checklistProgress" → "checklistProgress"
  */
 export class PropertyMappingService {
-	constructor(
-		private plugin: TaskNotesPlugin,
-		private fieldMapper: FieldMapper
-	) {}
+	private fieldMapper: FieldMapper;
+
+	constructor(fieldMapper: FieldMapper);
+	constructor(_legacyPlugin: unknown, fieldMapper: FieldMapper);
+	constructor(fieldMapperOrLegacyPlugin: unknown, legacyFieldMapper?: FieldMapper) {
+		this.fieldMapper = legacyFieldMapper ?? (fieldMapperOrLegacyPlugin as FieldMapper);
+	}
 
 	/**
 	 * Map Bases property ID to TaskCard property ID.
@@ -136,7 +138,7 @@ export class PropertyMappingService {
 	 * @returns Internal field name (e.g., "status")
 	 */
 	userPropertyToInternal(userPropertyName: string): string {
-		return this.fieldMapper.fromUserField(userPropertyName) || userPropertyName;
+		return this.fieldMapper.lookupMappingKey(userPropertyName) || userPropertyName;
 	}
 
 	/**
@@ -144,7 +146,7 @@ export class PropertyMappingService {
 	 * Use this when you need to read/write frontmatter based on Bases config.
 	 */
 	basesToUserProperty(basesPropertyId: string): string {
-		const internal = this.basesToInternal(basesPropertyId);
+		const internal = this.basesToTaskCardProperty(basesPropertyId);
 		return this.internalToUserProperty(internal);
 	}
 
@@ -194,7 +196,7 @@ export class PropertyMappingService {
 		let cleanId = basesPropertyId.replace(/^(note\.|file\.|task\.)/, '');
 
 		// Try to map back from user-configured property name to internal field name
-		const internalField = this.fieldMapper?.fromUserField(cleanId);
+		const internalField = this.fieldMapper?.lookupMappingKey(cleanId);
 		if (internalField) {
 			return internalField;
 		}
@@ -217,6 +219,19 @@ export class PropertyMappingService {
 	 * @returns TaskCard property IDs for rendering
 	 */
 	mapVisibleProperties(basesPropertyIds: string[]): TaskCardPropertyId[] {
-		return basesPropertyIds.map((id) => this.basesToTaskCardProperty(id));
+		const seen = new Set<TaskCardPropertyId>();
+		const visibleProperties: TaskCardPropertyId[] = [];
+
+		for (const id of basesPropertyIds) {
+			const mappedId = this.basesToTaskCardProperty(id);
+			if (seen.has(mappedId)) {
+				continue;
+			}
+
+			seen.add(mappedId);
+			visibleProperties.push(mappedId);
+		}
+
+		return visibleProperties;
 	}
 }

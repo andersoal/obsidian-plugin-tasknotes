@@ -2,28 +2,67 @@
    SETTINGS VIEW - MINIMAL CLEAN STRUCTURE
    ================================================ */
 
+/* Obsidian 1.13+ gives plugin setting-tab roots the `setting-item` class. Its
+   flex layout would place TaskNotes' toolbar and tab content side by side, so
+   restore the vertical document flow used by this settings view. */
+.modal.mod-settings .tasknotes-settings {
+    box-sizing: border-box;
+    display: block;
+}
+
+body:not(.is-mobile) .modal.mod-settings .tasknotes-settings {
+    padding-inline: var(--size-4-8);
+}
+
+body:not(.is-mobile) .modal.mod-settings .tasknotes-settings .settings-view__tab-content > .setting-group {
+    margin-inline: 0;
+}
+
+/* Native setting rows use flex, so explicitly honor the validation row's hidden state. */
+.tasknotes-plugin .settings-view__identification-warning[hidden] {
+    display: none;
+}
+
 /* ================================================
    SETTINGS HEADER
    ================================================ */
 
+/* Wrap instead of clipping: at constrained pane widths the horizontal
+   overflow used to hide the final tab (Integrations) entirely (#2222). */
+.tasknotes-plugin .settings-view__toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: var(--tn-spacing-xs) var(--tn-spacing-md);
+    margin-bottom: var(--tn-spacing-md);
+}
+
 .tasknotes-plugin .settings-header {
     display: flex;
-    justify-content: flex-start;
-    margin-bottom: var(--tn-spacing-md);
-    margin-top: calc(-1 * var(--tn-spacing-sm));
+    flex-shrink: 0;
+    justify-content: flex-end;
+    margin-inline-start: auto;
 }
 
 .tasknotes-plugin .settings-header-link {
     display: inline-flex;
     align-items: center;
     gap: var(--tn-spacing-xs);
-    color: var(--text-accent);
+    min-height: 28px;
+    padding: 3px 8px;
+    border-radius: var(--radius-m);
+    color: var(--text-muted);
     text-decoration: none;
     font-size: var(--font-ui-small);
+    font-weight: 500;
+    line-height: 1.4;
 }
 
 .tasknotes-plugin .settings-header-link:hover {
-    text-decoration: underline;
+    background: var(--background-modifier-hover);
+    color: var(--text-normal);
+    text-decoration: none;
 }
 
 .tasknotes-plugin .settings-header-link::after {
@@ -38,23 +77,71 @@
 /* Tab Navigation Container */
 .tasknotes-plugin .settings-view__tab-nav {
     display: flex;
+    align-items: center;
+    flex: 1 1 36rem;
+    flex-wrap: wrap;
     gap: var(--tn-spacing-xs);
-    margin-bottom: var(--tn-spacing-lg);
-    border-bottom: 1px solid var(--tn-border-color);
-    padding-bottom: var(--tn-spacing-sm);
-    overflow-x: auto;
-    white-space: nowrap;
+    min-width: 0;
+    width: auto;
+    max-width: 100%;
+    margin-bottom: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    overflow: visible;
+    white-space: normal;
+    scrollbar-width: thin;
 }
 
 .tasknotes-plugin .settings-view__tab-button {
+    appearance: none;
+    box-sizing: border-box;
     white-space: nowrap;
     flex-shrink: 0;
+    min-height: 28px;
+    padding: 3px 9px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-m);
+    box-shadow: none;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: var(--font-ui-small);
+    font-weight: 500;
+    line-height: 1.4;
+    cursor: var(--cursor-link, pointer);
+    transition: background-color 0.12s ease, color 0.12s ease;
+}
+
+.tasknotes-plugin .settings-view__tab-button:hover {
+    background: var(--background-modifier-hover);
+    color: var(--text-normal);
+}
+
+.tasknotes-plugin .settings-view__tab-button:focus-visible {
+    outline: 2px solid var(--background-modifier-border-focus);
+    outline-offset: 2px;
 }
 
 .tasknotes-plugin .settings-view__tab-button--active,
 .tasknotes-plugin .settings-view__tab-button.is-active {
-    background: var(--interactive-accent) !important;
-    color: var(--text-on-accent) !important;
+    background: var(--background-primary);
+    color: var(--text-normal);
+}
+
+@media (max-width: 700px) {
+    .tasknotes-plugin .settings-view__toolbar {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: var(--tn-spacing-xs);
+    }
+
+    .tasknotes-plugin .settings-header {
+        justify-content: flex-start;
+    }
+
+    .tasknotes-plugin .settings-view__tab-nav {
+        width: 100%;
+    }
 }
 
 /* ================================================
@@ -136,8 +223,8 @@
 }
 
 .tasknotes-settings__card-secondary-text {
-    font-size: 12px !important;
-    color: var(--text-muted) !important;
+    font-size: 12px;
+    color: var(--text-muted);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -213,16 +300,16 @@ select.tasknotes-settings__card-input {
 }
 
 .tasknotes-settings__card-input[type="checkbox"] {
-    width: 16px !important;
-    height: 16px !important;
-    min-width: 16px !important;
-    min-height: 16px !important;
-    max-width: 16px !important;
-    max-height: 16px !important;
-    padding: 0 !important;
-    margin: 0 !important;
-    flex-shrink: 0 !important;
-    align-self: center !important;
+    width: 16px;
+    height: 16px;
+    min-width: 16px;
+    min-height: 16px;
+    max-width: 16px;
+    max-height: 16px;
+    padding: 0;
+    margin: 0;
+    flex-shrink: 0;
+    align-self: center;
 }
 
 .tasknotes-settings__card-input[type="color"] {
@@ -238,6 +325,77 @@ select.tasknotes-settings__card-input {
 .tasknotes-settings__card-input:focus {
     outline: none;
     border-color: var(--interactive-accent);
+}
+
+.tasknotes-theme-color-text-input {
+    flex: 1 1 10rem;
+    min-width: 0;
+}
+
+input.tasknotes-theme-color-picker {
+    flex: 0 0 2.25rem;
+    width: 2.25rem;
+    min-width: 2.25rem;
+    max-width: 2.25rem;
+    height: 2rem;
+    padding: 2px;
+    margin-inline-start: 0.5rem;
+    cursor: var(--cursor-link, pointer);
+}
+
+body.is-mobile .tasknotes-plugin .tasknotes-settings__card-config-row {
+    align-items: stretch;
+    flex-direction: column;
+    gap: var(--tn-spacing-xs);
+    min-width: 0;
+    width: 100%;
+    max-width: 100%;
+}
+
+body.is-mobile .tasknotes-plugin .tasknotes-settings__nested-content,
+body.is-mobile .tasknotes-plugin .tasknotes-settings__nested-cards,
+body.is-mobile .tasknotes-plugin .tasknotes-settings__collapsible-section-content {
+    min-width: 0;
+    width: 100%;
+    max-width: 100%;
+}
+
+body.is-mobile .tasknotes-plugin .field-manager,
+body.is-mobile .tasknotes-plugin .field-manager__content,
+body.is-mobile .tasknotes-plugin .field-manager__cards {
+    min-width: 0;
+    max-width: 100%;
+}
+
+body.is-mobile .tasknotes-plugin .field-manager__tabs {
+    max-width: 100%;
+    overflow-x: auto;
+    scrollbar-width: thin;
+}
+
+body.is-mobile .tasknotes-plugin .field-manager__tab {
+    flex: 0 0 auto;
+}
+
+body.is-mobile .tasknotes-plugin .tasknotes-settings__card-config-label {
+    min-width: 0;
+    width: 100%;
+    margin-right: 0;
+}
+
+body.is-mobile .tasknotes-plugin .tasknotes-settings__card-input:not([type="checkbox"]):not([type="color"]) {
+    min-width: 0;
+    width: 100%;
+    max-width: 100%;
+}
+
+body.is-mobile .tasknotes-plugin .tasknotes-settings__card-actions {
+    flex-direction: column;
+}
+
+body.is-mobile .tasknotes-plugin .tasknotes-settings__card-action-btn {
+    justify-content: center;
+    width: 100%;
 }
 
 /* Card Actions */
@@ -257,7 +415,7 @@ select.tasknotes-settings__card-input {
     color: var(--text-normal);
     font-size: 13px;
     font-weight: 500;
-    cursor: var(--cursor, pointer);
+    cursor: var(--cursor-link, pointer);
     display: flex;
     align-items: center;
     gap: 6px;
@@ -279,47 +437,57 @@ select.tasknotes-settings__card-input {
 
 .tasknotes-settings__card-action-btn--delete {
     background: var(--color-red);
-    color: white;
+    color: var(--text-on-accent);
     border-color: var(--color-red);
 }
 
 /* Header Actions */
-.tasknotes-settings__card-header-actions {
+.tasknotes-plugin .tasknotes-settings__card-header-actions {
     display: flex;
     align-items: center;
     gap: 4px;
 }
 
-.tasknotes-settings__card-header-btn {
-    width: 20px;
-    height: 20px;
-    border: none !important;
-    background: transparent;
-    color: var(--text-muted);
-    cursor: var(--cursor, pointer);
-    border-radius: 3px;
-    display: flex;
+.tasknotes-plugin .tasknotes-settings__card-header-btn {
+    appearance: none;
+    display: inline-flex;
     align-items: center;
     justify-content: center;
-    box-shadow: none !important;
-    outline: none !important;
+    width: 24px;
+    height: 24px;
+    min-width: 24px;
+    min-height: 24px;
+    margin: 0;
     padding: 0;
+    border: 0;
+    border-radius: var(--radius-s);
+    box-shadow: none;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: var(--cursor-link, pointer);
+    outline: none;
 }
 
-.tasknotes-settings__card-header-btn:focus {
-    box-shadow: none !important;
-    outline: none !important;
-    border: none !important;
+.tasknotes-plugin .tasknotes-settings__card-header-btn svg {
+    width: 15px;
+    height: 15px;
+    stroke: currentColor;
 }
 
-.tasknotes-settings__card-header-btn:hover {
+.tasknotes-plugin .tasknotes-settings__card-header-btn:focus {
+    box-shadow: none;
+    outline: none;
+    border: 0;
+}
+
+.tasknotes-plugin .tasknotes-settings__card-header-btn:hover {
     background: var(--background-modifier-hover);
     color: var(--text-normal);
 }
 
-.tasknotes-settings__card-header-btn--delete:hover {
-    background: var(--color-red);
-    color: white;
+.tasknotes-plugin .tasknotes-settings__card-header-btn--delete:hover {
+    background: rgba(var(--color-red-rgb), 0.16);
+    color: var(--color-red);
 }
 
 /* Status Badges */
@@ -334,12 +502,12 @@ select.tasknotes-settings__card-input {
 
 .tasknotes-settings__card-status-badge--active {
     background: var(--color-green);
-    color: white;
+    color: var(--text-on-accent);
 }
 
 .tasknotes-settings__card-status-badge--inactive {
     background: var(--color-red);
-    color: white;
+    color: var(--text-on-accent);
 }
 
 .tasknotes-settings__card-info-badge {
@@ -370,7 +538,7 @@ select.tasknotes-settings__card-input {
     border-radius: 16px;
     font-size: 12px;
     color: var(--text-normal);
-    transition: all 0.15s ease;
+    transition: background-color 0.15s ease, border-color 0.15s ease;
 }
 
 .tasknotes-settings__project-item:hover {
@@ -397,7 +565,7 @@ select.tasknotes-settings__card-input {
     background: transparent;
     color: var(--text-muted);
     cursor: pointer;
-    transition: all 0.15s ease;
+    transition: background-color 0.15s ease, color 0.15s ease;
     flex-shrink: 0;
 }
 
@@ -425,7 +593,7 @@ select.tasknotes-settings__card-input {
     align-items: center;
     justify-content: center;
     border-radius: 3px;
-    transition: all 0.2s ease;
+    transition: background-color 0.2s ease, opacity 0.2s ease;
     opacity: 0.6;
 }
 
@@ -487,12 +655,18 @@ select.tasknotes-settings__card-input {
 
 /* Collapsible card support */
 .tasknotes-settings__card--collapsible {
-    transition: all 0.2s ease;
+    border-color: var(--background-modifier-border);
+    overflow: hidden;
+    transition: opacity 0.2s ease;
+}
+
+.tasknotes-settings__card--collapsible:hover {
+    border-color: var(--interactive-accent);
 }
 
 .tasknotes-settings__card--collapsible .tasknotes-settings__card-content,
 .tasknotes-settings__card--collapsible .tasknotes-settings__card-actions {
-    transition: all 0.2s ease;
+    transition: opacity 0.16s ease;
     overflow: hidden;
 }
 
@@ -516,7 +690,7 @@ select.tasknotes-settings__card-input {
 /* Collapse button styling */
 .tasknotes-settings__card-collapse-btn {
     opacity: 0.7;
-    transition: all 0.2s ease;
+    transition: opacity 0.2s ease, transform 0.2s ease;
 }
 
 .tasknotes-settings__card-collapse-btn:hover {
@@ -531,7 +705,7 @@ select.tasknotes-settings__card-input {
 
 /* Clickable header styling */
 .tasknotes-settings__card-header--clickable {
-    cursor: var(--cursor, pointer);
+    cursor: var(--cursor-link, pointer);
     user-select: none;
 }
 
@@ -548,45 +722,6 @@ select.tasknotes-settings__card-input {
     padding: var(--tn-spacing-lg);
 }
 
-.tasknotes-webhook-modal-header {
-    display: flex;
-    align-items: center;
-    gap: var(--tn-spacing-md);
-    margin-bottom: var(--tn-spacing-lg);
-    padding-bottom: var(--tn-spacing-md);
-    border-bottom: 1px solid var(--background-modifier-border);
-}
-
-.tasknotes-webhook-modal-icon {
-    color: var(--interactive-accent);
-    font-size: 1.5rem;
-}
-
-.tasknotes-webhook-modal-title {
-    margin: 0;
-    color: var(--text-normal);
-    font-size: 1.25rem;
-    font-weight: 600;
-}
-
-.tasknotes-webhook-modal-section {
-    margin-bottom: var(--tn-spacing-xl);
-}
-
-.tasknotes-webhook-modal-subsection-header {
-    display: flex;
-    align-items: center;
-    gap: var(--tn-spacing-sm);
-    margin-bottom: var(--tn-spacing-md);
-}
-
-.tasknotes-webhook-modal-subsection-header h3 {
-    margin: 0;
-    font-size: 1rem;
-    font-weight: 600;
-    color: var(--text-normal);
-}
-
 .tasknotes-webhook-events-list .setting-item {
     padding: var(--tn-spacing-sm) 0;
     border-bottom: 1px solid var(--background-modifier-border);
@@ -596,131 +731,11 @@ select.tasknotes-settings__card-input {
     border-bottom: none;
 }
 
-.tasknotes-webhook-transform-help {
-    margin-top: var(--tn-spacing-md);
-    padding: var(--tn-spacing-md);
-    background: var(--background-secondary);
-    border-radius: var(--tn-radius-sm);
-    border-left: 3px solid var(--interactive-accent);
-}
-
-.tasknotes-webhook-help-header {
-    display: flex;
-    align-items: center;
-    gap: var(--tn-spacing-xs);
-    margin-bottom: var(--tn-spacing-sm);
-    font-weight: 500;
-    color: var(--text-normal);
-}
-
-.tasknotes-webhook-help-list {
-    margin: var(--tn-spacing-sm) 0;
-    padding-left: var(--tn-spacing-lg);
-    color: var(--text-muted);
-    font-size: var(--tn-font-size-sm);
-}
-
-.tasknotes-webhook-help-list li {
-    margin-bottom: var(--tn-spacing-xs);
-}
-
-.tasknotes-webhook-help-example {
-    margin-top: var(--tn-spacing-sm);
-    font-size: var(--tn-font-size-sm);
-    color: var(--text-muted);
-}
-
-.tasknotes-webhook-modal-buttons {
-    display: flex;
-    gap: var(--tn-spacing-sm);
-    justify-content: flex-end;
-    margin-top: var(--tn-spacing-xl);
-    padding-top: var(--tn-spacing-md);
-    border-top: 1px solid var(--background-modifier-border);
-}
-
-.tasknotes-webhook-modal-btn {
-    display: flex;
-    align-items: center;
-    gap: var(--tn-spacing-xs);
-    padding: var(--tn-spacing-sm) var(--tn-spacing-lg);
-    border: 1px solid var(--background-modifier-border);
-    border-radius: var(--tn-radius-sm);
-    background: var(--background-primary);
-    color: var(--text-normal);
-    font-size: var(--tn-font-size-sm);
-    font-weight: 500;
-    cursor: var(--cursor, pointer);
-    transition: all 0.2s ease;
-}
-
-.tasknotes-webhook-modal-btn:hover {
-    background: var(--background-modifier-hover);
-    border-color: var(--interactive-accent);
-}
-
-.tasknotes-webhook-modal-btn.save {
-    background: var(--interactive-accent);
-    color: var(--text-on-accent);
-    border-color: var(--interactive-accent);
-}
-
-.tasknotes-webhook-modal-btn.save:hover {
-    background: var(--interactive-accent-hover);
-    border-color: var(--interactive-accent-hover);
-}
-
-.tasknotes-webhook-modal-btn.cancel {
-    background: transparent;
-}
-
-.tasknotes-webhook-modal-btn.cancel:hover {
-    background: var(--background-modifier-hover);
-}
-
-.tasknotes-webhook-modal-btn-icon {
-    font-size: 0.9rem;
-    line-height: 1;
-}
-
 /* Webhook Secret Notice */
-.tasknotes-webhook-secret-notice {
-    text-align: center;
-    padding: var(--tn-spacing-xl);
-}
-
-.tasknotes-webhook-secret-title {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: var(--tn-spacing-sm);
-    margin-bottom: var(--tn-spacing-lg);
-    font-size: 1.125rem;
-    font-weight: 600;
-    color: var(--interactive-accent);
-}
-
-.tasknotes-webhook-secret-content {
-    margin-bottom: var(--tn-spacing-lg);
-}
 
 .tasknotes-webhook-secret-content p {
     margin-bottom: var(--tn-spacing-md);
     color: var(--text-normal);
-}
-
-.tasknotes-webhook-secret-code {
-    display: block;
-    background: var(--background-modifier-form-field);
-    padding: var(--tn-spacing-md);
-    border-radius: var(--tn-radius-sm);
-    font-family: var(--font-monospace);
-    font-size: var(--tn-font-size-sm);
-    word-break: break-all;
-    user-select: all;
-    border: 1px solid var(--background-modifier-border);
-    margin: var(--tn-spacing-md) 0;
-    cursor: var(--cursor, pointer);
 }
 
 .tasknotes-webhook-secret-code:hover {
@@ -912,13 +927,13 @@ select.tasknotes-settings__card-input {
     width: 16px;
     height: 16px;
     margin: 0;
-    cursor: var(--cursor, pointer);
+    cursor: var(--cursor-link, pointer);
 }
 
 .tasknotes-settings__property-label {
     font-size: 13px;
     color: var(--text-normal);
-    cursor: var(--cursor, pointer);
+    cursor: var(--cursor-link, pointer);
     flex: 1;
     line-height: 1.3;
 }
@@ -932,7 +947,7 @@ select.tasknotes-settings__card-input {
    ================================================ */
 
 .tasknotes-settings__collapsible-header {
-    cursor: var(--cursor, pointer);
+    cursor: var(--cursor-link, pointer);
     padding: 8px 12px;
     margin: -8px -12px 12px -12px;
     border-radius: 4px;
@@ -966,7 +981,7 @@ select.tasknotes-settings__card-input {
 }
 
 .tasknotes-settings__collapsible-content {
-    transition: all 0.2s ease;
+    transition: opacity 0.2s ease, max-height 0.2s ease;
 }
 
 /* Nested collapsible sections (e.g., filter settings within custom fields) */
@@ -978,7 +993,7 @@ select.tasknotes-settings__card-input {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    cursor: var(--cursor, pointer);
+    cursor: var(--cursor-link, pointer);
     padding: 8px 12px;
     margin: 0 -12px 12px -12px;
     border-radius: 4px;
@@ -1142,7 +1157,8 @@ select.tasknotes-settings__card-input {
     padding: 12px;
     background: var(--background-secondary);
     border-radius: 6px;
-    border-left: 3px solid var(--interactive-accent);
+    border: 1px solid var(--background-modifier-border);
+    border-inline-start-color: var(--interactive-accent);
     margin-bottom: 16px;
 }
 
@@ -1157,6 +1173,10 @@ select.tasknotes-settings__card-input {
 .tasknotes-calendar-info {
     font-size: 0.9em;
     color: var(--text-muted);
+}
+
+.tasknotes-calendar-info--warning {
+    color: var(--text-error);
 }
 
 .tasknotes-calendar-help {
@@ -1245,4 +1265,8 @@ select.tasknotes-settings__card-input {
     .tasknotes-settings__card-drag-handle {
         transition: none;
     }
+}
+
+.tasknotes-settings__card-config-row--hidden {
+    display: none;
 }

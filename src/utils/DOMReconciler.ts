@@ -1,3 +1,6 @@
+import { createTaskNotesLogger } from "./tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Utils/DOMReconciler" });
 /**
  * DOM Reconciler for efficient incremental updates
  *
@@ -17,7 +20,7 @@ export class DOMReconciler {
 
 		if (!this.isProcessing) {
 			this.isProcessing = true;
-			requestAnimationFrame(() => {
+			window.requestAnimationFrame(() => {
 				this.processUpdates();
 			});
 		}
@@ -36,7 +39,11 @@ export class DOMReconciler {
 				try {
 					update();
 				} catch (error) {
-					console.error("Error processing DOM update:", error);
+					tasknotesLogger.error("Error processing DOM update:", {
+						category: "validation",
+						operation: "processing-dom-update",
+						error: error,
+					});
 				}
 			});
 		} finally {
@@ -44,7 +51,7 @@ export class DOMReconciler {
 
 			// If more updates were queued during processing, schedule another frame
 			if (this.updateQueue.length > 0) {
-				requestAnimationFrame(() => {
+				window.requestAnimationFrame(() => {
 					this.processUpdates();
 				});
 			}
@@ -111,12 +118,12 @@ export class DOMReconciler {
 		const state = {
 			scrollTop: element.scrollTop,
 			scrollLeft: element.scrollLeft,
-			focused: document.activeElement === element,
+			focused: activeDocument.activeElement === element,
 			selection: null as { start: number; end: number } | null,
 		};
 
 		// Preserve text selection for input elements
-		if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
+		if (element.instanceOf(HTMLInputElement) || element.instanceOf(HTMLTextAreaElement)) {
 			state.selection = {
 				start: element.selectionStart || 0,
 				end: element.selectionEnd || 0,
@@ -150,7 +157,7 @@ export class DOMReconciler {
 		// Restore text selection for input elements
 		if (
 			state.selection &&
-			(element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)
+			(element.instanceOf(HTMLInputElement) || element.instanceOf(HTMLTextAreaElement))
 		) {
 			element.setSelectionRange(state.selection.start, state.selection.end);
 		}
@@ -166,12 +173,12 @@ export class DOMReconciler {
 	): void {
 		element.classList.add(`task-${animation}`);
 
-		const timeout = setTimeout(() => {
+		const timeout = window.setTimeout(() => {
 			element.classList.remove(`task-${animation}`);
-			this.activeTimeouts.delete(timeout as unknown as number);
+			this.activeTimeouts.delete(timeout);
 		}, duration);
 
-		this.activeTimeouts.add(timeout as unknown as number);
+		this.activeTimeouts.add(timeout);
 	}
 
 	/**
@@ -197,7 +204,7 @@ export class DOMReconciler {
 		});
 
 		const newKeys = new Set(newItems.map(getKey));
-		const fragment = document.createDocumentFragment();
+		const fragment = activeWindow.createFragment();
 
 		// Process new items
 		newItems.forEach((item) => {
@@ -268,7 +275,7 @@ export class DOMReconciler {
 
 		// Clear all active timeouts
 		for (const timeout of this.activeTimeouts) {
-			clearTimeout(timeout);
+			window.clearTimeout(timeout);
 		}
 		this.activeTimeouts.clear();
 	}
@@ -278,7 +285,7 @@ export class DOMReconciler {
  * State management for preserving UI state across updates
  */
 export class UIStateManager {
-	private stateMap = new Map<string, any>();
+	private stateMap = new Map<string, ReturnType<DOMReconciler["preserveState"]>>();
 
 	/**
 	 * Save UI state for a specific element

@@ -1,29 +1,128 @@
+import { uiData } from "../i18n/dataText";
+import type { RenderContext } from "obsidian";
+import { stringifyUnknown } from "../utils/stringUtils";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Ui/TaskCardPresentation" });
+
 export interface TaskCardPresentationOptions {
 	propertyLabels?: Record<string, string>;
 }
 
+const NULLISH_DISPLAY_STRINGS = new Set(["null", "undefined"]);
+
+type RenderableBasesValue = {
+	renderTo(container: HTMLElement, renderContext: RenderContext): void;
+	toString(): string;
+};
+
+function isNullishDisplayString(value: string): boolean {
+	return NULLISH_DISPLAY_STRINGS.has(value.trim().toLowerCase());
+}
+
+export function isBasesValue(value: unknown): value is RenderableBasesValue {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		typeof (value as { renderTo?: unknown }).renderTo === "function" &&
+		typeof (value as { toString?: unknown }).toString === "function"
+	);
+}
+
+function getBasesDisplayString(value: RenderableBasesValue): string {
+	const text = value.toString();
+	return text === "[object Object]" ? "" : uiData(text, "Native Bases query display string; preserve user data");
+}
+
+export function isNullBasesValue(value: unknown): boolean {
+	if (value === null || value === undefined) {
+		return true;
+	}
+
+	const basesValue = value as { constructor?: { name?: string }; toString?: () => string };
+	if (basesValue.constructor?.name === "NullValue") {
+		return true;
+	}
+
+	return isBasesValue(value) && isNullishDisplayString(getBasesDisplayString(value));
+}
+
+export function isEmptyCardDisplayValue(value: unknown): boolean {
+	if (isNullBasesValue(value)) {
+		return true;
+	}
+
+	if (Array.isArray(value)) {
+		return value.every(isEmptyCardDisplayValue);
+	}
+
+	if (typeof value === "string") {
+		return value.trim() === "" || isNullishDisplayString(value);
+	}
+
+	if (isBasesValue(value)) {
+		return getBasesDisplayString(value).trim() === "";
+	}
+
+	return false;
+}
+
+export function renderBasesValue(
+	container: HTMLElement,
+	value: unknown,
+	renderContext: RenderContext
+): boolean {
+	if (!isBasesValue(value) || isNullBasesValue(value)) {
+		return false;
+	}
+
+	try {
+		value.renderTo(container, renderContext);
+		if (!container.hasChildNodes() && !container.textContent) {
+			container.textContent = getBasesDisplayString(value);
+		}
+	} catch (error) {
+		tasknotesLogger.debug("[TaskNotes] Error rendering Bases value:", {
+			category: "persistence",
+			operation: "rendering-bases-value",
+			error: error,
+		});
+		container.textContent = getBasesDisplayString(value);
+	}
+
+	return true;
+}
+
 /**
- * Extract raw value from a Bases Value object.
- * Bases API may return objects like {icon: "...", data: ...} or {icon: "...", link: "..."}
- * instead of raw primitive values. This function extracts the actual value.
- *
- * For link values (icon: "lucide-link"), Bases strips the [[]] from wikilinks,
- * so we need to restore them to ensure proper rendering.
+ * Normalize older Bases-like wrapper objects. Official Bases Value instances are
+ * returned intact so TaskCard can render them with Value.renderTo().
  */
 export function extractBasesValue(value: unknown): unknown {
+	return uiData(extractBasesData(value), "Native Bases property/query output; user data, not interface copy");
+}
+
+function extractBasesData(value: unknown): unknown {
+	if (isNullBasesValue(value)) {
+		return "";
+	}
+
+	if (isBasesValue(value)) {
+		return value;
+	}
+
 	if (value && typeof value === "object" && "icon" in value) {
 		const v = value as Record<string, unknown>;
 
 		if (v.icon === "lucide-link" && "data" in v && v.data !== null && v.data !== undefined) {
-			const linkPath = String(v.data);
+			const linkPath = stringifyUnknown(v.data);
 			if (!linkPath.match(/^[a-z]+:\/\//i)) {
-				const display = "display" in v && v.display ? String(v.display) : null;
+				const display = "display" in v && v.display ? stringifyUnknown(v.display) : null;
 				if (display && display !== linkPath) {
 					return `[[${linkPath}|${display}]]`;
 				}
 				return `[[${linkPath}]]`;
 			}
-			const display = "display" in v && v.display ? String(v.display) : null;
+			const display = "display" in v && v.display ? stringifyUnknown(v.display) : null;
 			if (display) {
 				return `[${display}](${linkPath})`;
 			}
@@ -42,7 +141,7 @@ export function extractBasesValue(value: unknown): unknown {
 		if (v.icon === "lucide-file-question" || v.icon === "lucide-help-circle") {
 			return "";
 		}
-		return v.icon ? String(v.icon).replace("lucide-", "") : "";
+		return v.icon ? stringifyUnknown(v.icon).replace("lucide-", "") : "";
 	}
 	return value;
 }
@@ -60,7 +159,7 @@ export function resolveTaskCardPropertyLabel(
 		return fallbackLabel;
 	}
 	if (propertyId.startsWith("formula.")) {
-		return propertyId.substring(8);
+		return uiData(propertyId.substring(8), "User-authored formula identifier; preserve the native property name");
 	}
-	return propertyId.charAt(0).toUpperCase() + propertyId.slice(1);
+	return uiData(propertyId.charAt(0).toUpperCase() + propertyId.slice(1), "Unknown/custom property identifier; preserve user schema metadata");
 }

@@ -196,7 +196,44 @@
     flex-direction: column;
     height: fit-content;
     max-height: calc(100vh - 200px);
-    transition: border-color var(--tn-transition-fast), box-shadow var(--tn-transition-fast);
+    transition: width var(--tn-transition-fast), min-width var(--tn-transition-fast), max-width var(--tn-transition-fast), border-color var(--tn-transition-fast), box-shadow var(--tn-transition-fast), background-color var(--tn-transition-fast);
+}
+
+.tasknotes-plugin .kanban-view__column--collapsed {
+    min-width: var(--tn-kanban-collapsed-column-width, 48px);
+    max-width: var(--tn-kanban-collapsed-column-width, 48px);
+}
+
+.tasknotes-plugin .kanban-view__column--collapsed .kanban-view__column-header {
+    flex-direction: column;
+    align-items: center;
+    padding: var(--tn-spacing-sm) var(--tn-spacing-xs);
+    border-bottom: 0;
+}
+
+.tasknotes-plugin .kanban-view__column--collapsed .kanban-view__drag-handle,
+.tasknotes-plugin .kanban-view__column--collapsed .kanban-view__column-count,
+.tasknotes-plugin .kanban-view__column--collapsed .kanban-view__cards,
+.tasknotes-plugin .kanban-view__column--collapsed .kanban-view__add-task-button {
+    display: none;
+}
+
+/* Collapsed strip label: icon, then the title reading top to bottom, cut off with an
+   ellipsis. The title always starts at the top, also in right-to-left layouts. */
+.tasknotes-plugin .kanban-view__column--collapsed .kanban-view__column-header .kanban-view__column-title {
+    flex: none;
+    max-height: var(--tn-kanban-collapsed-title-max-height, 240px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    writing-mode: vertical-rl;
+    direction: ltr;
+    unicode-bidi: isolate;
+}
+
+.tasknotes-plugin .kanban-view__column--status-colored {
+    background: color-mix(in srgb, var(--tn-kanban-status-color) 6%, var(--tn-bg-primary));
+    border-color: color-mix(in srgb, var(--tn-kanban-status-color) 38%, var(--tn-border-color));
 }
 
 .tasknotes-plugin .kanban-view__column--dragover {
@@ -204,13 +241,32 @@
     box-shadow: var(--tn-shadow-medium);
 }
 
+.tasknotes-plugin .kanban-view__column--unknown-status {
+    border-style: dashed;
+    border-color: var(--tn-text-faint);
+    background: var(--tn-bg-secondary);
+}
+
+.tasknotes-plugin .kanban-view__column-header--unknown-status {
+    background: var(--tn-bg-primary);
+    color: var(--tn-text-muted);
+}
+
+.tasknotes-plugin .kanban-view__column-header--unknown-status .kanban-view__column-title::after,
+.tasknotes-plugin .kanban-view__column-header-cell--unknown-status .kanban-view__column-title::after {
+    content: "not in settings";
+    display: inline-flex;
+    margin-left: var(--tn-spacing-xs);
+    color: var(--tn-text-muted);
+    font-size: var(--tn-font-size-xs);
+    font-weight: var(--tn-font-weight-normal);
+}
+
 /* Column header dragover state (for column reordering) */
 .tasknotes-plugin .kanban-view__column-header--dragover,
 .tasknotes-plugin .kanban-view__column-header-cell--dragover {
     background: var(--tn-interactive-hover);
-    border: 2px solid var(--tn-interactive-accent);
-    transform: scale(1.02);
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+    box-shadow: inset 0 0 0 1px var(--tn-interactive-accent);
 }
 
 .tasknotes-plugin .kanban-view__column--uncategorized {
@@ -224,10 +280,9 @@
 
 .tasknotes-plugin .kanban-view__column--column-drop-target {
     background: var(--tn-interactive-hover);
-    border: 2px dashed var(--tn-interactive-accent);
-    transform: scale(1.02);
-    transition: all var(--tn-transition-medium);
-    box-shadow: var(--tn-shadow-medium);
+    border-color: var(--tn-interactive-accent);
+    transition: background-color var(--tn-transition-medium), border-color var(--tn-transition-medium), box-shadow var(--tn-transition-medium);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--tn-interactive-accent) 45%, transparent);
     position: relative;
 }
 
@@ -237,20 +292,12 @@
 }
 
 .tasknotes-plugin .kanban-view__column--column-drop-target::before {
-    content: "Drop here to reorder column";
+    content: "";
     position: absolute;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    background: var(--tn-interactive-accent);
-    color: var(--tn-text-on-accent);
-    padding: var(--tn-spacing-xs) var(--tn-spacing-md);
+    inset: var(--tn-spacing-xs);
+    border: 1px dashed color-mix(in srgb, var(--tn-interactive-accent) 65%, transparent);
     border-radius: var(--tn-radius-sm);
-    font-size: var(--tn-font-size-sm);
-    font-weight: var(--tn-font-weight-medium);
-    z-index: 1000;
     pointer-events: none;
-    white-space: nowrap;
 }
 
 /* Column Header */
@@ -267,7 +314,7 @@
     border-radius: var(--tn-radius-md) var(--tn-radius-md) 0 0;
     cursor: grab;
     user-select: none;
-    transition: all var(--tn-transition-fast);
+    transition: background-color var(--tn-transition-fast), border-color var(--tn-transition-fast), box-shadow var(--tn-transition-fast), opacity var(--tn-transition-fast), transform var(--tn-transition-fast);
 }
 
 .tasknotes-plugin .kanban-view__column-header:active {
@@ -276,33 +323,44 @@
 
 .tasknotes-plugin .kanban-view__column-header--dragging {
     opacity: 0.5;
-    transform: rotate(2deg);
     box-shadow: var(--tn-shadow-medium);
 }
 
-@media (pointer: coarse) {
-    .tasknotes-plugin .kanban-view__column-header--dragging {
-        pointer-events: none;
-    }
+/* Only active long-press touch drags opt out of hit-testing.
+   Shared --dragging classes must stay visual-only for native mouse dragging. */
+.tasknotes-plugin .kanban-view__touch-drag-source {
+    pointer-events: none;
 }
 
 /* Drag Handle */
 .tasknotes-plugin .kanban-view__drag-handle {
     color: var(--tn-text-muted);
     cursor: grab;
-    font-size: var(--tn-font-size-sm);
-    opacity: 0.5;
-    transition: opacity var(--tn-transition-fast);
+    opacity: 0.62;
+    width: 18px;
+    height: 18px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--tn-radius-xs);
+    transition: opacity var(--tn-transition-fast), background-color var(--tn-transition-fast), color var(--tn-transition-fast);
     flex-shrink: 0;
 }
 
 .tasknotes-plugin .kanban-view__column-header:hover .kanban-view__drag-handle,
 .tasknotes-plugin .kanban-view__column-header-cell:hover .kanban-view__drag-handle {
     opacity: 1;
+    color: var(--tn-text-normal);
+    background: var(--tn-interactive-hover);
 }
 
 .tasknotes-plugin .kanban-view__drag-handle:active {
     cursor: grabbing;
+}
+
+.tasknotes-plugin .kanban-view__drag-handle svg {
+    width: 14px;
+    height: 14px;
 }
 
 .tasknotes-plugin .kanban-view__column-title {
@@ -344,6 +402,52 @@
     flex-shrink: 0;
 }
 
+.tasknotes-plugin .kanban-view__column-count--exceeded {
+    color: var(--tn-color-error);
+    font-weight: var(--tn-font-weight-semibold);
+}
+
+.tasknotes-plugin .kanban-view__column-collapse-button {
+    appearance: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    min-width: 24px;
+    min-height: 24px;
+    margin: 0;
+    padding: 0;
+    flex-shrink: 0;
+    border: 0;
+    border-radius: var(--tn-radius-sm);
+    box-shadow: none;
+    background: transparent;
+    color: var(--tn-text-muted);
+    cursor: var(--cursor-link, pointer);
+}
+
+.tasknotes-plugin .kanban-view__column-collapse-button:hover,
+.tasknotes-plugin .kanban-view__column-collapse-button:focus-visible {
+    background: var(--tn-interactive-hover);
+    color: var(--tn-text-normal);
+}
+
+.tasknotes-plugin .kanban-view__column-collapse-button svg {
+    width: 16px;
+    height: 16px;
+}
+
+.tasknotes-plugin .kanban-view__column--collapsed .kanban-view__column-collapse-button {
+    order: -1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .tasknotes-plugin .kanban-view__column {
+        transition: none;
+    }
+}
+
 /* ================================================
    KANBAN TASK CARDS
    ================================================ */
@@ -356,6 +460,66 @@
     overflow-y: auto; /* Allow vertical scrolling */
     flex: 1; /* Fill available space in column */
     min-height: 0; /* Allow container to shrink and enable scrolling */
+}
+
+.tasknotes-plugin .kanban-view__card-wrapper .task-card--layout-compact {
+    padding: var(--tn-spacing-sm) var(--tn-spacing-md);
+    border-radius: var(--tn-radius-sm);
+}
+
+.tasknotes-plugin .kanban-view__card-wrapper .task-card--layout-compact .task-card__title {
+    font-size: var(--tn-font-size-md);
+    line-height: 1.3;
+}
+
+.tasknotes-plugin .kanban-view__card-wrapper .task-card--layout-compact .task-card__metadata {
+    gap: 2px var(--tn-spacing-sm);
+}
+
+.tasknotes-plugin .kanban-view__add-task-footer {
+    display: flex;
+    justify-content: center;
+    padding: var(--tn-spacing-xs);
+    border-top: 1px solid color-mix(in srgb, var(--tn-border-color) 72%, transparent);
+    flex-shrink: 0;
+}
+
+.tasknotes-plugin .kanban-view__add-task-button {
+    width: 100%;
+    min-height: 28px;
+    color: var(--tn-text-muted);
+    border-radius: var(--tn-radius-sm);
+    opacity: 0.72;
+    transition: opacity var(--tn-transition-fast), color var(--tn-transition-fast), background-color var(--tn-transition-fast);
+}
+
+.tasknotes-plugin .kanban-view__add-task-button:hover,
+.tasknotes-plugin .kanban-view__add-task-button:focus-visible {
+    color: var(--tn-text-normal);
+    background: var(--tn-interactive-hover);
+    opacity: 1;
+}
+
+.tasknotes-plugin .kanban-view__add-task-button svg {
+    width: 16px;
+    height: 16px;
+}
+
+.tasknotes-plugin .kanban-view__empty-cell {
+    flex: 1 1 auto;
+    min-height: 64px;
+    margin: var(--tn-spacing-xs);
+    border: 1px dashed color-mix(in srgb, var(--tn-border-color) 78%, transparent);
+    border-radius: var(--tn-radius-sm);
+    background: color-mix(in srgb, var(--tn-bg-secondary) 70%, transparent);
+    color: var(--tn-text-faint);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--tn-spacing-xs);
+    font-size: var(--tn-font-size-sm);
+    line-height: 1.2;
+    text-align: center;
 }
 
 /* Virtualized columns need bounded height and relative positioning. */
@@ -438,6 +602,64 @@
     }
 }
 
+body.is-mobile .tasknotes-plugin .kanban-view__board {
+    align-items: flex-start;
+    scroll-snap-type: x proximity;
+}
+
+body.is-mobile .tasknotes-plugin .kanban-view__column {
+    min-width: min(78vw, 320px);
+    max-width: min(78vw, 320px);
+    max-height: 100%;
+    scroll-snap-align: start;
+}
+
+body.is-mobile .tasknotes-plugin .kanban-view__column--collapsed {
+    min-width: var(--tn-kanban-collapsed-column-width, 48px);
+    max-width: var(--tn-kanban-collapsed-column-width, 48px);
+}
+
+body.is-mobile .tasknotes-plugin .kanban-view__board--swimlanes {
+    --kanban-swimlane-label-width: 72px;
+    --kanban-column-width: minmax(156px, 64vw);
+}
+
+body.is-mobile .tasknotes-plugin .kanban-view__swimlane-row {
+    grid-template-columns: var(--kanban-swimlane-label-width);
+    grid-auto-columns: var(--kanban-column-width);
+    align-items: start;
+}
+
+body.is-mobile .tasknotes-plugin .kanban-view__swimlane-row > .kanban-view__swimlane-label {
+    width: var(--kanban-swimlane-label-width);
+    min-width: var(--kanban-swimlane-label-width);
+    max-width: var(--kanban-swimlane-label-width);
+}
+
+body.is-mobile .tasknotes-plugin .kanban-view__swimlane-label {
+    position: static;
+    z-index: auto;
+    overflow: hidden;
+}
+
+body.is-mobile .tasknotes-plugin .kanban-view__swimlane-title {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+body.is-mobile .tasknotes-plugin .kanban-view__swimlane-label,
+body.is-mobile .tasknotes-plugin .kanban-view__column-header-cell,
+body.is-mobile .tasknotes-plugin .kanban-view__swimlane-column {
+    padding: var(--tn-spacing-xs);
+}
+
+body.is-mobile .tasknotes-plugin .kanban-view__swimlane-column {
+    min-height: 56px;
+    max-height: none;
+}
+
 /* Touch drag support */
 .tasknotes-plugin .kanban-view__card-wrapper[draggable="true"],
 .tasknotes-plugin .kanban-view__column-header[draggable="true"],
@@ -454,9 +676,81 @@
     border: 2px solid var(--tn-interactive-accent);
 }
 
+.tasknotes-plugin.kanban-view__drag-image,
+.tasknotes-plugin.kanban-view__floating-drag-preview {
+    border: 1px solid var(--tn-interactive-accent);
+    border-radius: var(--tn-radius-md);
+    background: var(--tn-bg-primary);
+    box-shadow: 0 8px 18px color-mix(in srgb, var(--tn-shadow-color) 24%, transparent),
+        0 0 0 2px color-mix(in srgb, var(--tn-interactive-accent) 18%, transparent);
+}
+
+.tasknotes-plugin.kanban-view__drag-image {
+    position: absolute;
+    left: -10000px;
+    top: -10000px;
+    margin: 0;
+    pointer-events: none;
+}
+
+.tasknotes-plugin.kanban-view__floating-drag-preview {
+    position: absolute;
+    inset-inline-start: 0;
+    inset-block-start: 0;
+    display: flex;
+    align-items: center;
+    gap: var(--tn-spacing-sm);
+    box-sizing: border-box;
+    width: var(--tn-kanban-drag-preview-width, auto);
+    min-height: 40px;
+    max-height: 40px;
+    padding: 0 var(--tn-spacing-md);
+    pointer-events: none;
+    transform: var(--tn-kanban-drag-preview-transform, translate3d(-9999px, -9999px, 0));
+    z-index: var(--layer-tooltip, 10000);
+    overflow: hidden;
+    contain: layout paint style;
+    cursor: grabbing;
+    opacity: 0.96;
+    will-change: transform;
+}
+
+.tasknotes-plugin.kanban-view__floating-drag-preview-title {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--tn-text-normal);
+    font-size: var(--font-ui-small);
+    font-weight: var(--font-medium);
+    line-height: 1.3;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.tasknotes-plugin.kanban-view__floating-drag-preview::after {
+    content: attr(data-drag-count);
+    display: none;
+    flex: 0 0 auto;
+    min-width: 20px;
+    padding: 2px 6px;
+    border-radius: var(--tn-radius-full);
+    background: var(--tn-interactive-accent);
+    color: var(--text-on-accent);
+    font-size: var(--font-ui-smaller);
+    font-weight: var(--font-semibold);
+    line-height: 1.4;
+    opacity: 0;
+}
+
+.tasknotes-plugin.kanban-view__floating-drag-preview[data-drag-count]::after {
+    display: block;
+    opacity: 1;
+}
+
 .tasknotes-plugin .kanban-view__card--dragging {
-    opacity: 0.4;
-    transform: scale(0.95);
+    opacity: 0.64;
+    transform: scale(0.98);
+    outline: 1px dashed color-mix(in srgb, var(--tn-interactive-accent) 55%, transparent);
+    outline-offset: -2px;
 }
 
 /* Drop position indicators for within-column reordering */
@@ -474,15 +768,35 @@
     transform: translateY(var(--tn-drag-gap, 60px));
 }
 
+.tasknotes-plugin .kanban-view__card-wrapper--drop-marker::before {
+    content: "";
+    position: absolute;
+    inset-inline: 0;
+    top: calc(-1 * var(--tn-drag-gap, 60px) + var(--tn-spacing-xs));
+    height: max(32px, calc(var(--tn-drag-gap, 60px) - (var(--tn-spacing-xs) * 2)));
+    box-sizing: border-box;
+    border: 2px dashed var(--tn-interactive-accent);
+    border-radius: var(--tn-radius-md);
+    background: color-mix(in srgb, var(--tn-interactive-accent) 12%, transparent);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--tn-interactive-accent) 20%, transparent);
+    pointer-events: none;
+}
+
+.tasknotes-plugin .kanban-view__cards--drop-marker-end::after,
+.tasknotes-plugin .kanban-view__tasks-container.kanban-view__cards--drop-marker-end::after {
+    content: "";
+    display: block;
+    height: max(32px, calc(var(--tn-drag-gap, 60px) - (var(--tn-spacing-xs) * 2)));
+    box-sizing: border-box;
+    border: 2px dashed var(--tn-interactive-accent);
+    border-radius: var(--tn-radius-md);
+    background: color-mix(in srgb, var(--tn-interactive-accent) 12%, transparent);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--tn-interactive-accent) 20%, transparent);
+}
+
 @media (prefers-reduced-motion: reduce) {
     .tasknotes-plugin .kanban-view__card-wrapper--drag-shift {
         transition: none;
-    }
-}
-
-@media (pointer: coarse) {
-    .tasknotes-plugin .kanban-view__card--dragging {
-        pointer-events: none;
     }
 }
 

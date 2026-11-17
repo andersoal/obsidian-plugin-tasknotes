@@ -11,11 +11,19 @@ You can create and edit tasks in a variety of ways. The primary method is throug
 
 ![Task creation modal](../assets/feature-task-modal-filled.png)
 
-When creating a task, the title will be automatically sanitized to remove any characters that are forbidden in filenames.
+TaskNotes keeps a storage title and a filename-safe title separate. When **Store title in filename** is enabled, forbidden filename characters are removed from the filename while the task title is preserved whenever it cannot be represented exactly by that filename. With another filename format, such as timestamp or UUID, the full title is stored in frontmatter.
 
-TaskNotes also supports **Natural Language Creation**, which allows you to create tasks by typing descriptions in plain English. The built-in parser can extract structured data from phrases like "Buy groceries tomorrow at 3pm @home #errands high priority."
+For existing tasks, the **Quick actions for current task** command opens a keyboard-searchable action palette. It includes status, priority, time-tracking, archive, edit, and date actions, including built-in due and scheduled date presets such as today, tomorrow, this weekend, next week, and next month.
+
+TaskNotes also supports **Natural Language Creation**, which allows you to create tasks by typing descriptions in plain English. The built-in parser can extract structured data from phrases like "Buy groceries tomorrow at 3pm @home #errands high priority." The form updates as you type: removing text undoes what it set, and a field you change by hand keeps your value.
 
 In most workflows, users combine both approaches: fast capture with natural language, then occasional structured edits in the modal when more precision is needed.
+
+### Highlighting in Natural Language Input
+
+As you type, the parts of the input that set a value are highlighted in the natural language field: dates (blue), recurrence (purple), time estimates (orange), priority (red), status (green), and tags, contexts, projects and custom fields (accent color). Text that is not highlighted becomes the title. A highlighted phrase can still stay in the title, as in "weekly review" or "Monday's meeting", where the phrase both names the task and sets the value.
+
+To change the colors, target the `tn-nlp-highlight` class, or one kind such as `tn-nlp-highlight--due`, in a CSS snippet.
 
 ### Auto-Suggestions in Natural Language Input
 
@@ -25,6 +33,8 @@ The natural language input field includes auto-suggestion functionality that act
 - **#** - Shows available tags from existing tasks
 - **+** - Shows files from your vault as project suggestions
 - **\*** - Shows available status options (configurable trigger in Settings → Features)
+
+In task creation and edit fields, focusing the tags or contexts input also opens the available suggestions immediately, so you can pick from the current vocabulary without typing a first character.
 
 #### Project Suggestions
 
@@ -88,6 +98,8 @@ When typing the status trigger character (default `*`) in the natural language i
 
 Status suggestions allow quick selection of statuses when creating tasks. For example, typing `*in` shows "In Progress" as a suggestion if that's one of your configured statuses.
 
+Clicking a task card's status indicator cycles through statuses in the order configured under **Settings → Task Properties → Status**. A status can optionally define a specific **Next status** for forward cycling; otherwise TaskNotes uses the configured order. Statuses marked **Skip when cycling** are left out of the ordered click cycle, but remain available through menus, suggestions, direct edits, and explicit next-status jumps. When **Reset status after each occurrence** is on and the first status marked **Completed** has a **Next status**, recurring tasks follow the same cycle and complete the occurrence when it reaches a completed status. Otherwise, a click completes the occurrence directly. See [Recurring Tasks](recurring-tasks.md#completion-tracking).
+
 Additionally, you can convert any line type in your notes to TaskNotes using the **Instant Conversion** feature. This works with checkboxes, bullet points, numbered lists, blockquotes, headers, and plain text lines.
 
 ## Task Properties
@@ -97,6 +109,12 @@ Tasks store their data in YAML frontmatter with properties for status, priority,
 This frontmatter-first design keeps task data editable and portable while supporting consistent behavior across views and widgets.
 
 For property types and examples, see [Core Concepts](../core-concepts.md#yaml-frontmatter). For configuration options, see [Task Properties Settings](../settings/task-properties.md).
+
+### Task Dates
+
+Scheduled and due dates can be date-only or include a time. The **+1 day**, **-1 day**, **+1 week**, and **-1 week** actions in card date menus and task context menus shift the existing date while keeping its local time, including across daylight-saving changes. Date-only values stay date-only; for example, `2026-05-16T21:37` becomes `2026-05-17T21:37` with **+1 day**.
+
+Absolute presets such as **Today** and **Tomorrow** set a date without a time. Use **Pick date & time…** to choose a specific date and time.
 
 ## Projects
 
@@ -139,7 +157,9 @@ blockedBy:
 - `reltype` is stored with each dependency and defaults to `FINISHTOSTART` for dependencies created in the UI.
 - `gap` is optional and uses ISO&nbsp;8601 duration syntax (for example `PT4H` or `P2D`).
 
-Whenever a dependency is added, TaskNotes updates the upstream note’s `blocking` list so the reverse relationship stays synchronized. Removing a dependency automatically clears both sides.
+TaskNotes stores each dependency in the dependent task’s `blockedBy` field and derives the reverse “Blocking” relationship from it. For example, if Task B is blocked by Task A, B stores a reference to A; A does not need a separate `blocking` frontmatter property. Editing “Blocking” updates the selected dependent tasks’ `blockedBy` fields. Removing a dependency also removes the derived reverse relationship.
+
+Dependencies are separate from project/subtask membership: adding a blocker does not require adding either task to the other’s `projects` field. To view tasks blocked by the current note, use the Relationships widget’s **Blocking** view, which finds them through Bases without a stored `blocking` property.
 
 ### Selecting dependencies in the UI
 
@@ -150,6 +170,36 @@ Whenever a dependency is added, TaskNotes updates the upstream note’s `blockin
 These controls currently create and manage finish-to-start style blockers. Advanced `reltype` values and `gap` data are preserved in frontmatter, but blocking evaluation is currently based on whether unresolved dependencies exist rather than relationship-type-specific scheduling rules.
 
 ![Task context menu](../assets/feature-task-context-menu.png)
+
+## Attachments
+
+Attachments are files that belong to a task, such as a receipt, a scan or a PDF. They are stored as an ordered list of links in the task's `attachments` frontmatter property:
+
+```yaml
+attachments:
+  - "[[Files/receipt.png]]"
+  - "[[Files/invoice.pdf]]"
+```
+
+Each entry links to a file in the vault by its full path. The property name follows the `attachments` field mapping, and the field can be used in Bases filters, formulas and columns like other list properties.
+
+### Managing attachments in the task modals
+
+The **Attachments** field in the task creation and edit modals shows the task's attachments in order. From there you can:
+
+- **Add from vault** to pick an existing file with fuzzy search. The picker only selects files; it does not create new ones.
+- **Import file** to choose a file from your device, or drag files onto the field. Imported files are copied into the vault only when you save the task, into the folder set by Obsidian's **Default location for new attachments** setting (relative to the task note). If you cancel or discard the modal, nothing is written.
+- Select a file name to open it in a new tab.
+- Use the arrow buttons to change the order.
+- Use the remove button to unlink a file from the task. Removing an attachment never deletes the file from the vault; delete it from Obsidian's file explorer if you no longer need it.
+
+Files need a file extension, and their names can't contain `[`, `]`, `#` or `|`, because those characters would break the link. Rename such a file before attaching it. If saving fails, files that save had already copied in are moved to the trash, and they stay in the list waiting to be imported again.
+
+All controls are buttons with labels, so they can be reached with the keyboard and used on touch devices. You can hide the field, or show it only in one of the modals, in [Modal Fields Settings](../settings/modal-fields.md).
+
+### Attachment indicators
+
+Task cards show a paperclip with the number of attachments next to their other badges. Calendar views show a paperclip after the title of task events, and the event tooltip includes the attachment count.
 
 ## Automation
 
@@ -172,9 +222,47 @@ These settings let you align task files with existing vault conventions (for exa
 For configuration details, see [Task Defaults](../settings/task-defaults.md).  
 For template variables, see [Template Variables Reference](template-variables.md).
 
+## Completing Tasks
+
+You can record a task's completion — and choose the date it is recorded against — directly from the task context menu, without opening the task. Four actions are offered:
+
+- **Completed today** — records today's date.
+- **Completed on schedule** — records the task's scheduled date (for a recurring task, the scheduled date of the occurrence you clicked).
+- **Completed on due date** — records the due date.
+- **Completed on (pick date)** — opens a date picker and records the date you choose.
+
+An action is disabled when the date it needs is not set — for example *Completed on schedule* on a task with no scheduled date — rather than silently falling back to another date. Recurring tasks also get a **Skip instance** action alongside these.
+
+By default the actions are grouped under a single **Mark complete or skip** entry (**Mark complete** for non-recurring tasks). To show them directly in the menu instead — set off by dividers — turn off **Settings → Appearance & UI → Task cards → Group complete and skip actions in a submenu**.
+
+![Completion actions grouped under a submenu (default)](../assets/feature-completion-date-actions.png)
+
+With the submenu grouping turned off, the same actions appear directly in the menu:
+
+![Completion actions shown flat in the menu](../assets/feature-completion-date-actions-flat.png)
+
+## Repeating a Completed Task
+
+For tasks that come back irregularly, **TaskNotes: Repeat current task** reuses the same note instead of creating a new one. Open the completed task's note and run the command from the command palette.
+
+A confirmation appears **before any changes**. Cancel or dismiss it to leave the note unchanged. Confirming:
+
+1. Unarchives the task, moving it back to the task folder if **Move archived tasks to folder** is enabled.
+2. Saves its completion date in `complete_instances`, returns it to the default status and clears `completedDate`.
+3. Resets body checkboxes if **Reset checkboxes on recurrence** is enabled.
+4. Opens the task editor to choose new scheduled and due dates.
+
+The previous scheduled and due dates stay unchanged until you save the editor. **Cancelling that editor does not undo the confirmed repeat.**
+
+The history stores **distinct completion dates**, not every completion: repeating a task completed twice on the same date adds that date only once. A completed task without `completedDate` is reopened without adding a history entry. This history is available in frontmatter and Bases; the editor's completions calendar remains specific to recurring tasks.
+
+Recurring tasks and materialized occurrence notes cannot be repeated with this command; they already have an occurrence workflow.
+
+If a step fails, earlier changes are kept, not rolled back, and later steps are not attempted. Check the note before retrying: for example, reopening can fail after unarchiving, or a checkbox reset can fail after the task has reopened and saved its history. Archive moves follow the existing best-effort behavior: if the move fails, a notice appears and the task is still unarchived and repeated at its existing path.
+
 ## Recurring Tasks
 
-TaskNotes recurring tasks use RFC 5545 RRule syntax with `DTSTART`, separate pattern definition from next occurrence scheduling, and support independent instance completion.
+TaskNotes recurring tasks use RFC 5545 RRule syntax with `DTSTART`, separate pattern definition from next occurrence scheduling, and support independent instance completion. When an individual recurrence needs its own checklist, time entries, or notes, you can create a materialized occurrence note from the task or calendar context menu.
 
 For full behavior, examples, and edge cases, see [Recurring Tasks](recurring-tasks.md).
 

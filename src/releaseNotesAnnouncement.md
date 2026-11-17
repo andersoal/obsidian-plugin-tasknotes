@@ -1,0 +1,1 @@
+**TaskNotes v5 beta.** Use your Markdown tasks in Obsidian and the new TaskNotes app. [Plugin beta](https://github.com/callumalpass/tasknotes/releases/tag/5.0.0-beta.6) · [Web app](https://app.tasknotes.dev/) · [iOS](https://apps.apple.com/app/tasknotes/id6797168033). Back up your vault before trying the beta.

@@ -1,8 +1,11 @@
+import { uiText } from "../../i18n/runtime";
+import { msg } from "@lingui/core/macro";
 import type { CliData } from "obsidian";
 import type { CliCommandDefinition } from "../types";
 import { formatCliJson } from "../helpers/formatters";
 import { resolveTaskForCli } from "../helpers/taskResolution";
 import type { PomodoroState, TaskInfo } from "../../types";
+import type TaskNotesPlugin from "../../main";
 
 type PomodoroAction =
 	| "status"
@@ -49,7 +52,7 @@ function hasTaskLookup(params: CliData): boolean {
 }
 
 async function resolvePomodoroTask(
-	plugin: any,
+	plugin: TaskNotesPlugin,
 	params: CliData,
 	required: boolean
 ): Promise<TaskInfo | undefined> {
@@ -67,7 +70,7 @@ async function resolvePomodoroTask(
 	});
 }
 
-async function formatPomodoroState(plugin: any, state: PomodoroState): Promise<Record<string, unknown>> {
+async function formatPomodoroState(plugin: TaskNotesPlugin, state: PomodoroState): Promise<Record<string, unknown>> {
 	const currentSession = state.currentSession;
 	const task =
 		currentSession?.taskPath
@@ -105,27 +108,27 @@ async function formatPomodoroState(plugin: any, state: PomodoroState): Promise<R
 
 export const pomodoroCliCommand: CliCommandDefinition = {
 	command: "pomodoro",
-	description: "Control TaskNotes Pomodoro sessions or inspect the current Pomodoro state",
+	get description() { return uiText(msg({ message: "Control TaskNotes Pomodoro sessions or inspect the current Pomodoro state", context: "cli/commands/pomodoroCommand: defaults description" })); },
 	flags: {
 		action: {
 			value: "<status|start|pause|resume|stop|short-break|long-break>",
-			description: "Pomodoro action to perform (default: status)",
+			get description() { return uiText(msg({ message: "Pomodoro action to perform (default: status)", context: "cli/commands/pomodoroCommand: defaults description" })); },
 		},
 		path: {
 			value: "<path>",
-			description: "Exact task file path for action=start",
+			get description() { return uiText(msg({ message: "Exact task file path for action=start", context: "cli/commands/pomodoroCommand: defaults description" })); },
 		},
 		title: {
 			value: "<title>",
-			description: "Exact task title for action=start",
+			get description() { return uiText(msg({ message: "Exact task title for action=start", context: "cli/commands/pomodoroCommand: defaults description" })); },
 		},
 		query: {
 			value: "<text>",
-			description: "Substring match against task title or path for action=start",
+			get description() { return uiText(msg({ message: "Substring match against task title or path for action=start", context: "cli/commands/pomodoroCommand: defaults description" })); },
 		},
 		duration: {
 			value: "<minutes>",
-			description: "Optional work-session duration override for action=start",
+			get description() { return uiText(msg({ message: "Optional work-session duration override for action=start", context: "cli/commands/pomodoroCommand: defaults description" })); },
 		},
 	},
 	async handler(plugin, params: CliData): Promise<string> {

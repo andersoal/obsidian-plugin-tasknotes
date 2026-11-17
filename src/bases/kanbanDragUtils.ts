@@ -1,0 +1,572 @@
+import type { TaskInfo } from "../types";
+import { clearStaticStyleClasses } from "../utils/staticStyleClasses";
+import {
+	applyGroupPropertyMutation,
+	moveGroupListValue,
+	normalizeGroupValue,
+} from "./groupPropertyMutation";
+
+export type KanbanTaskDragSource = {
+	taskPath: string;
+	sourceElement: HTMLElement;
+};
+
+export type KanbanDropTarget = {
+	taskPath: string;
+	above: boolean;
+};
+
+export type KanbanDropTargetResolutionInput = {
+	dropTarget: KanbanDropTarget | undefined;
+	isCrossScope: boolean;
+	targetInDropScope: boolean;
+	fallbackDropTarget?: KanbanDropTarget;
+};
+
+export type KanbanDropTargetFromContainerInput = {
+	cardsContainer: HTMLElement;
+	draggedTaskPaths: readonly string[];
+	currentInsertionIndex: number;
+	clientY?: number;
+};
+
+export type KanbanOptimisticReorderInput = {
+	draggedPaths: readonly string[];
+	dropTarget: KanbanDropTarget | undefined;
+	targetContainer?: HTMLElement | null;
+	currentTaskElements: ReadonlyMap<string, HTMLElement>;
+	removeEmptyCellHint?: (container: HTMLElement) => void;
+	log?: (message: string, data?: Record<string, unknown>) => void;
+};
+
+export type KanbanTaskDropUpdatePlan = {
+	path: string;
+	sourceColumn: string | null | undefined;
+	sourceSwimlane: string | null | undefined;
+	needsGroupUpdate: boolean;
+	needsSwimlaneUpdate: boolean;
+	groupByFrontmatterKey: string;
+	swimlaneFrontmatterKey?: string;
+	groupByTaskProp: string | null;
+	swimlaneTaskProp: string | null;
+	changedTaskProp: string | null;
+	oldPropValue: string | null | undefined;
+	newPropValue: string | null;
+	newGroupValue: string;
+	newSwimLaneValue: string | null;
+	isGroupByListProperty: boolean;
+	isSwimlaneListProperty: boolean;
+};
+
+export type KanbanTaskDropUpdateInput = {
+	path: string;
+	sourceColumn: string | null | undefined;
+	sourceSwimlane: string | null | undefined;
+	newGroupValue: string;
+	newSwimLaneValue: string | null;
+	groupByPropertyId: string;
+	swimLanePropertyId: string | null | undefined;
+	groupByTaskProp: string | null;
+	swimlaneTaskProp: string | null;
+	isGroupByListProperty: boolean;
+	isSwimlaneListProperty: boolean;
+};
+
+export type KanbanFrontmatterDropUpdateOptions = {
+	coerceGroupValue: (frontmatterKey: string, groupKey: string) => string | number | boolean;
+};
+
+export type KanbanStatusDerivativePlan = {
+	statusValue: string;
+	isRecurring: boolean;
+	dateModifiedField: string;
+	dateModifiedValue: string;
+};
+
+export type KanbanStatusDerivativePlanInput = {
+	plan: KanbanTaskDropUpdatePlan;
+	task: Pick<TaskInfo, "recurrence"> | null | undefined;
+	dateModifiedField: string;
+	dateModifiedValue: string;
+};
+
+export type KanbanDropSideEffectPlan = {
+	changedTaskProp: keyof TaskInfo;
+	oldPropValue: unknown;
+	newPropValue: unknown;
+	updatedTask: TaskInfo;
+};
+
+export type KanbanDropSideEffectPlanInput = {
+	plan: KanbanTaskDropUpdatePlan;
+	originalTask: TaskInfo | null | undefined;
+	dateModifiedValue: string;
+	isCompletedStatus: (status: string) => boolean;
+};
+
+type FrontmatterRecord = Record<string, unknown>;
+
+function getEventTargetElement(target: EventTarget | null): HTMLElement | null {
+	const node = target as Node | null;
+	if (!node || typeof node.nodeType !== "number") {
+		return null;
+	}
+
+	return node.nodeType === Node.ELEMENT_NODE ? (node as HTMLElement) : node.parentElement;
+}
+
+export function resolveNestedTaskCardDragSource(
+	target: EventTarget | null,
+	cardWrapper: HTMLElement
+): KanbanTaskDragSource | null {
+	const targetEl = getEventTargetElement(target);
+	if (!targetEl || !cardWrapper.contains(targetEl)) {
+		return null;
+	}
+
+	const nestedTaskCard = targetEl.closest<HTMLElement>(
+		".task-card__subtasks .task-card[data-task-path]"
+	);
+	if (!nestedTaskCard || !cardWrapper.contains(nestedTaskCard)) {
+		return null;
+	}
+
+	const taskPath = nestedTaskCard.dataset.taskPath;
+	if (!taskPath) {
+		return null;
+	}
+
+	return {
+		taskPath,
+		sourceElement: nestedTaskCard,
+	};
+}
+
+export function createKanbanDropTarget(
+	taskPath: string | null | undefined,
+	above: boolean
+): KanbanDropTarget | undefined {
+	return taskPath ? { taskPath, above } : undefined;
+}
+
+export function getKanbanDraggedPaths(
+	draggedTaskPaths: readonly string[],
+	draggedTaskPath: string
+): string[] {
+	return draggedTaskPaths.length > 0 ? [...draggedTaskPaths] : [draggedTaskPath];
+}
+
+export function resolveKanbanContainerDropTarget({
+	dropTarget,
+	isCrossScope,
+	targetInDropScope,
+	fallbackDropTarget,
+}: KanbanDropTargetResolutionInput): KanbanDropTarget | undefined {
+	if (dropTarget && isCrossScope && !targetInDropScope) {
+		return undefined;
+	}
+
+	if (!dropTarget && !isCrossScope) {
+		return fallbackDropTarget;
+	}
+
+	return dropTarget;
+}
+
+export function getKanbanCardDropTargetFromClientY(
+	cardWrapper: HTMLElement,
+	taskPath: string,
+	clientY: number
+): KanbanDropTarget {
+	const rect = cardWrapper.getBoundingClientRect();
+	return {
+		taskPath,
+		above: clientY < rect.top + rect.height / 2,
+	};
+}
+
+export function reconstructKanbanDropTargetFromContainer({
+	cardsContainer,
+	draggedTaskPaths,
+	currentInsertionIndex,
+	clientY,
+}: KanbanDropTargetFromContainerInput): KanbanDropTarget | undefined {
+	const visibleCards = Array.from(
+		cardsContainer.querySelectorAll<HTMLElement>(".kanban-view__card-wrapper")
+	).filter((el) => {
+		const taskPath = el.dataset.taskPath;
+		return !!taskPath && !draggedTaskPaths.includes(taskPath);
+	});
+
+	if (visibleCards.length === 0) return undefined;
+
+	if (clientY !== undefined && Number.isFinite(clientY)) {
+		const targetIndex = visibleCards.findIndex((card) => {
+			const rect = card.getBoundingClientRect();
+			return clientY < rect.top + rect.height / 2;
+		});
+
+		if (targetIndex === -1) {
+			const lastCard = visibleCards[visibleCards.length - 1];
+			return {
+				taskPath: lastCard.dataset.taskPath as string,
+				above: false,
+			};
+		}
+
+		return { taskPath: visibleCards[targetIndex].dataset.taskPath as string, above: true };
+	}
+
+	const idx =
+		currentInsertionIndex >= 0
+			? Math.min(currentInsertionIndex, visibleCards.length)
+			: visibleCards.length;
+
+	if (idx === 0) {
+		return { taskPath: visibleCards[0].dataset.taskPath as string, above: true };
+	}
+
+	return { taskPath: visibleCards[idx - 1].dataset.taskPath as string, above: false };
+}
+
+export function updateKanbanDropMarker(
+	cardsContainer: HTMLElement,
+	visibleCards: readonly HTMLElement[],
+	insertionIndex: number
+): void {
+	cardsContainer.classList.remove("kanban-view__cards--drop-marker-end");
+	for (const card of visibleCards) {
+		card.classList.remove("kanban-view__card-wrapper--drop-marker");
+	}
+
+	const markerCard = visibleCards[insertionIndex];
+	if (markerCard) {
+		markerCard.classList.add("kanban-view__card-wrapper--drop-marker");
+		return;
+	}
+
+	if (visibleCards.length > 0 && insertionIndex >= visibleCards.length) {
+		cardsContainer.classList.add("kanban-view__cards--drop-marker-end");
+	}
+}
+
+export function clearKanbanDropMarkers(root: ParentNode): void {
+	if ((root as Node).nodeType === Node.ELEMENT_NODE) {
+		(root as HTMLElement).classList.remove(
+			"kanban-view__card-wrapper--drop-marker",
+			"kanban-view__cards--drop-marker-end"
+		);
+	}
+
+	root
+		.querySelectorAll<HTMLElement>(".kanban-view__card-wrapper--drop-marker")
+		.forEach((card) => {
+			card.classList.remove("kanban-view__card-wrapper--drop-marker");
+		});
+	root
+		.querySelectorAll<HTMLElement>(".kanban-view__cards--drop-marker-end")
+		.forEach((container) => {
+			container.classList.remove("kanban-view__cards--drop-marker-end");
+		});
+}
+
+export function performKanbanOptimisticReorder({
+	draggedPaths,
+	dropTarget,
+	targetContainer,
+	currentTaskElements,
+	removeEmptyCellHint,
+	log,
+}: KanbanOptimisticReorderInput): boolean {
+	if (draggedPaths.length === 0) {
+		log?.("OPTIMISTIC-REORDER: bail — no dragged paths");
+		return false;
+	}
+
+	const resolveDraggedElements = (): HTMLElement[] | null => {
+		const draggedElements: HTMLElement[] = [];
+		for (const path of draggedPaths) {
+			const draggedEl = currentTaskElements.get(path);
+			if (!draggedEl) {
+				log?.("OPTIMISTIC-REORDER: bail — element not in currentTaskElements", {
+					path: path.split("/").pop(),
+				});
+				return null;
+			}
+			draggedElements.push(draggedEl);
+		}
+		return draggedElements;
+	};
+
+	if (!dropTarget) {
+		if (!targetContainer) {
+			log?.("OPTIMISTIC-REORDER: bail — no dropTarget AND no targetContainer");
+			return false;
+		}
+
+		const draggedElements = resolveDraggedElements();
+		if (!draggedElements) return false;
+
+		removeEmptyCellHint?.(targetContainer);
+		log?.("OPTIMISTIC-REORDER: cross-column append path", {
+			paths: draggedPaths.map((p) => p.split("/").pop()),
+			containerChildCount: targetContainer.childElementCount,
+			containerClass: targetContainer.className,
+		});
+
+		for (const draggedEl of draggedElements) {
+			const oldParent = draggedEl.parentElement;
+			log?.("OPTIMISTIC-REORDER: moving element", {
+				path: draggedEl.dataset.taskPath?.split("/").pop(),
+				oldParentClass: oldParent?.className,
+				oldParentChildCount: oldParent?.childElementCount,
+				sameContainer: oldParent === targetContainer,
+				elCurrentStyles: draggedEl.style.cssText.slice(0, 120),
+			});
+			clearStaticStyleClasses(draggedEl);
+			draggedEl.classList.remove("kanban-view__card--dragging");
+			targetContainer.appendChild(draggedEl);
+		}
+
+		log?.("OPTIMISTIC-REORDER: cross-column append SUCCESS", {
+			containerChildCount: targetContainer.childElementCount,
+		});
+		return true;
+	}
+
+	log?.("OPTIMISTIC-REORDER: drop-on-card path", {
+		paths: draggedPaths.map((p) => p.split("/").pop()),
+		targetCard: dropTarget.taskPath.split("/").pop(),
+		above: dropTarget.above,
+		hasContainer: !!targetContainer,
+	});
+
+	const targetEl = currentTaskElements.get(dropTarget.taskPath);
+	if (!targetEl) {
+		log?.("OPTIMISTIC-REORDER: bail — target element not in currentTaskElements", {
+			target: dropTarget.taskPath.split("/").pop(),
+		});
+		return false;
+	}
+
+	const container = targetContainer || targetEl.parentElement;
+	if (!container) {
+		log?.("OPTIMISTIC-REORDER: bail — no container resolved");
+		return false;
+	}
+
+	if (!container.contains(targetEl)) {
+		log?.("OPTIMISTIC-REORDER: bail — targetEl not in container", {
+			containerClass: container.className,
+			targetElParentClass: targetEl.parentElement?.className,
+		});
+		return false;
+	}
+
+	const draggedElements = resolveDraggedElements();
+	if (!draggedElements) return false;
+
+	removeEmptyCellHint?.(container);
+
+	for (const draggedEl of draggedElements) {
+		clearStaticStyleClasses(draggedEl);
+		draggedEl.classList.remove("kanban-view__card--dragging");
+
+		if (dropTarget.above) {
+			container.insertBefore(draggedEl, targetEl);
+		} else {
+			container.insertBefore(draggedEl, targetEl.nextSibling);
+		}
+	}
+
+	log?.("OPTIMISTIC-REORDER: drop-on-card SUCCESS");
+	return true;
+}
+
+export function getKanbanFrontmatterKey(propertyId: string): string {
+	return propertyId.replace(/^(note\.|file\.|task\.)/, "");
+}
+
+export function planKanbanTaskDropUpdate({
+	path,
+	sourceColumn,
+	sourceSwimlane,
+	newGroupValue,
+	newSwimLaneValue,
+	groupByPropertyId,
+	swimLanePropertyId,
+	groupByTaskProp,
+	swimlaneTaskProp,
+	isGroupByListProperty,
+	isSwimlaneListProperty,
+}: KanbanTaskDropUpdateInput): KanbanTaskDropUpdatePlan {
+	const needsGroupUpdate = sourceColumn !== newGroupValue;
+	const needsSwimlaneUpdate =
+		newSwimLaneValue !== null && !!swimLanePropertyId && sourceSwimlane !== newSwimLaneValue;
+	// The primary change drives property-specific side effects. Prefer the column
+	// axis, but fall back to the swimlane when the column property is not a task field.
+	const useGroupAxis = needsGroupUpdate && !!groupByTaskProp;
+	const changedTaskProp = useGroupAxis
+		? groupByTaskProp
+		: needsSwimlaneUpdate
+			? swimlaneTaskProp
+			: null;
+	const oldPropValue = useGroupAxis ? sourceColumn : sourceSwimlane;
+	const newPropValue = useGroupAxis ? newGroupValue : newSwimLaneValue;
+
+	return {
+		path,
+		sourceColumn,
+		sourceSwimlane,
+		needsGroupUpdate,
+		needsSwimlaneUpdate,
+		groupByFrontmatterKey: getKanbanFrontmatterKey(groupByPropertyId),
+		swimlaneFrontmatterKey: swimLanePropertyId
+			? getKanbanFrontmatterKey(swimLanePropertyId)
+			: undefined,
+		groupByTaskProp,
+		swimlaneTaskProp,
+		changedTaskProp,
+		oldPropValue,
+		newPropValue,
+		newGroupValue,
+		newSwimLaneValue,
+		isGroupByListProperty,
+		isSwimlaneListProperty,
+	};
+}
+
+export function kanbanDropPlanNeedsWrite(
+	plan: KanbanTaskDropUpdatePlan,
+	hasSortOrderPlan: boolean
+): boolean {
+	return plan.needsGroupUpdate || plan.needsSwimlaneUpdate || hasSortOrderPlan;
+}
+
+const updateListDropValue = moveGroupListValue;
+
+export function applyKanbanTaskDropFrontmatterPlan(
+	frontmatter: FrontmatterRecord,
+	plan: KanbanTaskDropUpdatePlan,
+	options: KanbanFrontmatterDropUpdateOptions
+): void {
+	if (plan.needsGroupUpdate) {
+		applyGroupPropertyMutation({
+			frontmatter,
+			property: plan.groupByFrontmatterKey,
+			sourceValue: plan.sourceColumn,
+			targetValue: plan.newGroupValue,
+			isList: plan.isGroupByListProperty,
+			preserveEmptyList: true,
+			coerceValue: options.coerceGroupValue,
+		});
+	}
+
+	if (plan.needsSwimlaneUpdate && plan.swimlaneFrontmatterKey && plan.newSwimLaneValue !== null) {
+		applyGroupPropertyMutation({
+			frontmatter,
+			property: plan.swimlaneFrontmatterKey,
+			sourceValue: plan.sourceSwimlane,
+			targetValue: plan.newSwimLaneValue,
+			isList: plan.isSwimlaneListProperty,
+			preserveEmptyList: true,
+			coerceValue: options.coerceGroupValue,
+		});
+	}
+}
+
+export function getKanbanDropStatusValue(plan: KanbanTaskDropUpdatePlan): string | null {
+	const statusValue =
+		plan.needsGroupUpdate && plan.groupByTaskProp === "status"
+			? plan.newGroupValue
+			: plan.needsSwimlaneUpdate &&
+				  plan.swimlaneTaskProp === "status" &&
+				  plan.newSwimLaneValue !== null
+				? plan.newSwimLaneValue
+				: null;
+
+	// The NONE_GROUP_KEY column clears status; never evaluate the label as a status value.
+	return statusValue === null ? null : (normalizeGroupValue(statusValue) ?? "");
+}
+
+export function planKanbanStatusDerivativeUpdate({
+	plan,
+	task,
+	dateModifiedField,
+	dateModifiedValue,
+}: KanbanStatusDerivativePlanInput): KanbanStatusDerivativePlan | null {
+	const statusValue = getKanbanDropStatusValue(plan);
+
+	if (statusValue === null) {
+		return null;
+	}
+
+	return {
+		statusValue,
+		isRecurring: !!task?.recurrence,
+		dateModifiedField,
+		dateModifiedValue,
+	};
+}
+
+export function planKanbanDropSideEffect({
+	plan,
+	originalTask,
+	dateModifiedValue,
+	isCompletedStatus,
+}: KanbanDropSideEffectPlanInput): KanbanDropSideEffectPlan | null {
+	if (!plan.changedTaskProp || !originalTask) {
+		return null;
+	}
+
+	// Apply every changed axis so a diagonal drop (column + swimlane) produces a
+	// complete task snapshot for the cache, events, and local card refresh.
+	const updatedTask: TaskInfo = { ...originalTask, dateModified: dateModifiedValue };
+	const changedValues = new Map<keyof TaskInfo, unknown>();
+	if (plan.needsGroupUpdate && plan.groupByTaskProp) {
+		const prop = plan.groupByTaskProp as keyof TaskInfo;
+		changedValues.set(
+			prop,
+			plan.isGroupByListProperty
+				? updateListDropValue(originalTask[prop], plan.sourceColumn, plan.newGroupValue)
+				: toKanbanDropTaskValue(plan.newGroupValue)
+		);
+	}
+	if (plan.needsSwimlaneUpdate && plan.swimlaneTaskProp && plan.newSwimLaneValue !== null) {
+		const prop = plan.swimlaneTaskProp as keyof TaskInfo;
+		changedValues.set(
+			prop,
+			plan.isSwimlaneListProperty
+				? updateListDropValue(
+						changedValues.has(prop) ? changedValues.get(prop) : originalTask[prop],
+						plan.sourceSwimlane,
+						plan.newSwimLaneValue
+					)
+				: toKanbanDropTaskValue(plan.newSwimLaneValue)
+		);
+	}
+	for (const [prop, value] of changedValues) {
+		(updatedTask as unknown as Record<string, unknown>)[prop] = value;
+	}
+
+	const statusValue = changedValues.get("status");
+	if (changedValues.has("status") && !originalTask.recurrence) {
+		updatedTask.completedDate =
+			typeof statusValue === "string" && isCompletedStatus(statusValue)
+				? new Date().toISOString().split("T")[0]
+				: undefined;
+	}
+
+	const changedTaskProp = plan.changedTaskProp as keyof TaskInfo;
+	return {
+		changedTaskProp,
+		oldPropValue: plan.oldPropValue,
+		newPropValue: changedValues.get(changedTaskProp) ?? plan.newPropValue,
+		updatedTask,
+	};
+}
+
+// Match the frontmatter write: dropping into NONE_GROUP_KEY deletes the property.
+function toKanbanDropTaskValue(value: unknown): unknown {
+	return typeof value === "string" ? (normalizeGroupValue(value) ?? undefined) : value;
+}

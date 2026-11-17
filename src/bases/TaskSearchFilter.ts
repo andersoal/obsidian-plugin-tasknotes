@@ -1,9 +1,10 @@
 import { TaskInfo } from '../types';
+import { stringifyUnknown } from '../utils/stringUtils';
 
 /**
  * TaskSearchFilter - Filters tasks based on search term across visible columns
  * 
- * Implements ephemeral filtering (non-destructive) with case-insensitive full-text search.
+ * Implements ephemeral filtering (non-destructive) with case-insensitive word search.
  * Follows Single Responsibility Principle - only handles search/filter logic.
  */
 export class TaskSearchFilter {
@@ -25,15 +26,16 @@ export class TaskSearchFilter {
 	 */
 	filterTasks(tasks: TaskInfo[], searchTerm: string): TaskInfo[] {
 		const normalizedTerm = this.normalizeSearchTerm(searchTerm);
+		const searchWords = normalizedTerm.split(/\s+/).filter(Boolean);
 		
 		// Empty search term returns all tasks
-		if (!normalizedTerm) {
+		if (searchWords.length === 0) {
 			return tasks;
 		}
 
 		return tasks.filter(task => {
 			const searchableText = this.extractSearchableText(task);
-			return searchableText.includes(normalizedTerm);
+			return searchWords.some(word => searchableText.includes(word));
 		});
 	}
 
@@ -74,7 +76,7 @@ export class TaskSearchFilter {
 					if (Array.isArray(value)) {
 						parts.push(value.join(' '));
 					} else {
-						parts.push(String(value));
+						parts.push(stringifyUnknown(value));
 					}
 				}
 			}
@@ -94,4 +96,3 @@ export class TaskSearchFilter {
 		return term.trim().toLowerCase();
 	}
 }
-

@@ -9,7 +9,7 @@ This page documents folder management, filename templates, archive settings, and
 
 You can specify a **Default Tasks Folder** where new tasks will be created. You can also configure the **Task Tag** that identifies notes as TaskNotes, and you can specify a list of **Excluded Folders** that will be ignored by the plugin.
 
-Filename generation settings are configured in the **Task Properties** tab within the Title property card. You can choose from title-based, timestamp-based, Zettelkasten-style patterns, or create a custom filename template.
+Filename generation settings are configured in the **Task Properties** tab within the Title property card. You can choose from title-based, timestamp-based, Zettelkasten-style patterns, or create a custom filename template. These filename settings also apply to inline task conversion and instant-created task notes.
 These settings define folder paths and filename behavior for new tasks, which affects long-term vault structure.
 
 ### Folder Template Variables
@@ -24,6 +24,10 @@ The **Default Tasks Folder** setting supports dynamic folder creation using temp
 - `{{contexts}}` - All contexts from the task's contexts array, joined by `/`
 - `{{project}}` - First project from the task's projects array  
 - `{{projects}}` - All projects from the task's projects array, joined by `/`
+- `{{projectFilePath}}` - Full path of the first project, without `.md`
+- `{{projectFilePaths}}` - Full paths of all projects, without `.md`, joined by `/`
+- `{{projectFolder}}` - Folder containing the first project note (the project file path without the note's own name); empty when the project note is at the top level. Use this to store tasks beside their project note, e.g. `{{projectFolder}}` stores a task for `[[Areas/EFC/EFC]]` in `Areas/EFC/`
+- `{{projectFolders}}` - Folders of all projects, joined by `/`
 - `{{priority}}` - Task priority (e.g., "high", "medium", "low")
 - `{{status}}` - Task status (e.g., "todo", "in-progress", "done")
 - `{{title}}` - Task title (sanitized for folder names)
@@ -85,6 +89,7 @@ Time variables are commonly used for filename/path uniqueness in high-volume cap
 - `{{utcOffsetShort}}` - Short UTC offset (e.g., "+1000")
 - `{{utcZ}}` - UTC Z indicator (always "Z")
 - `{{zettel}}` - Zettelkasten ID (e.g., "250815abc")
+- `{{uuid}}` - UUID v4 (e.g., "550e8400-e29b-41d4-a716-446655440000")
 - `{{nano}}` - Nano ID with timestamp and random string
 Advanced variables increase uniqueness and entropy, but may reduce path readability.
 
@@ -92,10 +97,11 @@ Advanced variables increase uniqueness and entropy, but may reduce path readabil
 
 - **Variable Processing**: Variables are processed when the task is created, using the actual task properties
 - **Missing Values**: If a task doesn't have a value for a variable (e.g., no context assigned), the variable is replaced with an empty string
-- **Multiple Values**: For arrays like contexts and projects, only the first value is used
+- **Multiple Values**: Singular variables like `{{context}}` and `{{project}}` use the first value. Plural variables like `{{contexts}}` and `{{projects}}` join all values with `/`
 - **Title Sanitization**: The `{{title}}` variable automatically removes invalid folder characters (`<>:"/\|?*`) and replaces them with underscores
 - **Folder Creation**: Folders are automatically created if they don't exist
-- **Inline Tasks**: Template variables also work for the inline task conversion folder setting
+- **Inline Tasks**: Template variables also work for the inline-created task folder setting. Leave that setting empty to use the default tasks folder.
+- **Relative Paths**: `.` and `..` path segments are normalized after variables are expanded, so `{{currentNotePath}}/../Tasks` can target a sibling folder.
 When templates contain nested variables, create a small test set first to validate the resulting paths.
 
 #### Advanced Usage
@@ -145,6 +151,9 @@ Short deterministic filename patterns improve link stability, scripting, and man
 - `{{scheduledDate}}` - Task scheduled date (YYYY-MM-DD format)
 - `{{context}}` - First context from the task's contexts array
 - `{{contexts}}` - All contexts joined by `/`
+- `{{project}}` - First project from the task's projects array
+- `{{projects}}` - All projects joined by `/`
+- `{{projectId}}` - First project abbreviated to four alphanumeric uppercase characters (e.g., "TASK")
 - `{{tags}}` - Task tags (comma-separated)
 - `{{hashtags}}` - Task tags as space-separated hashtags (e.g., "#work #urgent")
 - `{{timeEstimate}}` - Time estimate in minutes
@@ -199,7 +208,12 @@ Date/time components provide uniqueness without relying only on title text.
 - `{{utcOffsetShort}}` - Short UTC offset (e.g., "+1000")
 - `{{utcZ}}` - UTC Z indicator (always "Z")
 - `{{zettel}}` - Zettelkasten ID (e.g., "250815abc")
+- `{{uuid}}` - UUID v4 (e.g., "550e8400-e29b-41d4-a716-446655440000")
 - `{{nano}}` - Nano ID with timestamp and random string
+
+### Materialized Occurrence Filename Variables
+
+Materialized recurring occurrence notes can use a separate, optional filename template. It supports all variables above plus explicit occurrence date, ISO week, month, year, and month-name variables. See [Recurring Tasks](../features/recurring-tasks.md#occurrence-filenames) for configuration, per-parent overrides, and examples.
 
 ### Filename Template Examples
 
@@ -241,18 +255,19 @@ For ICS event notes, additional variables are available:
 - **Unified Syntax**: Both filename and body templates now use double braces `{{variable}}`. Single braces `{variable}` are supported for backwards compatibility but deprecated.
 - **Sanitization**: All variables are automatically sanitized to be safe for filenames (invalid characters removed)
 - **Empty Values**: If a property doesn't have a value, the variable is replaced with an empty string
+- **Multiple Values**: Singular variables like `{{context}}` and `{{project}}` use the first value. Plural variables like `{{contexts}}` and `{{projects}}` join all values with `/`, then the final filename is sanitized
 - **Character Limits**: Filenames are limited to 255 characters on most systems
 
 ### Store Title in Filename
 
 This setting is configured in the **Task Properties** tab within the Title property card.
 
-When enabled, the task's title is stored in the filename instead of frontmatter. The `title` property is removed from frontmatter, and the filename updates when the title changes. This disables other filename templating options.
+When enabled, the task's title is stored in the filename when it can represent the title exactly. Sanitized characters, links, long filenames and collision suffixes require a frontmatter title to preserve the full text. The filename updates when the title changes; a failed rename leaves the old title and properties unchanged. This disables other filename templating options.
 
 **Important Considerations:**
 
 - **Backward Compatibility:** This feature is designed to be backward-compatible. Existing tasks with the `title` property in their frontmatter will continue to work as expected. The plugin will always prioritize reading the title from the frontmatter if it exists.
-- **New Tasks:** New tasks created with this setting enabled will have their title stored exclusively in the filename.
+- **New Tasks:** Titles are stored exclusively in the filename only when it represents the full title exactly.
 - **Migration:** To migrate an existing task to this system, rename the file to match the task's title and remove the `title` property from frontmatter.
 Storing title in filename favors path-readable tasks and external tooling that keys off filenames. Keeping title in frontmatter avoids path changes when titles are edited.
 
@@ -286,6 +301,8 @@ For detailed reminder documentation, see [Task Reminders](../features/task-manag
 
 TaskNotes supports **Templates** for both the YAML frontmatter and the body of your task notes. You can use templates to pre-fill common values, add boilerplate text, and create a consistent structure for your tasks. Templates can also include variables, such as `{{title}}`, `{{date}}`, and `{{parentNote}}`, which will be automatically replaced with the appropriate values when a new task is created.
 
+Materialized occurrence notes can use a separate template from regular new tasks. Configure a global fallback in **Settings → Features → Body template**, or set `occurrence_template` on a recurring parent task to use a template for that series.
+
 ### Unified Template Variables
 
 Body templates now support the same variables as filename templates. All variables listed in the [Filename Template Variables](#filename-template-variables) section above are available in body templates, including:
@@ -293,7 +310,7 @@ Body templates now support the same variables as filename templates. All variabl
 - All date/time variables (`{{year}}`, `{{month}}`, `{{timestamp}}`, etc.)
 - All title variations (`{{titleKebab}}`, `{{titleSnake}}`, etc.)
 - Task property variations (`{{priorityShort}}`, `{{statusShort}}`)
-- Unique identifiers (`{{zettel}}`, `{{nano}}`)
+- Unique identifiers (`{{zettel}}`, `{{uuid}}`, `{{nano}}`)
 - Advanced variables (`{{unix}}`, `{{unixMs}}`, etc.)
 
 ### Body-Specific Variables

@@ -1,6 +1,7 @@
+import { msg } from "@lingui/core/macro";
 import { Modal, App, setIcon } from "obsidian";
 import TaskNotesPlugin from "../main";
-import { TranslationKey } from "../i18n";
+import { MessageDescriptor } from "../i18n";
 
 interface DeviceCodeInfo {
 	userCode: string;
@@ -16,9 +17,9 @@ export class DeviceCodeModal extends Modal {
 	private plugin: TaskNotesPlugin;
 	private deviceCode: DeviceCodeInfo;
 	private onCancel: () => void;
-	private countdownInterval?: ReturnType<typeof setInterval>;
+	private countdownInterval?: number;
 	private expiresAt: number;
-	private translate: (key: TranslationKey, variables?: Record<string, any>) => string;
+	private translate: (key: MessageDescriptor, variables?: Record<string, unknown>) => string;
 
 	constructor(
 		app: App,
@@ -30,7 +31,7 @@ export class DeviceCodeModal extends Modal {
 		this.plugin = plugin;
 		this.deviceCode = deviceCode;
 		this.onCancel = onCancel;
-		this.expiresAt = Date.now() + (deviceCode.expiresIn * 1000);
+		this.expiresAt = Date.now() + deviceCode.expiresIn * 1000;
 		this.translate = plugin.i18n.translate.bind(plugin.i18n);
 	}
 
@@ -43,59 +44,62 @@ export class DeviceCodeModal extends Modal {
 		const header = contentEl.createDiv({ cls: "tasknotes-device-code-header" });
 		const headerIcon = header.createSpan({ cls: "tasknotes-device-code-icon" });
 		setIcon(headerIcon, "shield-check");
-		header.createEl("h2", { text: this.translate("modals.deviceCode.title"), cls: "tasknotes-device-code-title" });
+		header.createEl("h2", {
+			text: this.translate(msg({ message: "Google Calendar authorization", context: "modals.deviceCode.title" })),
+			cls: "tasknotes-device-code-title",
+		});
 
 		// Instructions
 		const instructions = contentEl.createDiv({ cls: "tasknotes-device-code-instructions" });
 		instructions.createEl("p", {
-			text: this.translate("modals.deviceCode.instructions.intro"),
+			text: this.translate(msg({ message: "To connect your Google Calendar, please follow these steps:", context: "modals.deviceCode.instructions.intro" })),
 		});
 
 		// Steps
 		const stepsList = instructions.createEl("ol", { cls: "tasknotes-device-code-steps" });
 
 		const step1 = stepsList.createEl("li");
-		step1.createSpan({ text: this.translate("modals.deviceCode.steps.open") + " " });
+		step1.createSpan({ text: this.translate(msg({ message: "Open", context: "modals.deviceCode.steps.open" })) + " " });
 		const linkSpan = step1.createEl("a", {
 			text: this.deviceCode.verificationUrl,
 			href: this.deviceCode.verificationUrl,
-			cls: "tasknotes-device-code-link"
+			cls: "tasknotes-device-code-link",
 		});
 		linkSpan.setAttribute("target", "_blank");
-		step1.createSpan({ text: " " + this.translate("modals.deviceCode.steps.inBrowser") });
+		step1.createSpan({ text: " " + this.translate(msg({ message: "in your browser", context: "modals.deviceCode.steps.inBrowser" })) });
 
 		const step2 = stepsList.createEl("li");
-		step2.createSpan({ text: this.translate("modals.deviceCode.steps.enterCode") });
+		step2.createSpan({ text: this.translate(msg({ message: "Enter this code when prompted:", context: "modals.deviceCode.steps.enterCode" })) });
 
 		const step3 = stepsList.createEl("li");
-		step3.createSpan({ text: this.translate("modals.deviceCode.steps.signIn") });
+		step3.createSpan({ text: this.translate(msg({ message: "Sign in with your Google account and grant access", context: "modals.deviceCode.steps.signIn" })) });
 
 		const step4 = stepsList.createEl("li");
-		step4.createSpan({ text: this.translate("modals.deviceCode.steps.returnToObsidian") });
+		step4.createSpan({ text: this.translate(msg({ message: "Return to Obsidian (this window will close automatically)", context: "modals.deviceCode.steps.returnToObsidian" })) });
 
 		// Code display
 		const codeContainer = contentEl.createDiv({ cls: "tasknotes-device-code-container" });
-		codeContainer.createEl("div", {
-			text: this.translate("modals.deviceCode.codeLabel"),
-			cls: "tasknotes-device-code-label"
+		codeContainer.createDiv({
+			text: this.translate(msg({ message: "Your code:", context: "modals.deviceCode.codeLabel" })),
+			cls: "tasknotes-device-code-label",
 		});
 
-		const codeBox = codeContainer.createEl("div", { cls: "tasknotes-device-code-box" });
+		const codeBox = codeContainer.createDiv({ cls: "tasknotes-device-code-box" });
 		codeBox.createEl("code", {
 			text: this.formatUserCode(this.deviceCode.userCode),
-			cls: "tasknotes-device-code-text"
+			cls: "tasknotes-device-code-text",
 		});
 
 		const copyIcon = codeBox.createEl("button", {
 			cls: "tasknotes-device-code-copy",
-			attr: { "aria-label": this.translate("modals.deviceCode.copyCodeAriaLabel") }
+			attr: { "aria-label": this.translate(msg({ message: "Copy code", context: "modals.deviceCode.copyCodeAriaLabel" })) },
 		});
 		setIcon(copyIcon, "copy");
 		copyIcon.addEventListener("click", () => {
-			navigator.clipboard.writeText(this.deviceCode.userCode);
+			void navigator.clipboard.writeText(this.deviceCode.userCode);
 			copyIcon.empty();
 			setIcon(copyIcon, "check");
-			setTimeout(() => {
+			window.setTimeout(() => {
 				copyIcon.empty();
 				setIcon(copyIcon, "copy");
 			}, 2000);
@@ -105,13 +109,13 @@ export class DeviceCodeModal extends Modal {
 		const timerContainer = contentEl.createDiv({ cls: "tasknotes-device-code-timer" });
 		const timerIcon = timerContainer.createSpan({ cls: "tasknotes-device-code-timer-icon" });
 		setIcon(timerIcon, "clock");
-		const timerText = timerContainer.createEl("span", {
+		const timerText = timerContainer.createSpan({
 			text: this.getTimeRemaining(),
-			cls: "tasknotes-device-code-timer-text"
+			cls: "tasknotes-device-code-timer-text",
 		});
 
 		// Update countdown every second
-		this.countdownInterval = setInterval(() => {
+		this.countdownInterval = window.setInterval(() => {
 			const remaining = this.getTimeRemaining();
 			timerText.setText(remaining);
 
@@ -126,9 +130,9 @@ export class DeviceCodeModal extends Modal {
 		const statusIcon = statusContainer.createSpan({ cls: "tasknotes-device-code-status-icon" });
 		setIcon(statusIcon, "loader");
 		statusIcon.addClass("tasknotes-device-code-spinner");
-		statusContainer.createEl("span", {
-			text: this.translate("modals.deviceCode.waitingForAuthorization"),
-			cls: "tasknotes-device-code-status-text"
+		statusContainer.createSpan({
+			text: this.translate(msg({ message: "Waiting for authorization...", context: "modals.deviceCode.waitingForAuthorization" })),
+			cls: "tasknotes-device-code-status-text",
 		});
 
 		// Buttons
@@ -136,8 +140,8 @@ export class DeviceCodeModal extends Modal {
 
 		// Open browser button
 		const openButton = buttonContainer.createEl("button", {
-			text: this.translate("modals.deviceCode.openBrowserButton"),
-			cls: "mod-cta"
+			text: this.translate(msg({ message: "Open browser", context: "modals.deviceCode.openBrowserButton" })),
+			cls: "mod-cta",
 		});
 		const openIcon = openButton.createSpan({ cls: "tasknotes-device-code-button-icon" });
 		setIcon(openIcon, "external-link");
@@ -149,8 +153,8 @@ export class DeviceCodeModal extends Modal {
 
 		// Cancel button
 		const cancelButton = buttonContainer.createEl("button", {
-			text: this.translate("modals.deviceCode.cancelButton"),
-			cls: "tasknotes-device-code-cancel"
+			text: this.translate(msg({ message: "Cancel", context: "modals.deviceCode.cancelButton" })),
+			cls: "tasknotes-device-code-cancel",
 		});
 		const cancelIcon = cancelButton.createSpan({ cls: "tasknotes-device-code-button-icon" });
 		setIcon(cancelIcon, "x");
@@ -159,203 +163,11 @@ export class DeviceCodeModal extends Modal {
 			this.close();
 		});
 
-		// Add some helpful CSS for spinner animation
-		if (!document.getElementById("tasknotes-device-code-styles")) {
-			const style = document.createElement("style");
-			style.id = "tasknotes-device-code-styles";
-			style.textContent = `
-				.tasknotes-device-code-modal {
-					padding: 20px;
-				}
-
-				.tasknotes-device-code-header {
-					display: flex;
-					align-items: center;
-					gap: 12px;
-					margin-bottom: 20px;
-					padding-bottom: 16px;
-					border-bottom: 1px solid var(--background-modifier-border);
-				}
-
-				.tasknotes-device-code-icon {
-					width: 24px;
-					height: 24px;
-					color: var(--interactive-accent);
-				}
-
-				.tasknotes-device-code-title {
-					margin: 0;
-					font-size: 1.25em;
-					font-weight: 600;
-				}
-
-				.tasknotes-device-code-instructions {
-					margin-bottom: 20px;
-				}
-
-				.tasknotes-device-code-steps {
-					margin: 12px 0;
-					padding-left: 20px;
-				}
-
-				.tasknotes-device-code-steps li {
-					margin: 8px 0;
-					line-height: 1.6;
-				}
-
-				.tasknotes-device-code-link {
-					color: var(--interactive-accent);
-					text-decoration: none;
-					font-weight: 500;
-				}
-
-				.tasknotes-device-code-link:hover {
-					text-decoration: underline;
-				}
-
-				.tasknotes-device-code-container {
-					margin: 20px 0;
-					padding: 16px;
-					background: var(--background-secondary);
-					border-radius: 8px;
-					border: 1px solid var(--background-modifier-border);
-				}
-
-				.tasknotes-device-code-label {
-					font-size: 0.9em;
-					color: var(--text-muted);
-					margin-bottom: 8px;
-					font-weight: 500;
-				}
-
-				.tasknotes-device-code-box {
-					display: flex;
-					align-items: center;
-					gap: 12px;
-					padding: 12px;
-					background: var(--background-primary);
-					border-radius: 6px;
-					border: 1px solid var(--background-modifier-border);
-				}
-
-				.tasknotes-device-code-text {
-					flex: 1;
-					font-family: var(--font-monospace);
-					font-size: 1.5em;
-					font-weight: 600;
-					letter-spacing: 0.1em;
-					color: var(--text-normal);
-					text-align: center;
-				}
-
-				.tasknotes-device-code-copy {
-					padding: 8px;
-					background: var(--interactive-accent);
-					border: none;
-					border-radius: 4px;
-					cursor: pointer;
-					color: var(--text-on-accent);
-					display: flex;
-					align-items: center;
-					justify-content: center;
-				}
-
-				.tasknotes-device-code-copy:hover {
-					background: var(--interactive-accent-hover);
-				}
-
-				.tasknotes-device-code-timer {
-					display: flex;
-					align-items: center;
-					gap: 8px;
-					margin: 16px 0;
-					padding: 12px;
-					background: var(--background-secondary);
-					border-radius: 6px;
-					border: 1px solid var(--background-modifier-border);
-				}
-
-				.tasknotes-device-code-timer-icon {
-					width: 16px;
-					height: 16px;
-					color: var(--text-muted);
-				}
-
-				.tasknotes-device-code-timer-text {
-					font-size: 0.9em;
-					color: var(--text-muted);
-				}
-
-				.tasknotes-device-code-status {
-					display: flex;
-					align-items: center;
-					gap: 12px;
-					margin: 16px 0;
-					padding: 12px;
-					background: var(--background-primary-alt);
-					border-radius: 6px;
-					border: 1px solid var(--interactive-accent);
-				}
-
-				.tasknotes-device-code-status-icon {
-					width: 20px;
-					height: 20px;
-					color: var(--interactive-accent);
-				}
-
-				.tasknotes-device-code-spinner {
-					animation: spin 1s linear infinite;
-				}
-
-				@keyframes spin {
-					from { transform: rotate(0deg); }
-					to { transform: rotate(360deg); }
-				}
-
-				.tasknotes-device-code-status-text {
-					color: var(--text-muted);
-					font-weight: 500;
-				}
-
-				.tasknotes-device-code-buttons {
-					display: flex;
-					gap: 12px;
-					margin-top: 20px;
-					justify-content: flex-end;
-				}
-
-				.tasknotes-device-code-buttons button {
-					display: flex;
-					align-items: center;
-					gap: 6px;
-					padding: 8px 16px;
-					border-radius: 4px;
-					cursor: pointer;
-					font-weight: 500;
-				}
-
-				.tasknotes-device-code-cancel {
-					background: var(--background-modifier-border);
-					border: 1px solid var(--background-modifier-border);
-					color: var(--text-normal);
-				}
-
-				.tasknotes-device-code-cancel:hover {
-					background: var(--background-modifier-border-hover);
-				}
-
-				.tasknotes-device-code-button-icon {
-					width: 16px;
-					height: 16px;
-				}
-			`;
-			document.head.appendChild(style);
-		}
 	}
 
 	onClose(): void {
 		if (this.countdownInterval) {
-			clearInterval(this.countdownInterval);
+			window.clearInterval(this.countdownInterval);
 		}
 		const { contentEl } = this;
 		contentEl.empty();
@@ -385,9 +197,9 @@ export class DeviceCodeModal extends Modal {
 		const seconds = Math.floor((remaining % 60000) / 1000);
 
 		if (minutes > 0) {
-			return this.translate("modals.deviceCode.expiresMinutesSeconds", { minutes, seconds });
+			return this.translate(msg({ message: "Code expires in {minutes}m {seconds}s", context: "modals.deviceCode.expiresMinutesSeconds" }), { minutes, seconds });
 		} else {
-			return this.translate("modals.deviceCode.expiresSeconds", { seconds });
+			return this.translate(msg({ message: "Code expires in {seconds}s", context: "modals.deviceCode.expiresSeconds" }), { seconds });
 		}
 	}
 }

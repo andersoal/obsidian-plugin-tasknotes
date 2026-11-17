@@ -1,3 +1,4 @@
+import { observeTranslation as mockObserveTranslation, englishText as mockEnglishText, conceptDescriptor as mockConceptDescriptor } from "../../helpers/real-i18n";
 /**
  * TaskCard Year Display Tests
  *
@@ -14,10 +15,9 @@ import {
 
 import { TaskInfo } from '../../../src/types';
 import { TaskFactory } from '../../helpers/mock-factories';
-import { MockObsidian, App } from '../../__mocks__/obsidian';
+import { MockObsidian, App } from '../../helpers/obsidian-runtime';
 
 // Mock external dependencies
-jest.mock('obsidian');
 
 // We do NOT mock date-fns here - we want real formatting behavior
 // We do NOT mock dateUtils here - we want real date display logic
@@ -28,7 +28,8 @@ jest.mock('../../../src/utils/helpers', () => ({
 	shouldUseRecurringTaskUI: jest.fn((task) => !!task.recurrence),
 	getRecurringTaskCompletionText: jest.fn(() => 'Not completed for this date'),
 	getRecurrenceDisplayText: jest.fn((recurrence) => 'Daily'),
-	filterEmptyProjects: jest.fn((projects) => projects?.filter((p: string) => p && p.trim()) || [])
+	filterEmptyProjects: jest.fn((projects) => projects?.filter((p: string) => p && p.trim()) || []),
+	sanitizeForCssClass: jest.fn((value: string) => value.replace(/[^a-zA-Z0-9_-]/g, "-"))
 }));
 
 jest.mock('../../../src/components/TaskContextMenu', () => ({
@@ -43,7 +44,7 @@ jest.mock('../../../src/utils/propertyMapping', () => ({
 	isPropertyForField: jest.fn((propertyId, field) => propertyId === field)
 }));
 
-describe.skip('TaskCard Year Display (#1431)', () => {
+describe('TaskCard Year Display (#1431)', () => {
 	let mockPlugin: any;
 	let mockApp: any;
 	let container: HTMLElement;
@@ -133,6 +134,9 @@ describe.skip('TaskCard Year Display (#1431)', () => {
 			projectSubtasksService: {
 				isTaskUsedAsProject: jest.fn().mockResolvedValue(false),
 				isTaskUsedAsProjectSync: jest.fn().mockReturnValue(false)
+			},
+			i18n: {
+				translate: mockObserveTranslation()
 			},
 			settings: {
 				singleClickAction: 'edit',

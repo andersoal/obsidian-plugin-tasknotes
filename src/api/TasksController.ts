@@ -1,5 +1,4 @@
-import { IncomingMessage, ServerResponse } from "http";
-import { parse } from "url";
+import { parseRequestUrl, type HTTPRequestLike, type HTTPResponseLike } from "./httpTypes";
 import { BaseController } from "./BaseController";
 import { TaskInfo, TaskCreationData, FilterQuery } from "../types";
 import { TaskService } from "../services/TaskService";
@@ -7,14 +6,21 @@ import { FilterService } from "../services/FilterService";
 import { TaskManager } from "../utils/TaskManager";
 import { TaskStatsService } from "../services/TaskStatsService";
 import TaskNotesPlugin from "../main";
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-import { Get, Post, Put, Delete } from "../utils/OpenAPIDecorators";
+import { hydrateTaskDetailsFromFile } from "../utils/taskDetails";
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
+import { Get, Post, Put, Delete, OpenAPI } from "../utils/OpenAPIDecorators";
+
+type VaultAdapterWithPath = {
+	basePath?: string;
+	path?: string;
+};
+
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- Decorator metadata keeps route parameters aligned with controller signatures.
 interface TaskQueryParams {
 	status?: string;
 	priority?: string;
 	project?: string;
+	context?: string;
 	tag?: string;
 	due_before?: string;
 	due_after?: string;
@@ -40,16 +46,16 @@ export class TasksController extends BaseController {
 	}
 
 	@Get("/api/tasks")
-	async getTasks(req: IncomingMessage, res: ServerResponse): Promise<void> {
+	async getTasks(req: HTTPRequestLike, res: HTTPResponseLike): Promise<void> {
 		try {
-			const parsedUrl = parse(req.url || "", true);
-			const params = parsedUrl.query;
+			const params = parseRequestUrl(req).searchParams;
 
 			// Check if user is trying to use filtering parameters
 			const filterParams = [
 				"status",
 				"priority",
 				"project",
+				"context",
 				"tag",
 				"overdue",
 				"completed",
@@ -58,7 +64,7 @@ export class TasksController extends BaseController {
 				"due_after",
 				"sort",
 			];
-			const hasFilters = filterParams.some((param) => params[param]);
+			const hasFilters = filterParams.some((param) => params.has(param));
 
 			if (hasFilters) {
 				// Recommend using the more powerful query endpoint
@@ -79,15 +85,17 @@ export class TasksController extends BaseController {
 			let offset = 0;
 			let limit = 50; // Reduced default for basic listing
 
-			if (params.offset) {
-				offset = parseInt(params.offset as string, 10);
+			const offsetParam = params.get("offset");
+			if (offsetParam) {
+				offset = parseInt(offsetParam, 10);
 				if (isNaN(offset) || offset < 0) {
 					offset = 0;
 				}
 			}
 
-			if (params.limit) {
-				limit = parseInt(params.limit as string, 10);
+			const limitParam = params.get("limit");
+			if (limitParam) {
+				limit = parseInt(limitParam, 10);
 				if (isNaN(limit) || limit < 1) {
 					limit = 50;
 				}
@@ -100,7 +108,7 @@ export class TasksController extends BaseController {
 			const paginatedTasks = allTasks.slice(offset, offset + limit);
 
 			// Get vault information
-			const adapter = this.plugin.app.vault.adapter as any;
+			const adapter = this.plugin.app.vault.adapter as VaultAdapterWithPath;
 			let vaultPath = null;
 			try {
 				if ("basePath" in adapter && typeof adapter.basePath === "string") {
@@ -108,7 +116,7 @@ export class TasksController extends BaseController {
 				} else if ("path" in adapter && typeof adapter.path === "string") {
 					vaultPath = adapter.path;
 				}
-			} catch (error) {
+			} catch {
 				// Silently fail if vault path isn't accessible
 			}
 
@@ -130,15 +138,15 @@ export class TasksController extends BaseController {
 					note: "For filtering and advanced queries, use POST /api/tasks/query",
 				})
 			);
-		} catch (error: any) {
-			this.sendResponse(res, 500, this.errorResponse(error.message));
+		} catch (error: unknown) {
+			this.sendResponse(res, 500, this.errorResponse(this.getErrorMessage(error)));
 		}
 	}
 
 	@Post("/api/tasks")
-	async createTask(req: IncomingMessage, res: ServerResponse): Promise<void> {
+	async createTask(req: HTTPRequestLike, res: HTTPResponseLike): Promise<void> {
 		try {
-			const taskData: TaskCreationData = await this.parseRequestBody(req);
+			const taskData = await this.parseRequestBody<TaskCreationData>(req);
 
 			if (!taskData.title || !taskData.title.trim()) {
 				this.sendResponse(res, 400, this.errorResponse("Title is required"));
@@ -149,15 +157,15 @@ export class TasksController extends BaseController {
 			const result = await this.taskService.createTask(taskData);
 
 			this.sendResponse(res, 201, this.successResponse(result.taskInfo));
-		} catch (error: any) {
-			this.sendResponse(res, 400, this.errorResponse(error.message));
+		} catch (error: unknown) {
+			this.sendResponse(res, 400, this.errorResponse(this.getErrorMessage(error)));
 		}
 	}
 
 	@Get("/api/tasks/:id")
 	async getTask(
-		req: IncomingMessage,
-		res: ServerResponse,
+		req: HTTPRequestLike,
+		res: HTTPResponseLike,
 		params?: Record<string, string>
 	): Promise<void> {
 		try {
@@ -174,16 +182,18 @@ export class TasksController extends BaseController {
 				return;
 			}
 
-			this.sendResponse(res, 200, this.successResponse(task));
-		} catch (error: any) {
-			this.sendResponse(res, 500, this.errorResponse(error.message));
+			const taskWithDetails = await hydrateTaskDetailsFromFile(this.plugin.app, task);
+
+			this.sendResponse(res, 200, this.successResponse(taskWithDetails));
+		} catch (error: unknown) {
+			this.sendResponse(res, 500, this.errorResponse(this.getErrorMessage(error)));
 		}
 	}
 
 	@Put("/api/tasks/:id")
 	async updateTask(
-		req: IncomingMessage,
-		res: ServerResponse,
+		req: HTTPRequestLike,
+		res: HTTPResponseLike,
 		params?: Record<string, string>
 	): Promise<void> {
 		try {
@@ -193,7 +203,9 @@ export class TasksController extends BaseController {
 				return;
 			}
 
-			const updates = await this.parseRequestBody(req);
+			const updates = await this.parseRequestBody<Partial<TaskInfo> & { details?: string }>(
+				req
+			);
 
 			const originalTask = await this.cacheManager.getTaskInfo(taskId);
 			if (!originalTask) {
@@ -204,15 +216,15 @@ export class TasksController extends BaseController {
 			const updatedTask = await this.taskService.updateTask(originalTask, updates);
 
 			this.sendResponse(res, 200, this.successResponse(updatedTask));
-		} catch (error: any) {
-			this.sendResponse(res, 400, this.errorResponse(error.message));
+		} catch (error: unknown) {
+			this.sendResponse(res, 400, this.errorResponse(this.getErrorMessage(error)));
 		}
 	}
 
 	@Delete("/api/tasks/:id")
 	async deleteTask(
-		req: IncomingMessage,
-		res: ServerResponse,
+		req: HTTPRequestLike,
+		res: HTTPResponseLike,
 		params?: Record<string, string>
 	): Promise<void> {
 		try {
@@ -236,15 +248,15 @@ export class TasksController extends BaseController {
 				200,
 				this.successResponse({ message: "Task deleted successfully" })
 			);
-		} catch (error: any) {
-			this.sendResponse(res, 500, this.errorResponse(error.message));
+		} catch (error: unknown) {
+			this.sendResponse(res, 500, this.errorResponse(this.getErrorMessage(error)));
 		}
 	}
 
 	@Post("/api/tasks/:id/toggle-status")
 	async toggleStatus(
-		req: IncomingMessage,
-		res: ServerResponse,
+		req: HTTPRequestLike,
+		res: HTTPResponseLike,
 		params?: Record<string, string>
 	): Promise<void> {
 		try {
@@ -264,15 +276,15 @@ export class TasksController extends BaseController {
 			const updatedTask = await this.taskService.toggleStatus(task);
 
 			this.sendResponse(res, 200, this.successResponse(updatedTask));
-		} catch (error: any) {
-			this.sendResponse(res, 400, this.errorResponse(error.message));
+		} catch (error: unknown) {
+			this.sendResponse(res, 400, this.errorResponse(this.getErrorMessage(error)));
 		}
 	}
 
 	@Post("/api/tasks/:id/archive")
 	async toggleArchive(
-		req: IncomingMessage,
-		res: ServerResponse,
+		req: HTTPRequestLike,
+		res: HTTPResponseLike,
 		params?: Record<string, string>
 	): Promise<void> {
 		try {
@@ -292,15 +304,15 @@ export class TasksController extends BaseController {
 			const updatedTask = await this.taskService.toggleArchive(task);
 
 			this.sendResponse(res, 200, this.successResponse(updatedTask));
-		} catch (error: any) {
-			this.sendResponse(res, 400, this.errorResponse(error.message));
+		} catch (error: unknown) {
+			this.sendResponse(res, 400, this.errorResponse(this.getErrorMessage(error)));
 		}
 	}
 
 	@Post("/api/tasks/:id/complete-instance")
 	async completeRecurringInstance(
-		req: IncomingMessage,
-		res: ServerResponse,
+		req: HTTPRequestLike,
+		res: HTTPResponseLike,
 		params?: Record<string, string>
 	): Promise<void> {
 		try {
@@ -310,7 +322,22 @@ export class TasksController extends BaseController {
 				return;
 			}
 
-			const { date } = await this.parseRequestBody(req);
+			const { date, instanceDate: legacyDate } = await this.parseRequestBody<{
+				date?: string; instanceDate?: string;
+			}>(req);
+			if (date !== undefined && legacyDate !== undefined && date !== legacyDate) {
+				throw new Error("Conflicting date and instanceDate");
+			}
+			const requestedDate = date !== undefined ? date : legacyDate;
+			if (requestedDate !== undefined && (
+				typeof requestedDate !== "string" ||
+				!/^\d{4}-\d{2}-\d{2}(?:T(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?)?$/.test(requestedDate) ||
+				!Number.isFinite(new Date(requestedDate).getTime()) ||
+				!Number.isFinite(new Date(requestedDate.slice(0, 10)).getTime()) ||
+				new Date(requestedDate.slice(0, 10)).toISOString().slice(0, 10) !== requestedDate.slice(0, 10)
+			)) {
+				throw new Error("Date must be a valid ISO calendar date or timestamp");
+			}
 			const task = await this.cacheManager.getTaskInfo(taskId);
 
 			if (!task) {
@@ -318,22 +345,108 @@ export class TasksController extends BaseController {
 				return;
 			}
 
-			const instanceDate = date ? new Date(date) : undefined;
-			const updatedTask = await this.taskService.toggleRecurringTaskComplete(
+			const instanceDate = requestedDate ? new Date(requestedDate) : undefined;
+			const updatedTask = await this.taskService.toggleRecurringTaskCompleteWithOccurrenceNotes(
 				task,
 				instanceDate
 			);
 			this.sendResponse(res, 200, this.successResponse(updatedTask));
-		} catch (error: any) {
-			this.sendResponse(res, 400, this.errorResponse(error.message));
+		} catch (error: unknown) {
+			this.sendResponse(res, 400, this.errorResponse(this.getErrorMessage(error)));
 		}
 	}
 
-	@Post("/api/tasks/query")
-	async queryTasks(req: IncomingMessage, res: ServerResponse): Promise<void> {
+	@Post("/api/tasks/:id/materialize-occurrence")
+	async materializeOccurrence(
+		req: HTTPRequestLike,
+		res: HTTPResponseLike,
+		params?: Record<string, string>
+	): Promise<void> {
 		try {
-			const query = (await this.parseRequestBody(req)) as FilterQuery;
-			const filteredTasksMap = await this.filterService.getGroupedTasks(query);
+			const taskId = params?.id;
+			if (!taskId) {
+				this.sendResponse(res, 400, this.errorResponse("Task ID is required"));
+				return;
+			}
+
+			const { date } = await this.parseRequestBody<{ date?: string }>(req);
+			if (!date) {
+				this.sendResponse(res, 400, this.errorResponse("Date is required"));
+				return;
+			}
+
+			const task = await this.cacheManager.getTaskInfo(taskId);
+			if (!task) {
+				this.sendResponse(res, 404, this.errorResponse("Task not found"));
+				return;
+			}
+
+			const occurrence = await this.taskService.materializeOccurrence(task, date);
+			this.sendResponse(res, 200, this.successResponse(occurrence));
+		} catch (error: unknown) {
+			this.sendResponse(res, 400, this.errorResponse(this.getErrorMessage(error)));
+		}
+	}
+
+	@OpenAPI({
+		summary: "Query tasks",
+		description: "Filter, sort, and group tasks with a complete TaskNotes FilterQuery payload. Custom fields accept user:<id-or-key> or user.<id-or-key>. Invalid queries return HTTP 400.",
+		operationId: "queryTasks",
+		tags: ["Tasks"],
+		requestBody: {
+			required: true,
+			content: {
+				"application/json": {
+					schema: {
+						$ref: "#/components/schemas/FilterQuery",
+					},
+					example: {
+						type: "group",
+						id: "root",
+						conjunction: "and",
+						children: [
+							{
+								type: "condition",
+								id: "context",
+								property: "contexts",
+								operator: "contains",
+								value: "@office",
+							},
+						],
+						sortKey: "due",
+						sortDirection: "asc",
+					},
+				},
+			},
+		},
+		responses: {
+			"200": {
+				description: "Tasks matching the query",
+				content: {
+					"application/json": {
+						schema: {
+							$ref: "#/components/schemas/APIResponse",
+						},
+					},
+				},
+			},
+			"400": {
+				description: "Invalid query payload",
+				content: {
+					"application/json": {
+						schema: {
+							$ref: "#/components/schemas/Error",
+						},
+					},
+				},
+			},
+		},
+	})
+	@Post("/api/tasks/query")
+	async queryTasks(req: HTTPRequestLike, res: HTTPResponseLike): Promise<void> {
+		try {
+			const query = await this.parseRequestBody<FilterQuery>(req);
+			const filteredTasksMap = await this.filterService.getGroupedTasksStrict(query);
 
 			// Flatten grouped results into a single array
 			const filteredTasks: TaskInfo[] = [];
@@ -343,7 +456,7 @@ export class TasksController extends BaseController {
 
 			const allTasks = await this.cacheManager.getAllTasks();
 			// Get vault information
-			const adapter = this.plugin.app.vault.adapter as any;
+			const adapter = this.plugin.app.vault.adapter as VaultAdapterWithPath;
 			let vaultPath = null;
 			try {
 				if ("basePath" in adapter && typeof adapter.basePath === "string") {
@@ -351,7 +464,7 @@ export class TasksController extends BaseController {
 				} else if ("path" in adapter && typeof adapter.path === "string") {
 					vaultPath = adapter.path;
 				}
-			} catch (error) {
+			} catch {
 				// Silently fail if vault path isn't accessible
 			}
 
@@ -368,23 +481,23 @@ export class TasksController extends BaseController {
 					},
 				})
 			);
-		} catch (error: any) {
-			this.sendResponse(res, 400, this.errorResponse(error.message));
+		} catch (error: unknown) {
+			this.sendResponse(res, 400, this.errorResponse(this.getErrorMessage(error)));
 		}
 	}
 
 	@Get("/api/filter-options")
-	async getFilterOptions(req: IncomingMessage, res: ServerResponse): Promise<void> {
+	async getFilterOptions(req: HTTPRequestLike, res: HTTPResponseLike): Promise<void> {
 		try {
 			const filterOptions = await this.filterService.getFilterOptions();
 			this.sendResponse(res, 200, this.successResponse(filterOptions));
-		} catch (error: any) {
-			this.sendResponse(res, 500, this.errorResponse(error.message));
+		} catch (error: unknown) {
+			this.sendResponse(res, 500, this.errorResponse(this.getErrorMessage(error)));
 		}
 	}
 
 	@Get("/api/stats")
-	async getStats(req: IncomingMessage, res: ServerResponse): Promise<void> {
+	async getStats(req: HTTPRequestLike, res: HTTPResponseLike): Promise<void> {
 		try {
 			const allTasks = await this.cacheManager.getAllTasks();
 			const fullStats = this.taskStatsService.getStats(allTasks);
@@ -399,9 +512,8 @@ export class TasksController extends BaseController {
 			};
 
 			this.sendResponse(res, 200, this.successResponse(stats));
-		} catch (error: any) {
-			this.sendResponse(res, 500, this.errorResponse(error.message));
+		} catch (error: unknown) {
+			this.sendResponse(res, 500, this.errorResponse(this.getErrorMessage(error)));
 		}
 	}
-
 }

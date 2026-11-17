@@ -1,13 +1,24 @@
+import { fieldLabel, fieldGroupLabel } from "../../i18n/fieldLabels";
+import { uiData } from "../../i18n/dataText";
+import { messages, messageForKey } from "../../i18n/messages";
+import { msg } from "@lingui/core/macro";
 import { App } from "obsidian";
 import type TaskNotesPlugin from "../../main";
-import type { ModalFieldConfig, FieldGroup, TaskModalFieldsConfig } from "../../types/settings";
+import type { MessageDescriptor } from "../../i18n";
+import type {
+	ModalFieldConfig,
+	FieldGroup,
+	TaskModalFieldsConfig,
+	UserMappedField,
+} from "../../types/settings";
 import {
 	createCard,
 	setupCardDragAndDrop,
-	createCardInput,
 	createCardSelect,
-	createCardToggle
+	createCardToggle,
 } from "./CardComponent";
+
+type TranslateFn = (key: MessageDescriptor, params?: Record<string, string | number>) => string;
 
 /**
  * Creates the field manager UI component for configuring modal fields
@@ -19,15 +30,16 @@ export function createFieldManager(
 	onUpdate: (config: TaskModalFieldsConfig) => void,
 	app: App
 ): void {
-	const translate = (key: string, params?: Record<string, string | number>) =>
-		plugin.i18n.translate(key as any, params);
-
 	container.empty();
 	container.addClass("field-manager");
 
+	const translate: TranslateFn = (key, params) => plugin.i18n.translate(key, params);
+
 	// Safety check
 	if (!config || !config.groups || !config.fields) {
-		container.createDiv({ text: "Error: Invalid field configuration. Please reset to defaults." });
+		container.createDiv({
+			text: translate(msg({ message: "Error: Invalid field configuration. Please reset to defaults.", context: "settings.modalFields.manager.invalidConfig" })),
+		});
 		return;
 	}
 
@@ -44,7 +56,7 @@ export function createFieldManager(
 		if (index === 0) {
 			tab.addClass("field-manager__tab--active");
 		}
-		tab.setText(group.displayName);
+		tab.setText(fieldGroupLabel(group));
 		tab.onclick = () => {
 			// Update active tab
 			tabsContainer.querySelectorAll(".field-manager__tab").forEach((t) => {
@@ -76,8 +88,7 @@ function renderFieldGroup(
 ): void {
 	container.empty();
 
-	const translate = (key: string, params?: Record<string, string | number>) =>
-		plugin.i18n.translate(key as any, params);
+	const translate: TranslateFn = (key, params) => plugin.i18n.translate(key, params);
 
 	// Get fields for this group
 	const groupFields = config.fields
@@ -86,7 +97,7 @@ function renderFieldGroup(
 
 	if (groupFields.length === 0) {
 		const emptyState = container.createDiv({ cls: "field-manager__empty" });
-		emptyState.setText("No fields in this group");
+		emptyState.setText(translate(msg({ message: "No fields in this group", context: "settings.modalFields.manager.emptyGroup" })));
 		return;
 	}
 
@@ -112,14 +123,16 @@ function createFieldCard(
 	app: App,
 	groupId: FieldGroup
 ): void {
-	const translate = (key: string, params?: Record<string, string | number>) =>
-		plugin.i18n.translate(key as any, params);
+	const translate: TranslateFn = (key, params) => plugin.i18n.translate(key, params);
 
 	// Create type badge
-	const typeBadge = document.createElement("span");
+	const typeBadge = activeWindow.createSpan();
 	typeBadge.classList.add("field-card__type");
 	typeBadge.classList.add(`field-card__type--${field.fieldType}`);
-	typeBadge.textContent = field.fieldType;
+	const typeConcept = `settings.modalFields.manager.fieldTypes.${field.fieldType}` as const;
+	typeBadge.textContent = Object.prototype.hasOwnProperty.call(messages, typeConcept)
+		? translate(messageForKey(typeConcept))
+		: uiData(String(field.fieldType), "Unknown persisted field type; show raw user data rather than throwing");
 
 	// Create toggle switches with callbacks
 	const enabledToggle = createCardToggle(field.enabled, (value) => {
@@ -128,13 +141,27 @@ function createFieldCard(
 			config.fields[fieldIndex].enabled = value;
 			onUpdate(config);
 			// Re-render to update visibility
-			const activeTab = document.querySelector(".field-manager__tab--active") as HTMLElement;
+			const activeTab = activeDocument.querySelector(
+				".field-manager__tab--active"
+			) as HTMLElement;
 			if (activeTab) {
-				const tabIndex = Array.from(activeTab.parentElement!.children).indexOf(activeTab);
+				const tabParent = activeTab.parentElement;
+				const contentParent = container.parentElement;
+				if (!tabParent || !contentParent) {
+					return;
+				}
+				const tabIndex = Array.from(tabParent.children).indexOf(activeTab);
 				const groups = [...config.groups].sort((a, b) => a.order - b.order);
 				const groupToRender = groups[tabIndex];
 				if (groupToRender) {
-					renderFieldGroup(container.parentElement!, groupToRender.id, config, plugin, onUpdate, app);
+					renderFieldGroup(
+						contentParent,
+						groupToRender.id,
+						config,
+						plugin,
+						onUpdate,
+						app
+					);
 				}
 			}
 		}
@@ -158,7 +185,7 @@ function createFieldCard(
 
 	// Create group selector
 	const groupSelect = createCardSelect(
-		config.groups.map((g) => ({ value: g.id, label: g.displayName })),
+		config.groups.map((g) => ({ value: g.id, label: fieldGroupLabel(g) })),
 		field.group
 	);
 	groupSelect.onchange = () => {
@@ -167,7 +194,9 @@ function createFieldCard(
 			config.fields[fieldIndex].group = groupSelect.value as FieldGroup;
 			onUpdate(config);
 			// Re-render to show field in new group
-			const activeTab = document.querySelector(".field-manager__tab--active") as HTMLElement;
+			const activeTab = activeDocument.querySelector(
+				".field-manager__tab--active"
+			) as HTMLElement;
 			if (activeTab) {
 				activeTab.click();
 			}
@@ -183,27 +212,25 @@ function createFieldCard(
 		id: field.id,
 		draggable: canReorder,
 		header: {
-			primaryText: field.displayName,
-			secondaryText: `ID: ${field.id}`,
+			primaryText: fieldLabel(field),
+			secondaryText: getFieldSecondaryText(field, plugin.settings.userFields, translate),
 			meta: [typeBadge],
 		},
 		content: {
 			sections: [
 				{
-					rows: [
-						{ label: "Enabled:", input: enabledToggle },
-					],
+					rows: [{ label: translate(msg({ message: "Enabled:", context: "settings.modalFields.manager.enabled" })), input: enabledToggle }],
 				},
 				...(field.enabled
 					? [
 							{
 								rows: [
-									{ label: "Show in Creation:", input: creationToggle },
-									{ label: "Show in Edit:", input: editToggle },
-									{ label: "Group:", input: groupSelect, fullWidth: true },
+									{ label: translate(msg({ message: "Show in creation:", context: "settings.modalFields.manager.showInCreation" })), input: creationToggle },
+									{ label: translate(msg({ message: "Show in edit:", context: "settings.modalFields.manager.showInEdit" })), input: editToggle },
+									{ label: translate(msg({ message: "Group:", context: "settings.modalFields.manager.group" })), input: groupSelect, fullWidth: true },
 								],
 							},
-					  ]
+						]
 					: []),
 			],
 		},
@@ -211,121 +238,58 @@ function createFieldCard(
 
 	// Setup drag and drop for reordering (only for fields that can be reordered)
 	if (canReorder) {
-		setupCardDragAndDrop(card, container, (draggedId: string, targetId: string, insertBefore: boolean) => {
-			const draggedIndex = config.fields.findIndex((f) => f.id === draggedId && f.group === groupId);
-			const targetIndex = config.fields.findIndex((f) => f.id === targetId && f.group === groupId);
+		setupCardDragAndDrop(
+			card,
+			container,
+			(draggedId: string, targetId: string, insertBefore: boolean) => {
+				const draggedIndex = config.fields.findIndex(
+					(f) => f.id === draggedId && f.group === groupId
+				);
+				const targetIndex = config.fields.findIndex(
+					(f) => f.id === targetId && f.group === groupId
+				);
 
-			if (draggedIndex === -1 || targetIndex === -1) return;
+				if (draggedIndex === -1 || targetIndex === -1) return;
 
-			// Get only fields in this group
-			const groupFields = config.fields.filter((f) => f.group === groupId);
+				// Get only fields in this group
+				const groupFields = config.fields.filter((f) => f.group === groupId);
 
-			// Find positions within the group
-			const draggedGroupIndex = groupFields.findIndex((f) => f.id === draggedId);
-			const targetGroupIndex = groupFields.findIndex((f) => f.id === targetId);
+				// Find positions within the group
+				const draggedGroupIndex = groupFields.findIndex((f) => f.id === draggedId);
+				const targetGroupIndex = groupFields.findIndex((f) => f.id === targetId);
 
-			// Reorder within group
-			const [movedField] = groupFields.splice(draggedGroupIndex, 1);
-			const insertIndex = targetGroupIndex + (insertBefore ? 0 : 1);
-			groupFields.splice(insertIndex, 0, movedField);
+				// Reorder within group
+				const [movedField] = groupFields.splice(draggedGroupIndex, 1);
+				const insertIndex = targetGroupIndex + (insertBefore ? 0 : 1);
+				groupFields.splice(insertIndex, 0, movedField);
 
-			// Update order values
-			groupFields.forEach((f, i) => {
-				const fieldIndex = config.fields.findIndex((cf) => cf.id === f.id);
-				if (fieldIndex !== -1) {
-					config.fields[fieldIndex].order = i;
-				}
-			});
+				// Update order values
+				groupFields.forEach((f, i) => {
+					const fieldIndex = config.fields.findIndex((cf) => cf.id === f.id);
+					if (fieldIndex !== -1) {
+						config.fields[fieldIndex].order = i;
+					}
+				});
 
-			onUpdate(config);
-			// Re-render the group
-			renderFieldGroup(container, groupId, config, plugin, onUpdate, app);
-		});
+				onUpdate(config);
+				// Re-render the group
+				renderFieldGroup(container, groupId, config, plugin, onUpdate, app);
+			}
+		);
 	}
 }
 
-/**
- * Add styles for field manager
- */
-export function addFieldManagerStyles(): void {
-	const styleId = "field-manager-styles";
-	if (document.getElementById(styleId)) return;
+function getFieldSecondaryText(
+	field: ModalFieldConfig,
+	userFields: UserMappedField[] | undefined,
+	translate: TranslateFn
+): string {
+	if (field.fieldType !== "user") {
+		return translate(msg({ message: "ID: {id}", context: "settings.modalFields.manager.fieldId" }), { id: field.id });
+	}
 
-	const style = document.createElement("style");
-	style.id = styleId;
-	style.textContent = `
-		.field-manager {
-			display: flex;
-			flex-direction: column;
-			gap: 1rem;
-		}
-
-		.field-manager__tabs {
-			display: flex;
-			gap: 0.5rem;
-			border-bottom: 2px solid var(--background-modifier-border);
-			padding-bottom: 0.5rem;
-		}
-
-		.field-manager__tab {
-			padding: 0.5rem 1rem;
-			cursor: pointer;
-			border-radius: 4px;
-			transition: background-color 0.2s;
-		}
-
-		.field-manager__tab:hover {
-			background-color: var(--background-modifier-hover);
-		}
-
-		.field-manager__tab--active {
-			background-color: var(--interactive-accent);
-			color: var(--text-on-accent);
-		}
-
-		.field-manager__content {
-			padding: 1rem 0;
-		}
-
-		.field-manager__cards {
-			display: flex;
-			flex-direction: column;
-			gap: 0.75rem;
-		}
-
-		.field-manager__empty {
-			text-align: center;
-			padding: 2rem;
-			color: var(--text-muted);
-		}
-
-		.field-card__type {
-			font-size: 0.75rem;
-			padding: 0.125rem 0.5rem;
-			border-radius: 3px;
-			background: var(--background-modifier-border);
-		}
-
-		.field-card__type--core {
-			background: var(--interactive-accent);
-			color: var(--text-on-accent);
-		}
-
-		.field-card__type--user {
-			background: var(--color-purple);
-			color: white;
-		}
-
-		.field-card__type--dependency {
-			background: var(--color-orange);
-			color: white;
-		}
-
-		.field-card__type--organization {
-			background: var(--color-green);
-			color: white;
-		}
-	`;
-
-	document.head.appendChild(style);
+	const userField = userFields?.find((candidate) => candidate.id === field.id);
+	return userField?.key
+		? translate(msg({ message: "Key: {key}", context: "settings.modalFields.manager.fieldKey" }), { key: userField.key })
+		: translate(msg({ message: "No key set", context: "settings.modalFields.manager.noKey" }));
 }

@@ -1,7 +1,7 @@
 # Agenda View
 
 
-The Agenda view is a dedicated `.base` file that opens the calendar in list mode. It provides a scrollable agenda of upcoming tasks, notes, and external calendar events without needing to switch the primary calendar into list view manually.
+The Agenda view is a dedicated `.base` file that opens the calendar in list mode. It provides a scrollable agenda of upcoming and overdue tasks, notes, and external calendar events without needing to switch the primary calendar into list view manually.
 
 ![Agenda View](../assets/views-agenda.png)
 
@@ -11,7 +11,7 @@ The Agenda view is a dedicated `.base` file that opens the calendar in list mode
 - Command: **Open Agenda View** (ribbon icon and command palette)
 - Configure the file path in **Settings → TaskNotes → General → View Commands**
 
-The file is created automatically the first time you run the command, and you can replace it with your own `.base` file if you maintain multiple agendas.
+TaskNotes creates missing default `.base` files automatically on startup when **Auto-create default files** is enabled. You can replace the command path with your own `.base` file if you maintain multiple agendas.
 
 ## Default Configuration
 
@@ -25,21 +25,25 @@ views:
     listDayCount: 7
     startDateProperty: file.ctime
     titleProperty: file.basename
+    showPropertyBasedEvents: false
+    showOverdueOnToday: true
     order:
       - note.status
       - note.priority
       - note.due
+      - formula.dueIn
       - note.scheduled
 ```
 
-This configuration displays seven days at a time, derives entries from `file.ctime`/`file.basename`, and inherits the same display options (show scheduled/due/recurring/timeblocks/time entries/ICS events) as the primary calendar view.
+This configuration displays seven days at a time, derives entries from `file.ctime`/`file.basename`, shows overdue scheduled or due tasks on today's row, shows the generated `Due in` countdown next to due dates, and inherits the same display options (show scheduled/due/recurring/timeblocks/time entries/ICS events) as the primary calendar view.
 
 ## Customization
 
 Edit the `.base` file to tailor the agenda:
 
 - Change `calendarView` to `listDay` or `listMonth` for different spans
-- Adjust `listDayCount` for shorter or longer agendas
+- Adjust `listDayCount` for shorter or longer agendas; the Bases option supports up to 365 days
+- Set `showOverdueOnToday: false` if you want the list to show only events that fall inside the current date window
 - Add `filters` to focus on specific projects, tags, or statuses
 - Modify `order` to control which task properties appear in the row layout
 

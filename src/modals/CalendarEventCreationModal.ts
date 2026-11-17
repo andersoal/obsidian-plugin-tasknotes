@@ -1,8 +1,18 @@
+import { displayError } from "../i18n/runtime";
+import { formatUIDate } from "../i18n/formatters";
+import { msg } from "@lingui/core/macro";
 import { App, Modal, Setting, Notice } from "obsidian";
 import TaskNotesPlugin from "../main";
-import { CalendarProvider, ProviderCalendar } from "../services/CalendarProvider";
-import { TranslationKey } from "../i18n";
+import {
+	CalendarProvider,
+	ProviderCalendar,
+	type CalendarEventData,
+} from "../services/CalendarProvider";
+import type { InterpolationValues, MessageDescriptor } from "../i18n";
 import { format } from "date-fns";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Modals/CalendarEventCreationModal" });
 
 export interface CalendarEventCreationOptions {
 	start: Date;
@@ -16,10 +26,29 @@ interface WritableCalendarEntry {
 	calendar: ProviderCalendar;
 }
 
+export function getDefaultWritableCalendarIndex(
+	writableCalendars: WritableCalendarEntry[],
+	googleTargetCalendarId: string | undefined
+): number {
+	if (googleTargetCalendarId) {
+		const targetCalendarIndex = writableCalendars.findIndex(
+			(entry) =>
+				entry.provider.providerId === "google" &&
+				entry.calendar.id === googleTargetCalendarId
+		);
+		if (targetCalendarIndex >= 0) {
+			return targetCalendarIndex;
+		}
+	}
+
+	const primaryIndex = writableCalendars.findIndex((entry) => entry.calendar.primary);
+	return primaryIndex >= 0 ? primaryIndex : 0;
+}
+
 export class CalendarEventCreationModal extends Modal {
 	plugin: TaskNotesPlugin;
 	options: CalendarEventCreationOptions;
-	private translate: (key: TranslationKey, variables?: Record<string, any>) => string;
+	private translate: (key: MessageDescriptor, variables?: InterpolationValues) => string;
 
 	private titleInput: HTMLInputElement;
 	private descriptionInput: HTMLTextAreaElement;
@@ -53,39 +82,39 @@ export class CalendarEventCreationModal extends Modal {
 	onOpen() {
 		const { contentEl } = this;
 		contentEl.empty();
-		contentEl.addClass("calendar-event-creation-modal");
+		contentEl.addClass("tasknotes-plugin", "calendar-event-creation-modal");
 
 		// Global Ctrl/Cmd+Enter shortcut
 		this.keyboardHandler = (e: KeyboardEvent) => {
 			if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
 				e.preventDefault();
-				this.handleSubmit();
+				void this.handleSubmit();
 			}
 		};
 		this.containerEl.addEventListener("keydown", this.keyboardHandler);
 
 		new Setting(contentEl)
-			.setName(this.translate("modals.calendarEventCreation.heading"))
+			.setName(this.translate(msg({ message: "Create calendar event", context: "modals.calendarEventCreation.heading" })))
 			.setHeading();
 
 		// Date/time display (read-only)
 		const dateDisplay = contentEl.createDiv({ cls: "calendar-event-date-display" });
 		dateDisplay.createEl("strong", {
-			text: this.translate("modals.calendarEventCreation.dateTimeLabel"),
+			text: this.translate(msg({ message: "Date & time: ", context: "modals.calendarEventCreation.dateTimeLabel" })),
 		});
 		const dateText = this.options.allDay
-			? format(this.options.start, "PPP")
-			: `${format(this.options.start, "PPP p")} – ${format(this.options.end, "p")}`;
+			? formatUIDate(this.options.start, "PPP")
+			: `${formatUIDate(this.options.start, "PPP p")} – ${formatUIDate(this.options.end, "p")}`;
 		dateDisplay.createSpan({ text: dateText });
 
 		// Title
 		new Setting(contentEl)
-			.setName(this.translate("modals.calendarEventCreation.titleLabel"))
-			.setDesc(this.translate("modals.calendarEventCreation.titleDesc"))
+			.setName(this.translate(msg({ message: "Title", context: "modals.calendarEventCreation.titleLabel" })))
+			.setDesc(this.translate(msg({ message: "Title for the calendar event", context: "modals.calendarEventCreation.titleDesc" })))
 			.addText((text) => {
 				this.titleInput = text.inputEl;
 				text.setPlaceholder(
-					this.translate("modals.calendarEventCreation.titlePlaceholder")
+					this.translate(msg({ message: "e.g., Team meeting", context: "modals.calendarEventCreation.titlePlaceholder" }))
 				).onChange(() => this.validateForm());
 				window.setTimeout(() => this.titleInput.focus(), 100);
 			});
@@ -93,8 +122,8 @@ export class CalendarEventCreationModal extends Modal {
 		// Calendar selector
 		if (this.writableCalendars.length > 1) {
 			new Setting(contentEl)
-				.setName(this.translate("modals.calendarEventCreation.calendarLabel"))
-				.setDesc(this.translate("modals.calendarEventCreation.calendarDesc"))
+				.setName(this.translate(msg({ message: "Calendar", context: "modals.calendarEventCreation.calendarLabel" })))
+				.setDesc(this.translate(msg({ message: "Which calendar to create the event on", context: "modals.calendarEventCreation.calendarDesc" })))
 				.addDropdown((dropdown) => {
 					this.calendarDropdown = dropdown.selectEl;
 					for (let i = 0; i < this.writableCalendars.length; i++) {
@@ -102,36 +131,34 @@ export class CalendarEventCreationModal extends Modal {
 						const label = `${entry.calendar.summary} (${entry.provider.providerName})`;
 						dropdown.addOption(String(i), label);
 					}
-					// Default to primary calendar if available
-					const primaryIdx = this.writableCalendars.findIndex(
-						(e) => e.calendar.primary
+					const defaultIndex = getDefaultWritableCalendarIndex(
+						this.writableCalendars,
+						this.plugin.settings.googleCalendarExport.targetCalendarId
 					);
-					if (primaryIdx >= 0) {
-						dropdown.setValue(String(primaryIdx));
-					}
+					dropdown.setValue(String(defaultIndex));
 				});
 		}
 
 		// Description (optional)
 		new Setting(contentEl)
-			.setName(this.translate("modals.calendarEventCreation.descriptionLabel"))
-			.setDesc(this.translate("modals.calendarEventCreation.descriptionDesc"))
+			.setName(this.translate(msg({ message: "Description", context: "modals.calendarEventCreation.descriptionLabel" })))
+			.setDesc(this.translate(msg({ message: "Optional description for the event", context: "modals.calendarEventCreation.descriptionDesc" })))
 			.addTextArea((text) => {
 				this.descriptionInput = text.inputEl;
 				text.setPlaceholder(
-					this.translate("modals.calendarEventCreation.descriptionPlaceholder")
+					this.translate(msg({ message: "Add details about this event...", context: "modals.calendarEventCreation.descriptionPlaceholder" }))
 				);
 				this.descriptionInput.rows = 3;
 			});
 
 		// Location (optional)
 		new Setting(contentEl)
-			.setName(this.translate("modals.calendarEventCreation.locationLabel"))
-			.setDesc(this.translate("modals.calendarEventCreation.locationDesc"))
+			.setName(this.translate(msg({ message: "Location", context: "modals.calendarEventCreation.locationLabel" })))
+			.setDesc(this.translate(msg({ message: "Optional location for the event", context: "modals.calendarEventCreation.locationDesc" })))
 			.addText((text) => {
 				this.locationInput = text.inputEl;
 				text.setPlaceholder(
-					this.translate("modals.calendarEventCreation.locationPlaceholder")
+					this.translate(msg({ message: "e.g., Conference Room A", context: "modals.calendarEventCreation.locationPlaceholder" }))
 				);
 			});
 
@@ -139,15 +166,17 @@ export class CalendarEventCreationModal extends Modal {
 		const buttonContainer = contentEl.createDiv({ cls: "calendar-event-modal-buttons" });
 
 		const cancelButton = buttonContainer.createEl("button", {
-			text: this.translate("common.cancel"),
+			text: this.translate(msg({ message: "Cancel", context: "common.cancel" })),
 		});
 		cancelButton.addEventListener("click", () => this.close());
 
 		const createButton = buttonContainer.createEl("button", {
-			text: this.translate("modals.calendarEventCreation.createButton"),
+			text: this.translate(msg({ message: "Create event", context: "modals.calendarEventCreation.createButton" })),
 			cls: "mod-cta calendar-event-create-button",
 		});
-		createButton.addEventListener("click", () => this.handleSubmit());
+		createButton.addEventListener("click", () => {
+			void this.handleSubmit();
+		});
 
 		this.validateForm();
 	}
@@ -166,17 +195,15 @@ export class CalendarEventCreationModal extends Modal {
 	private async handleSubmit(): Promise<void> {
 		const title = this.titleInput.value.trim();
 		if (!title) {
-			new Notice(this.translate("modals.calendarEventCreation.titleRequired"));
+			new Notice(this.translate(msg({ message: "Event title is required", context: "modals.calendarEventCreation.titleRequired" })));
 			return;
 		}
 
 		// Determine which calendar to use
-		const selectedIdx = this.calendarDropdown
-			? parseInt(this.calendarDropdown.value)
-			: 0;
+		const selectedIdx = this.calendarDropdown ? parseInt(this.calendarDropdown.value) : 0;
 		const entry = this.writableCalendars[selectedIdx];
 		if (!entry) {
-			new Notice(this.translate("modals.calendarEventCreation.noCalendarSelected"));
+			new Notice(this.translate(msg({ message: "No calendar selected", context: "modals.calendarEventCreation.noCalendarSelected" })));
 			return;
 		}
 
@@ -184,7 +211,7 @@ export class CalendarEventCreationModal extends Modal {
 			const { start, end, allDay } = this.options;
 			const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
-			const eventData: any = {
+			const eventData: CalendarEventData = {
 				summary: title,
 				start: allDay
 					? { date: format(start, "yyyy-MM-dd") }
@@ -202,16 +229,18 @@ export class CalendarEventCreationModal extends Modal {
 
 			await entry.provider.createEvent(entry.calendar.id, eventData);
 
-			new Notice(
-				this.translate("modals.calendarEventCreation.success", { title })
-			);
+			new Notice(this.translate(msg({ message: "Calendar event \"{title}\" created", context: "modals.calendarEventCreation.success" }), { title }));
 			this.options.onEventCreated?.();
 			this.close();
 		} catch (error) {
-			console.error("[TaskNotes] Error creating calendar event:", error);
+			tasknotesLogger.error("[TaskNotes] Error creating calendar event:", {
+				category: "provider",
+				operation: "creating-calendar-event",
+				error: error,
+			});
 			new Notice(
-				this.translate("modals.calendarEventCreation.error", {
-					message: error instanceof Error ? error.message : String(error),
+				this.translate(msg({ message: "Failed to create calendar event: {message}", context: "modals.calendarEventCreation.error" }), {
+					message: displayError(error instanceof Error ? error.message : String(error)),
 				})
 			);
 		}

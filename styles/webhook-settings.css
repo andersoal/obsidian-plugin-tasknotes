@@ -41,12 +41,13 @@
   border-radius: 8px;
   padding: 0;
   overflow: hidden;
-  transition: all 0.2s ease;
+  transition: background-color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
 }
 
 .tasknotes-webhook-card:hover {
   border-color: var(--interactive-accent);
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  transform: translateY(-1px);
 }
 
 /* Webhook Header */
@@ -98,16 +99,15 @@
   border-radius: 16px;
   font-size: 0.8rem;
   font-weight: 500;
+  transition: background-color 0.3s ease, color 0.3s ease, opacity 0.3s ease;
 }
 
 .tasknotes-webhook-status-indicator.active {
-  background: var(--color-green-rgb);
   background: rgba(var(--color-green-rgb), 0.15);
   color: var(--color-green);
 }
 
 .tasknotes-webhook-status-indicator.inactive {
-  background: var(--color-red-rgb);
   background: rgba(var(--color-red-rgb), 0.15);
   color: var(--color-red);
 }
@@ -218,8 +218,8 @@
   background: var(--background-primary);
   color: var(--text-normal);
   font-size: 0.85rem;
-  cursor: var(--cursor, pointer);
-  transition: all 0.2s ease;
+  cursor: var(--cursor-link, pointer);
+  transition: background-color 0.2s ease, border-color 0.2s ease, color 0.2s ease, opacity 0.2s ease;
 }
 
 .tasknotes-webhook-action-btn:hover {
@@ -229,7 +229,7 @@
 
 .tasknotes-webhook-action-btn.enable {
   background: var(--color-green);
-  color: white;
+  color: var(--text-on-accent);
   border-color: var(--color-green);
 }
 
@@ -240,7 +240,7 @@
 
 .tasknotes-webhook-action-btn.disable {
   background: var(--color-orange);
-  color: white;
+  color: var(--text-on-accent);
   border-color: var(--color-orange);
 }
 
@@ -251,7 +251,7 @@
 
 .tasknotes-webhook-action-btn.delete {
   background: var(--color-red);
-  color: white;
+  color: var(--text-on-accent);
   border-color: var(--color-red);
 }
 
@@ -288,17 +288,15 @@
 
 /* Better styling for Settings in modal */
 .tasknotes-webhook-modal .setting-item {
-  padding: 1rem;
-  margin-bottom: 0.75rem;
-  background: var(--background-modifier-form-field);
-  border: 1px solid var(--background-modifier-border);
-  border-radius: 8px;
-  transition: all 0.2s ease;
+  padding: var(--size-4-3) 0;
+  margin: 0;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--background-modifier-border);
 }
 
 .tasknotes-webhook-modal .setting-item:hover {
-  border-color: var(--interactive-accent);
-  background: var(--background-modifier-hover);
+  background: transparent;
 }
 
 .tasknotes-webhook-modal .setting-item:last-child {
@@ -331,6 +329,7 @@
 }
 
 .tasknotes-webhook-modal-icon {
+  font-size: 1.5rem;
   display: flex;
   align-items: center;
   color: var(--interactive-accent);
@@ -378,11 +377,11 @@
 
 /* Events List */
 .tasknotes-webhook-events-list {
-  margin-top: 1rem;
+  margin-top: 0;
   max-width: 100%;
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
+  gap: 0;
 }
 
 
@@ -399,6 +398,7 @@
 }
 
 .tasknotes-webhook-help-header {
+  color: var(--text-normal);
   display: flex;
   align-items: center;
   gap: 0.5rem;
@@ -407,6 +407,8 @@
 }
 
 .tasknotes-webhook-help-list {
+  color: var(--text-muted);
+  font-size: var(--tn-font-size-sm);
   margin: 0.75rem 0;
   padding-left: 1.25rem;
 }
@@ -419,6 +421,7 @@
 }
 
 .tasknotes-webhook-help-example {
+  color: var(--text-muted);
   margin-top: 0.75rem;
   padding-top: 0.75rem;
   border-top: 1px solid var(--background-modifier-border);
@@ -449,8 +452,8 @@
   color: var(--text-normal);
   font-size: 0.9rem;
   font-weight: 500;
-  cursor: var(--cursor, pointer);
-  transition: all 0.2s ease;
+  cursor: var(--cursor-link, pointer);
+  transition: background-color 0.2s ease, border-color 0.2s ease, color 0.2s ease, box-shadow 0.2s ease;
   white-space: nowrap;
   min-width: 0;
   flex-shrink: 0;
@@ -485,16 +488,21 @@
 }
 
 .tasknotes-webhook-modal-btn-icon {
+  font-size: 0.9rem;
+  line-height: 1;
   display: flex;
   align-items: center;
 }
 
 /* Secret Notice */
 .tasknotes-webhook-secret-notice {
+  text-align: center;
   padding: 1rem;
 }
 
 .tasknotes-webhook-secret-title {
+  justify-content: center;
+  font-size: 1.125rem;
   display: flex;
   align-items: center;
   gap: 0.5rem;
@@ -504,11 +512,16 @@
 }
 
 .tasknotes-webhook-secret-content {
+  margin-bottom: var(--tn-spacing-lg);
   font-size: 0.9rem;
   line-height: 1.4;
 }
 
 .tasknotes-webhook-secret-code {
+  display: block;
+  word-break: break-all;
+  user-select: all;
+  cursor: var(--cursor-link, pointer);
   background: var(--background-modifier-form-field);
   border: 1px solid var(--background-modifier-border);
   border-radius: 3px;
@@ -563,17 +576,4 @@
 .tasknotes-webhook-modal-btn:focus {
   outline: 2px solid var(--interactive-accent);
   outline-offset: 2px;
-}
-
-/* Animation for status changes */
-.tasknotes-webhook-status-indicator {
-  transition: all 0.3s ease;
-}
-
-.tasknotes-webhook-card {
-  transition: all 0.2s ease, transform 0.2s ease;
-}
-
-.tasknotes-webhook-card:hover {
-  transform: translateY(-1px);
 }

@@ -15,7 +15,7 @@
 import { InstantTaskConvertService } from '../../../src/services/InstantTaskConvertService';
 import { NaturalLanguageParser, ParsedTaskData as NLPParsedTaskData } from '../../../src/services/NaturalLanguageParser';
 import { PluginFactory } from '../../helpers/mock-factories';
-import { MockObsidian, TFile } from '../../__mocks__/obsidian';
+import { MockObsidian, TFile } from '../../helpers/obsidian-runtime';
 
 // Mock external dependencies
 jest.mock('../../../src/utils/dateUtils', () => ({
@@ -28,13 +28,15 @@ jest.mock('../../../src/utils/dateUtils', () => ({
 
 jest.mock('../../../src/utils/filenameGenerator', () => ({
   generateTaskFilename: jest.fn((context) => `${context.title.toLowerCase().replace(/\s+/g, '-')}.md`),
-  generateUniqueFilename: jest.fn((base) => base)
+  generateUniqueFilename: jest.fn((base) => base),
+  getTaskFilenameNotice: jest.fn(() => null)
 }));
 
 jest.mock('../../../src/utils/helpers', () => ({
   ensureFolderExists: jest.fn().mockResolvedValue(undefined),
   sanitizeFileName: jest.fn((name) => name.replace(/[<>:"|?*]/g, '')),
-  calculateDefaultDate: jest.fn(() => undefined)
+  calculateDefaultDate: jest.fn(() => undefined),
+  calculateDefaultDateTime: jest.fn(() => undefined)
 }));
 
 jest.mock('../../../src/utils/templateProcessor', () => ({

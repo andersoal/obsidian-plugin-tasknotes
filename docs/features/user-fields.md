@@ -27,11 +27,17 @@ Each user field has the following properties:
     - **Date**: Select from presets: None, Today, Tomorrow, or Next Week.
     - **List**: Enter comma-separated default values.
 
+## Link Values
+
+Use a **Text** field for one related link, such as a pull request or specification, and a **List** field for multiple related links. Task cards render wikilinks, markdown links, angle-bracket autolinks, and bare `https://` URLs as clickable links.
+
+For internal note links, type `[[` in a text or list field to use the same file suggestions as other TaskNotes link fields. Autosuggestion filters can narrow those note suggestions without changing how the stored field value is filtered, sorted, or grouped.
+
 ## File Suggestion Filtering (Advanced)
 
 When using text or list type custom fields, you can configure **autosuggestion filters** to control which files appear in the autocomplete dropdown when you type `[[` in the field.
 
-![Custom Field Filtering](../assets/CustomFields-Selection-Filter.gif)
+![Custom field autosuggestion filters for tags, folders, and property values](../assets/custom-fields-selection-filter.webp)
 
 This is useful when you want to limit suggestions to specific types of notes. For example:
 - An "Assignee" field that only suggests notes tagged with `#person`

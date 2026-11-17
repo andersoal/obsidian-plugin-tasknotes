@@ -16,16 +16,24 @@ This reference documents the expected data types for each frontmatter property t
 | dateCreated | text (datetime) | `"2025-01-01T08:00:00Z"` |
 | dateModified | text (datetime) | `"2025-01-15T10:30:00Z"` |
 | tags | list | `["work", "urgent"]` |
-| contexts | list | `["@office", "@home"]` |
+| contexts | list | `["office", "home"]` |
 | projects | list | `["[[Project A]]"]` |
 | timeEstimate | number | `120` (minutes) |
 | recurrence | text | `"FREQ=WEEKLY;BYDAY=MO"` |
 | recurrence_anchor | text | `"scheduled"` or `"completion"` |
+| recurrence_original_date | date (optional system property) | `"2026-10-18"` |
 | timeEntries | list (objects) | See [Time Entries](#time-entries) |
 | blockedBy | list (objects) | See [Dependencies](#dependencies-blockedby) |
 | reminders | list (objects) | See [Reminders](#reminders) |
 | complete_instances | list | `["2025-01-08", "2025-01-15"]` |
 | skipped_instances | list | `["2025-01-22"]` |
+| recurrence_parent | text (link/path) | `"[[Tasks/Weekly review]]"` |
+| occurrence_date | text (date) | `"2025-01-15"` |
+| occurrence_materialization | text | `"manual"` or `"on_completion"` |
+| occurrence_next_trigger | text | `"completion"` or `"completion_or_skip"` |
+| occurrence_template | text (link/path) | `"[[Templates/Occurrence]]"` |
+| occurrence_past_horizon | text (duration) | `"P7D"` |
+| occurrence_future_horizon | text (duration) | `"P14D"` |
 | icsEventId | list | `["event-abc123"]` |
 
 Use this table for fast validation when a field is not behaving as expected in views or API calls. Most parsing issues come from shape mismatches (for example scalar vs list) rather than missing values.
@@ -188,6 +196,14 @@ Single-item arrays may look verbose, but they prevent edge cases when filters an
 - **Description:** Determines whether the next occurrence is calculated from the scheduled date or when the task was completed
 - **Example:** `recurrence_anchor: "scheduled"`
 
+#### recurrence_original_date
+
+- **Type:** date string (optional, system-managed)
+- **Format:** `YYYY-MM-DD`
+- **Description:** Original rule date of a native scheduled-anchored virtual occurrence whose next `scheduled` placement was moved. The calendar shows the moved placement once; completion/skip history uses this original date. Repeated moves retain it; moving back, advancing the schedule, or editing the series clears it. Undo restores it with the moved schedule. Existing notes do not require migration, and legacy Google Calendar exception metadata is preserved.
+- **Example:** `scheduled: "2026-10-12"` with `recurrence_original_date: "2026-10-18"` still represents the 18 October occurrence.
+- **Direct YAML edits:** set this only when the original rule date is known; do not infer it from the nearest date. See [Recurring Tasks](../features/recurring-tasks.md#rescheduling-a-virtual-occurrence).
+
 #### complete_instances
 
 - **Type:** list (array of date strings)
@@ -211,6 +227,56 @@ Single-item arrays may look verbose, but they prevent edge cases when filters an
   ```yaml
   skipped_instances:
     - "2025-01-22"
+  ```
+
+### Materialized Occurrence Properties
+
+Materialized occurrence notes are ordinary task notes created for one date in a recurring series. The parent recurring task owns the recurrence rule; the occurrence note owns date-specific state such as status, completed date, body content, time entries, reminders, and comments.
+
+When an occurrence note is created, TaskNotes inherits parent planning metadata such as scheduled time, due offset, priority, tags, contexts, projects, reminders, dependencies, details, custom properties, and time estimate. It does not copy parent recurrence/history/runtime fields such as `recurrence`, `complete_instances`, `skipped_instances`, `completedDate`, provider event IDs, or `timeEntries`.
+
+#### recurrence_parent
+
+- **Type:** text (link or path string)
+- **Description:** Parent recurring task for a materialized occurrence note
+- **Example:** `recurrence_parent: "[[Tasks/Weekly review]]"`
+
+#### occurrence_date
+
+- **Type:** text (date string)
+- **Format:** `YYYY-MM-DD`
+- **Description:** Target recurrence date represented by a materialized occurrence note
+- **Example:** `occurrence_date: "2025-01-15"`
+
+#### occurrence_materialization
+
+- **Type:** text (string)
+- **Valid values:** `"manual"`, `"on_completion"`, `"rolling"`
+- **Description:** Parent task policy for creating occurrence notes. The plugin currently supports manual creation and creating the next note after completion; rolling windows are defined by the spec but are not automated yet.
+- **Example:** `occurrence_materialization: "on_completion"`
+
+#### occurrence_next_trigger
+
+- **Type:** text (string)
+- **Valid values:** `"completion"` or `"completion_or_skip"`
+- **Description:** Parent task policy for whether skip actions should also create the next occurrence note when occurrence materialization is set to `on_completion`
+- **Example:** `occurrence_next_trigger: "completion_or_skip"`
+
+#### occurrence_template
+
+- **Type:** text (link or path string)
+- **Description:** Optional template reference used when creating materialized occurrence notes. This parent-level template takes priority over the global occurrence note template fallback in Features settings.
+- **Example:** `occurrence_template: "[[Templates/Weekly occurrence]]"`
+
+#### occurrence_past_horizon and occurrence_future_horizon
+
+- **Type:** text (ISO 8601 duration string)
+- **Description:** Optional rolling-window bounds for occurrence materialization. These fields are part of the TaskNotes spec; automated rolling materialization is not currently enabled in the plugin.
+- **Examples:**
+
+  ```yaml
+  occurrence_past_horizon: "P7D"
+  occurrence_future_horizon: "P14D"
   ```
 
 ---
@@ -304,7 +370,7 @@ tags:
   - work
   - reports
 contexts:
-  - "@office"
+  - office
 projects:
   - "[[Q1 Planning]]"
 timeEstimate: 240
@@ -330,6 +396,8 @@ reminders:
 ## Field Mapping
 
 All property names can be customized via **Settings → Task Properties → Field Mapping**. If you change a field mapping, TaskNotes will read and write using your custom property name.
+
+Custom property names are frontmatter keys, so names with spaces or punctuation are valid in task files. When you write your own Bases filters or formulas for those keys, use bracket notation such as `note["TN-status"]` or `note["Task Type"]` instead of dot notation. Dot notation only works reliably for simple identifier-style names.
 
 For example, if you map `due` to `dueDate`, TaskNotes will expect:
 

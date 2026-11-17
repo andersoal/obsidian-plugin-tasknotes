@@ -1,26 +1,38 @@
-import { IncomingMessage, ServerResponse } from "http";
+import type { HTTPRequestLike, HTTPResponseLike } from "./httpTypes";
 import { BaseController } from "./BaseController";
-import { NaturalLanguageParser } from "../services/NaturalLanguageParser";
-import { TaskCreationData } from "../types";
+import type { TaskTextParser } from "../services/NaturalLanguageParser";
 import { TaskService } from "../services/TaskService";
 import TaskNotesPlugin from "../main";
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
+import { buildTaskCreationDataFromParsed } from "../services/buildTaskCreationDataFromParsed";
+
 import { generateOpenAPISpec, Get, Post } from "../utils/OpenAPIDecorators";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Api/SystemController" });
+
+type VaultAdapterWithPath = {
+	basePath?: string;
+	path?: string;
+};
+
+type OpenAPISpecProvider = {
+	generateOpenAPISpec(): unknown;
+};
 
 export class SystemController extends BaseController {
 	constructor(
 		private plugin: TaskNotesPlugin,
 		private taskService: TaskService,
-		private nlParser: NaturalLanguageParser,
-		private httpAPIService?: any
+		private nlParser: TaskTextParser,
+		private httpAPIService?: OpenAPISpecProvider
 	) {
 		super();
 	}
 
 	@Get("/api/health")
-	async healthCheck(req: IncomingMessage, res: ServerResponse): Promise<void> {
+	async healthCheck(req: HTTPRequestLike, res: HTTPResponseLike): Promise<void> {
 		const vaultName = this.plugin.app.vault.getName();
-		const adapter = this.plugin.app.vault.adapter as any;
+		const adapter = this.plugin.app.vault.adapter as VaultAdapterWithPath;
 
 		// Try to get vault path information
 		let vaultPath = null;
@@ -31,7 +43,7 @@ export class SystemController extends BaseController {
 			} else if ("path" in adapter && typeof adapter.path === "string") {
 				vaultPath = adapter.path;
 			}
-		} catch (error) {
+		} catch {
 			// Silently fail if vault path isn't accessible
 		}
 
@@ -50,7 +62,7 @@ export class SystemController extends BaseController {
 	}
 
 	@Post("/api/nlp/parse")
-	async handleNLPParse(req: IncomingMessage, res: ServerResponse): Promise<void> {
+	async handleNLPParse(req: HTTPRequestLike, res: HTTPResponseLike): Promise<void> {
 		try {
 			const body = await this.parseRequestBody(req);
 
@@ -66,32 +78,7 @@ export class SystemController extends BaseController {
 			// Parse the natural language input
 			const parsedData = this.nlParser.parseInput(body.text);
 
-			// Convert ParsedTaskData to TaskCreationData format
-			const taskData: TaskCreationData = {
-				title: parsedData.title,
-				details: parsedData.details,
-				priority: parsedData.priority,
-				status: parsedData.status || this.getDefaultStatus(),
-				tags: parsedData.tags,
-				contexts: parsedData.contexts,
-				projects: parsedData.projects,
-				recurrence: parsedData.recurrence,
-				timeEstimate: parsedData.estimate,
-			};
-
-			// Handle dates
-			if (parsedData.dueDate) {
-				taskData.due = parsedData.dueDate;
-				if (parsedData.dueTime) {
-					taskData.due = `${parsedData.dueDate} ${parsedData.dueTime}`;
-				}
-			}
-			if (parsedData.scheduledDate) {
-				taskData.scheduled = parsedData.scheduledDate;
-				if (parsedData.scheduledTime) {
-					taskData.scheduled = `${parsedData.scheduledDate} ${parsedData.scheduledTime}`;
-				}
-			}
+			const taskData = buildTaskCreationDataFromParsed(this.plugin, parsedData);
 
 			this.sendResponse(
 				res,
@@ -101,13 +88,13 @@ export class SystemController extends BaseController {
 					taskData: taskData,
 				})
 			);
-		} catch (error: any) {
-			this.sendResponse(res, 500, this.errorResponse(error.message));
+		} catch (error: unknown) {
+			this.sendResponse(res, 500, this.errorResponse(this.getErrorMessage(error)));
 		}
 	}
 
 	@Post("/api/nlp/create")
-	async handleNLPCreate(req: IncomingMessage, res: ServerResponse): Promise<void> {
+	async handleNLPCreate(req: HTTPRequestLike, res: HTTPResponseLike): Promise<void> {
 		try {
 			const body = await this.parseRequestBody(req);
 
@@ -123,33 +110,9 @@ export class SystemController extends BaseController {
 			// Parse the natural language input
 			const parsedData = this.nlParser.parseInput(body.text);
 
-			// Convert ParsedTaskData to TaskCreationData format
-			const taskData: TaskCreationData = {
-				title: parsedData.title,
-				details: parsedData.details,
-				priority: parsedData.priority,
-				status: parsedData.status || this.getDefaultStatus(),
-				tags: parsedData.tags,
-				contexts: parsedData.contexts,
-				projects: parsedData.projects,
-				recurrence: parsedData.recurrence,
-				timeEstimate: parsedData.estimate,
+			const taskData = buildTaskCreationDataFromParsed(this.plugin, parsedData, {
 				creationContext: "api",
-			};
-
-			// Handle dates
-			if (parsedData.dueDate) {
-				taskData.due = parsedData.dueDate;
-				if (parsedData.dueTime) {
-					taskData.due = `${parsedData.dueDate} ${parsedData.dueTime}`;
-				}
-			}
-			if (parsedData.scheduledDate) {
-				taskData.scheduled = parsedData.scheduledDate;
-				if (parsedData.scheduledTime) {
-					taskData.scheduled = `${parsedData.scheduledDate} ${parsedData.scheduledTime}`;
-				}
-			}
+			});
 
 			// Create the task - TaskService.createTask() applies defaults automatically
 			const result = await this.taskService.createTask(taskData);
@@ -162,13 +125,13 @@ export class SystemController extends BaseController {
 					parsed: parsedData,
 				})
 			);
-		} catch (error: any) {
-			this.sendResponse(res, 400, this.errorResponse(error.message));
+		} catch (error: unknown) {
+			this.sendResponse(res, 400, this.errorResponse(this.getErrorMessage(error)));
 		}
 	}
 
 	@Get("/api/docs")
-	async handleOpenAPISpec(req: IncomingMessage, res: ServerResponse): Promise<void> {
+	async handleOpenAPISpec(req: HTTPRequestLike, res: HTTPResponseLike): Promise<void> {
 		try {
 			// Use HTTPAPIService's method to get spec from all controllers
 			const spec =
@@ -178,37 +141,33 @@ export class SystemController extends BaseController {
 
 			res.statusCode = 200;
 			res.setHeader("Content-Type", "application/json");
-			res.setHeader("Access-Control-Allow-Origin", "*");
 			res.end(JSON.stringify(spec, null, 2));
-		} catch (error: any) {
-			console.error("OpenAPI spec generation error:", error);
+		} catch (error: unknown) {
+			tasknotesLogger.error("OpenAPI spec generation error:", {
+				category: "provider",
+				operation: "openapi-spec-generation",
+				error: error,
+			});
 			this.sendResponse(res, 500, this.errorResponse("Failed to generate API specification"));
 		}
 	}
 
 	@Get("/api/docs/ui")
-	async handleSwaggerUI(req: IncomingMessage, res: ServerResponse): Promise<void> {
+	async handleSwaggerUI(req: HTTPRequestLike, res: HTTPResponseLike): Promise<void> {
 		try {
 			const swaggerHTML = this.generateSwaggerUIHTML();
 
 			res.statusCode = 200;
 			res.setHeader("Content-Type", "text/html");
-			res.setHeader("Access-Control-Allow-Origin", "*");
 			res.end(swaggerHTML);
-		} catch (error: any) {
-			console.error("Swagger UI generation error:", error);
+		} catch (error: unknown) {
+			tasknotesLogger.error("Swagger UI generation error:", {
+				category: "provider",
+				operation: "swagger-ui-generation",
+				error: error,
+			});
 			this.sendResponse(res, 500, this.errorResponse("Failed to generate API documentation"));
 		}
-	}
-
-	private getDefaultStatus(): string {
-		// Get the first status (lowest order) as default, same logic as TaskModal
-		const statusConfigs = this.plugin.settings.customStatuses;
-		if (statusConfigs && statusConfigs.length > 0) {
-			const sortedStatuses = [...statusConfigs].sort((a, b) => a.order - b.order);
-			return sortedStatuses[0].value;
-		}
-		return "open"; // fallback
 	}
 
 	private generateSwaggerUIHTML(): string {

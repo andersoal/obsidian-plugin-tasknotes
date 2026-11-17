@@ -5,11 +5,24 @@ import {
 	FilterNode,
 	FilterProperty,
 	FilterOperator,
+	SavedView,
 } from "../types";
 import { StatusManager } from "./StatusManager";
 import { PriorityManager } from "./PriorityManager";
 import type TaskNotesPlugin from "../main";
 import type { UserMappedField } from "../types/settings";
+import { stringifyUnknown } from "../utils/stringUtils";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Services/BasesFilterConverter" });
+
+function getErrorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
 
 /**
  * Converts TaskNotes FilterQuery structures to Bases filter expressions
@@ -36,7 +49,7 @@ export class BasesFilterConverter {
 	/**
 	 * Convert a TaskNotes FilterQuery to a Bases filter expression (object notation)
 	 */
-	convertToBasesFilter(query: FilterQuery): any {
+	convertToBasesFilter(query: FilterQuery): unknown {
 		try {
 			// Convert to object notation for YAML
 			const filterObject = this.convertNodeToObject(query);
@@ -48,19 +61,23 @@ export class BasesFilterConverter {
 
 			return filterObject;
 		} catch (error) {
-			console.error("Error converting TaskNotes filter to Bases:", error);
-			throw new Error(`Failed to convert filter: ${error.message}`);
+			tasknotesLogger.error("Error converting TaskNotes filter to Bases:", {
+				category: "validation",
+				operation: "converting-tasknotes-filter-bases",
+				error: error,
+			});
+			throw new Error(`Failed to convert filter: ${getErrorMessage(error)}`);
 		}
 	}
 
 	/**
 	 * Convert a FilterNode to Bases object notation
 	 */
-	private convertNodeToObject(node: FilterNode): any {
+	private convertNodeToObject(node: FilterNode): unknown {
 		if (node.type == "group") {
-			return this.convertGroupToObject(node as FilterGroup);
+			return this.convertGroupToObject(node);
 		} else if (node.type == "condition") {
-			return this.convertConditionToString(node as FilterCondition);
+			return this.convertConditionToString(node);
 		}
 		return null;
 	}
@@ -68,11 +85,11 @@ export class BasesFilterConverter {
 	/**
 	 * Convert a FilterGroup to Bases object notation
 	 */
-	private convertGroupToObject(group: FilterGroup): any {
+	private convertGroupToObject(group: FilterGroup): unknown {
 		// Filter out incomplete conditions
 		const completeChildren = group.children.filter((child) => {
 			if (child.type == "condition") {
-				return this.isConditionComplete(child as FilterCondition);
+				return this.isConditionComplete(child);
 			}
 			return true; // Groups are always evaluated
 		});
@@ -135,7 +152,6 @@ export class BasesFilterConverter {
 		return this.convertOperator(basesProperty, operator, value, property);
 	}
 
-
 	/**
 	 * Check if a condition is complete (has property, operator, and value if needed)
 	 */
@@ -157,12 +173,11 @@ export class BasesFilterConverter {
 		return value !== null && value !== undefined && value !== "";
 	}
 
-
 	/**
 	 * Convert status.isCompleted to Bases expression
 	 * This needs to expand to check against all completed statuses and handle recurring tasks
 	 */
-	private convertCompletedStatusCondition(operator: FilterOperator, value: any): string {
+	private convertCompletedStatusCondition(operator: FilterOperator, value: unknown): string {
 		const completedStatusValues = this.statusManager.getCompletedStatuses();
 		const fm = this.plugin.fieldMapper;
 
@@ -174,9 +189,8 @@ export class BasesFilterConverter {
 			.join(" || ");
 
 		// Build status check expression
-		let statusExpression = completedStatusValues.length > 1
-			? `(${statusConditions})`
-			: statusConditions;
+		let statusExpression =
+			completedStatusValues.length > 1 ? `(${statusConditions})` : statusConditions;
 
 		// For recurring tasks, also check if today's date is in complete_instances array
 		// Use list.map() to convert dates to formatted strings, then check with contains()
@@ -234,16 +248,19 @@ export class BasesFilterConverter {
 	private convertUserFieldCondition(
 		property: string,
 		operator: FilterOperator,
-		value: any
+		value: unknown
 	): string {
 		const fieldId = property.slice(5); // Remove "user:" prefix
 		const userFields = this.plugin.settings.userFields || [];
-		const field = userFields.find((f: UserMappedField) =>
-			(f.id || f.key) === fieldId || f.key === fieldId
+		const field = userFields.find(
+			(f: UserMappedField) => (f.id || f.key) === fieldId || f.key === fieldId
 		);
 
 		if (!field) {
-			console.warn(`User field not found: ${fieldId}`);
+			tasknotesLogger.warn(`User field not found: ${fieldId}`, {
+				category: "validation",
+				operation: "user-field-not-found",
+			});
 			return "true"; // Default to always true if field not found
 		}
 
@@ -252,7 +269,13 @@ export class BasesFilterConverter {
 
 		// Convert based on field type
 		// Cast to FilterProperty since user fields are valid FilterProperty values (user:${string})
-		return this.convertOperator(basesProperty, operator, value, property as FilterProperty, field.type);
+		return this.convertOperator(
+			basesProperty,
+			operator,
+			value,
+			property as FilterProperty,
+			field.type
+		);
 	}
 
 	/**
@@ -314,7 +337,7 @@ export class BasesFilterConverter {
 			// Note: "dependencies.isBlocking" returns "true" (unsupported - requires reverse lookup)
 			default:
 				// Default to the property name (handles user fields and unknown properties)
-				frontmatterKey = property as string;
+				frontmatterKey = property;
 		}
 
 		return `note.${frontmatterKey}`;
@@ -326,7 +349,7 @@ export class BasesFilterConverter {
 	private convertOperator(
 		basesProperty: string,
 		operator: FilterOperator,
-		value: any,
+		value: unknown,
 		originalProperty: FilterProperty,
 		fieldType?: string
 	): string {
@@ -380,7 +403,11 @@ export class BasesFilterConverter {
 				return `${basesProperty} <= ${this.formatNumericValue(value)}`;
 
 			default:
-				console.warn(`Unknown operator: ${operator}`);
+				tasknotesLogger.warn("Unknown operator:", {
+					category: "validation",
+					operation: "unknown-operator",
+					details: { value: operator },
+				});
 				return "true";
 		}
 	}
@@ -388,33 +415,35 @@ export class BasesFilterConverter {
 	/**
 	 * Convert "is" operator to Bases expression
 	 */
-	private convertIsOperator(basesProperty: string, value: any, fieldType?: string): string {
+	private convertIsOperator(basesProperty: string, value: unknown, fieldType?: string): string {
 		// Handle array values (for multi-select properties)
 		if (Array.isArray(value)) {
 			if (value.length == 0) {
-				return `(!${basesProperty} || ${basesProperty}.length == 0)`;
+				return `${basesProperty}.isEmpty()`;
 			}
 
 			// Check if property contains any of the values
 			const conditions = value.map(
-				(v) => `${basesProperty}.contains("${this.escapeString(String(v))}")`
+				(v) => `${basesProperty}.contains("${this.escapeString(stringifyUnknown(v))}")`
 			);
 			return conditions.length > 1 ? `(${conditions.join(" || ")})` : conditions[0];
 		}
 
 		// Handle list-type user fields
 		if (fieldType == "list") {
-			return `${basesProperty}.contains("${this.escapeString(String(value))}")`;
+			return `${basesProperty}.contains("${this.escapeString(stringifyUnknown(value))}")`;
 		}
 
 		// Handle boolean values
 		if (typeof value == "boolean" || fieldType == "boolean") {
-			return `${basesProperty} == ${value}`;
+			const booleanValue =
+				typeof value === "boolean" ? (value ? "true" : "false") : stringifyUnknown(value);
+			return `${basesProperty} == ${booleanValue}`;
 		}
 
 		// Handle numeric values
 		if (typeof value == "number" || fieldType == "number") {
-			return `${basesProperty} == ${value}`;
+			return `${basesProperty} == ${this.formatNumericValue(value)}`;
 		}
 
 		// Handle null/empty
@@ -423,7 +452,7 @@ export class BasesFilterConverter {
 		}
 
 		// Default: string comparison
-		return `${basesProperty} == "${this.escapeString(String(value))}"`;
+		return `${basesProperty} == "${this.escapeString(stringifyUnknown(value))}"`;
 	}
 
 	/**
@@ -431,7 +460,7 @@ export class BasesFilterConverter {
 	 */
 	private convertContainsOperator(
 		basesProperty: string,
-		value: any,
+		value: unknown,
 		originalProperty: FilterProperty
 	): string {
 		// Handle array properties (tags, contexts, projects)
@@ -458,21 +487,21 @@ export class BasesFilterConverter {
 				}
 			}
 
-			return `${basesProperty}.contains("${this.escapeString(String(value))}")`;
+			return `${basesProperty}.contains("${this.escapeString(stringifyUnknown(value))}")`;
 		}
 
 		// For string properties, use substring match with Bases methods
-		return `${basesProperty}.lower().contains("${this.escapeString(String(value).toLowerCase())}")`;
+		return `${basesProperty}.lower().contains("${this.escapeString(stringifyUnknown(value).toLowerCase())}")`;
 	}
 
 	/**
 	 * Format numeric value for Bases expression (no quotes)
 	 */
-	private formatNumericValue(value: any): string {
+	private formatNumericValue(value: unknown): string {
 		if (typeof value == "number") {
 			return String(value);
 		}
-		const num = parseFloat(String(value));
+		const num = parseFloat(stringifyUnknown(value));
 		return isNaN(num) ? "0" : String(num);
 	}
 
@@ -482,16 +511,16 @@ export class BasesFilterConverter {
 	private escapeString(str: string): string {
 		return str
 			.replace(/\\/g, "\\\\") // Escape backslashes
-			.replace(/"/g, '\\"')   // Escape quotes
-			.replace(/\n/g, "\\n")  // Escape newlines
-			.replace(/\r/g, "\\r")  // Escape carriage returns
+			.replace(/"/g, '\\"') // Escape quotes
+			.replace(/\n/g, "\\n") // Escape newlines
+			.replace(/\r/g, "\\r") // Escape carriage returns
 			.replace(/\t/g, "\\t"); // Escape tabs
 	}
 
 	/**
 	 * Convert filter object to YAML string
 	 */
-	private filterObjectToYAML(filterObj: any, indent = 0): string {
+	private filterObjectToYAML(filterObj: unknown, indent = 0): string {
 		const indentStr = "  ".repeat(indent);
 
 		if (typeof filterObj == "string") {
@@ -501,16 +530,18 @@ export class BasesFilterConverter {
 
 		if (Array.isArray(filterObj)) {
 			// Array of conditions
-			return filterObj.map(item => `\n${indentStr}- ${this.filterObjectToYAML(item, indent + 1)}`).join("");
+			return filterObj
+				.map((item) => `\n${indentStr}- ${this.filterObjectToYAML(item, indent + 1)}`)
+				.join("");
 		}
 
-		if (typeof filterObj == "object" && filterObj !== null) {
+		if (isRecord(filterObj)) {
 			// Object with and/or/not keys
 			const key = Object.keys(filterObj)[0];
 			const value = filterObj[key];
 
 			if (Array.isArray(value)) {
-				return `\n${indentStr}${key}:${value.map(item => `\n${indentStr}  - ${this.filterObjectToYAML(item, indent + 2)}`).join("")}`;
+				return `\n${indentStr}${key}:${value.map((item) => `\n${indentStr}  - ${this.filterObjectToYAML(item, indent + 2)}`).join("")}`;
 			}
 
 			return `\n${indentStr}${key}: ${this.filterObjectToYAML(value, indent + 1)}`;
@@ -523,8 +554,11 @@ export class BasesFilterConverter {
 	 * Convert a SavedView to a Bases .base file content
 	 */
 	convertSavedViewToBasesFile(
-		savedView: any,
-		viewType: "tasknotesTaskList" | "tasknotesKanban" | "tasknotesCalendar" = "tasknotesTaskList"
+		savedView: SavedView,
+		viewType:
+			| "tasknotesTaskList"
+			| "tasknotesKanban"
+			| "tasknotesCalendar" = "tasknotesTaskList"
 	): string {
 		const filterObject = this.convertToBasesFilter(savedView.query);
 
@@ -540,7 +574,7 @@ export class BasesFilterConverter {
 		content += `    name: "${savedView.name}"\n`;
 
 		// Add sorting if present
-		if (savedView.query.sortKey && savedView.query.sortKey !== "none") {
+		if (savedView.query.sortKey) {
 			const sortColumn = this.mapSortKeyToBasesColumn(savedView.query.sortKey);
 			const sortDirection = (savedView.query.sortDirection || "asc").toUpperCase();
 			content += `    sort:\n`;
@@ -559,7 +593,6 @@ export class BasesFilterConverter {
 
 		// Add view options if present
 		if (savedView.viewOptions && Object.keys(savedView.viewOptions).length > 0) {
-			content += `    options:\n`;
 			Object.entries(savedView.viewOptions).forEach(([key, value]) => {
 				// Format value appropriately based on type
 				let formattedValue: string;
@@ -570,7 +603,7 @@ export class BasesFilterConverter {
 				} else {
 					formattedValue = JSON.stringify(value);
 				}
-				content += `      ${key}: ${formattedValue}\n`;
+				content += `    ${key}: ${formattedValue}\n`;
 			});
 		}
 
@@ -585,25 +618,37 @@ export class BasesFilterConverter {
 
 		// Handle known TaskNotes sort keys
 		switch (sortKey) {
-			case "due": return fm.toUserField("due");
-			case "scheduled": return fm.toUserField("scheduled");
-			case "priority": return fm.toUserField("priority");
-			case "status": return fm.toUserField("status");
-			case "title": return fm.toUserField("title");
-			case "dateCreated": return "file.ctime";
-			case "dateModified": return "file.mtime";
-			case "completedDate": return fm.toUserField("completedDate");
-			case "tags": return "file.tags";
-			case "path": return "file.path";
-			case "timeEstimate": return fm.toUserField("timeEstimate");
-			case "recurrence": return fm.toUserField("recurrence");
+			case "due":
+				return fm.toUserField("due");
+			case "scheduled":
+				return fm.toUserField("scheduled");
+			case "priority":
+				return fm.toUserField("priority");
+			case "status":
+				return fm.toUserField("status");
+			case "title":
+				return fm.toUserField("title");
+			case "dateCreated":
+				return "file.ctime";
+			case "dateModified":
+				return "file.mtime";
+			case "completedDate":
+				return fm.toUserField("completedDate");
+			case "tags":
+				return "file.tags";
+			case "path":
+				return "file.path";
+			case "timeEstimate":
+				return fm.toUserField("timeEstimate");
+			case "recurrence":
+				return fm.toUserField("recurrence");
 			default:
 				// Handle user fields
 				if (sortKey.startsWith("user:")) {
 					const fieldId = sortKey.slice(5);
 					const userFields = this.plugin.settings.userFields || [];
-					const field = userFields.find((f: UserMappedField) =>
-						(f.id || f.key) === fieldId || f.key === fieldId
+					const field = userFields.find(
+						(f: UserMappedField) => (f.id || f.key) === fieldId || f.key === fieldId
 					);
 					return field?.key || sortKey;
 				}
@@ -623,7 +668,7 @@ export class BasesFilterConverter {
 	/**
 	 * Convert all saved views to a single Bases .base file with multiple views
 	 */
-	convertAllSavedViewsToBasesFile(savedViews: any[]): string {
+	convertAllSavedViewsToBasesFile(savedViews: SavedView[]): string {
 		if (!savedViews || savedViews.length == 0) {
 			return "";
 		}
@@ -651,7 +696,7 @@ export class BasesFilterConverter {
 			}
 
 			// Add sorting if present
-			if (savedView.query.sortKey && savedView.query.sortKey !== "none") {
+			if (savedView.query.sortKey) {
 				const sortColumn = this.mapSortKeyToBasesColumn(savedView.query.sortKey);
 				const sortDirection = (savedView.query.sortDirection || "asc").toUpperCase();
 				viewDef += `    sort:\n`;
@@ -670,7 +715,6 @@ export class BasesFilterConverter {
 
 			// Add view options if present
 			if (savedView.viewOptions && Object.keys(savedView.viewOptions).length > 0) {
-				viewDef += `    options:\n`;
 				Object.entries(savedView.viewOptions).forEach(([key, value]) => {
 					// Format value appropriately based on type
 					let formattedValue: string;
@@ -681,7 +725,7 @@ export class BasesFilterConverter {
 					} else {
 						formattedValue = JSON.stringify(value);
 					}
-					viewDef += `      ${key}: ${formattedValue}\n`;
+					viewDef += `    ${key}: ${formattedValue}\n`;
 				});
 			}
 
@@ -698,7 +742,9 @@ export class BasesFilterConverter {
 	/**
 	 * Detect the view type for a saved view based on its viewOptions
 	 */
-	private detectViewType(savedView: any): "tasknotesTaskList" | "tasknotesKanban" | "tasknotesCalendar" {
+	private detectViewType(
+		savedView: SavedView
+	): "tasknotesTaskList" | "tasknotesKanban" | "tasknotesCalendar" {
 		const viewOptions = savedView.viewOptions || {};
 
 		// Check for calendar/agenda specific options
@@ -714,17 +760,18 @@ export class BasesFilterConverter {
 			"firstDay",
 			"slotMinTime",
 			"slotMaxTime",
-			"slotDuration"
+			"slotDuration",
+			"snapDuration",
 		];
 
-		const hasCalendarOptions = calendarOptions.some(option => option in viewOptions);
+		const hasCalendarOptions = calendarOptions.some((option) => option in viewOptions);
 		if (hasCalendarOptions) {
 			return "tasknotesCalendar";
 		}
 
 		// Check for kanban specific options
-		const kanbanOptions = ["columnWidth", "hideEmptyColumns"];
-		const hasKanbanOptions = kanbanOptions.some(option => option in viewOptions);
+		const kanbanOptions = ["columnWidth", "hideEmptyColumns", "pinnedColumns", "cardLayout"];
+		const hasKanbanOptions = kanbanOptions.some((option) => option in viewOptions);
 		if (hasKanbanOptions) {
 			return "tasknotesKanban";
 		}

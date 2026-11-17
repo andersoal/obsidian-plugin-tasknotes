@@ -1,35 +1,84 @@
-async function loadAPIEndpoints(container: HTMLElement, apiPort = 8080): Promise<void> {
+import { displayError } from "../i18n/runtime";
+import { uiText } from "../i18n/runtime";
+import { msg } from "@lingui/core/macro";
+import { requestUrl, type RequestUrlParam } from "obsidian";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Api/LoadAPIEndpoints" });
+
+type OpenAPIOperationSummary = {
+	tags?: string[];
+	summary?: string;
+	description?: string;
+};
+
+type OpenAPISpecSummary = {
+	paths?: Record<string, Record<string, OpenAPIOperationSummary>>;
+};
+
+type EndpointSummary = {
+	method: string;
+	path: string;
+	summary: string;
+};
+
+type LoadAPIEndpointsOptions = {
+	apiAuthToken?: string;
+};
+
+function getErrorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+function buildAPIEndpointsDocsRequest(
+	apiPort = 8080,
+	options: LoadAPIEndpointsOptions = {}
+): RequestUrlParam {
+	const request: RequestUrlParam = {
+		url: `http://localhost:${apiPort}/api/docs`,
+		throw: false,
+	};
+	const token = options.apiAuthToken?.trim();
+
+	if (token) {
+		request.headers = {
+			Authorization: `Bearer ${token}`,
+		};
+	}
+
+	return request;
+}
+
+async function loadAPIEndpoints(
+	container: HTMLElement,
+	apiPort = 8080,
+	options: LoadAPIEndpointsOptions = {}
+): Promise<void> {
 	// Show loading message first
 	const loadingEl = container.createEl("p", {
-		text: "Loading API endpoints...",
+		text: uiText(msg({ message: "Loading API endpoints...", context: "api/loadAPIEndpoints: loadAPIEndpoints text" })),
 		attr: { style: "color: var(--text-muted); font-style: italic; margin: 16px 0;" },
 	});
 
 	try {
-		// eslint-disable-next-line no-console
-		console.log(`Fetching API documentation from http://localhost:${apiPort}/api/docs`);
-		const response = await fetch(`http://localhost:${apiPort}/api/docs`);
-		// eslint-disable-next-line no-console
-		console.log("API docs response:", response.status, response.statusText);
+		const response = await requestUrl(buildAPIEndpointsDocsRequest(apiPort, options));
 
-		if (!response.ok) {
-			throw new Error(`API unavailable (${response.status}: ${response.statusText})`);
+		if (response.status < 200 || response.status >= 300) {
+			throw new Error(`API unavailable (${response.status})`);
 		}
 
-		const openApiSpec = await response.json();
-		// eslint-disable-next-line no-console
-		console.log("OpenAPI spec loaded:", openApiSpec);
+		const openApiSpec = response.json as OpenAPISpecSummary;
 
 		// Remove loading message
 		loadingEl.remove();
 
 		// Group endpoints by tags/categories
-		const endpointsByTag: { [tag: string]: any[] } = {};
+		const endpointsByTag: Record<string, EndpointSummary[]> = {};
 
 		if (openApiSpec.paths) {
 			for (const [path, methods] of Object.entries(openApiSpec.paths)) {
-				for (const [method, operation] of Object.entries(methods as any)) {
-					const tags = (operation as any).tags || ["General"];
+				for (const [method, operation] of Object.entries(methods)) {
+					const tags = operation.tags || [uiText(msg({ message: "General", context: "api/loadAPIEndpoints: loadAPIEndpoints display" }))];
 					const tag = tags[0];
 
 					if (!endpointsByTag[tag]) {
@@ -39,10 +88,7 @@ async function loadAPIEndpoints(container: HTMLElement, apiPort = 8080): Promise
 					endpointsByTag[tag].push({
 						method: method.toUpperCase(),
 						path,
-						summary:
-							(operation as any).summary ||
-							(operation as any).description ||
-							"No description",
+						summary: operation.summary || operation.description || uiText(msg({ message: "No description", context: "api/loadAPIEndpoints: loadAPIEndpoints summary" })),
 					});
 				}
 			}
@@ -66,22 +112,26 @@ async function loadAPIEndpoints(container: HTMLElement, apiPort = 8080): Promise
 			});
 		} else {
 			container.createEl("p", {
-				text: "No API endpoints found in specification.",
+				text: uiText(msg({ message: "No API endpoints found in specification.", context: "api/loadAPIEndpoints: loadAPIEndpoints text" })),
 				attr: { style: "color: var(--text-muted); margin: 16px 0;" },
 			});
 		}
-	} catch (error: any) {
-		console.error("Error loading API endpoints:", error);
+	} catch (error: unknown) {
+		tasknotesLogger.error("Error loading API endpoints:", {
+			category: "provider",
+			operation: "loading-api-endpoints",
+			error: error,
+		});
 
 		// Remove loading message
 		loadingEl.remove();
 
 		// Show error message with more details
 		container.createEl("p", {
-			text: `API server not accessible (${error.message}). Ensure the TaskNotes API server is running on port ${apiPort}.`,
+			text: uiText(msg({ message: "API server not accessible ({message}). Ensure the TaskNotes API server is running on port {apiPort, number}.", context: "api/loadAPIEndpoints: loadAPIEndpoints text" }), { message: displayError(getErrorMessage(error)), apiPort: apiPort }),
 			attr: { style: "color: var(--text-muted); font-style: italic; margin: 16px 0;" },
 		});
 	}
 }
 
-export { loadAPIEndpoints };
+export { buildAPIEndpointsDocsRequest, loadAPIEndpoints };

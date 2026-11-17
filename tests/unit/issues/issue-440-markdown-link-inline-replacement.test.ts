@@ -187,7 +187,29 @@ describe('Issue #440: Markdown link inline replacement', () => {
                 mockTask,
                 mockPlugin,
                 expect.stringContaining('Buy groceries task'),
-                'Buy groceries task'
+                'Buy groceries task',
+                undefined,
+                undefined
+            );
+        });
+
+        it('should use the task title when markdown link text is the generated filename', () => {
+            const docText = 'Duplicate of [task-202508181001](../../../GTD/tasks/task-202508181001.md).';
+            const state = EditorState.create({
+                doc: docText,
+                selection: EditorSelection.single(0)
+            });
+
+            const decorations = buildTaskLinkDecorations(state, mockPlugin, activeWidgets);
+
+            expect(decorations.size).toBeGreaterThan(0);
+            expect(MockTaskLinkWidget).toHaveBeenCalledWith(
+                mockTask,
+                mockPlugin,
+                expect.stringContaining('task-202508181001'),
+                undefined,
+                undefined,
+                undefined
             );
         });
 

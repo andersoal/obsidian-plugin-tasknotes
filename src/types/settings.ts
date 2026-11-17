@@ -79,6 +79,8 @@ export interface NLPTriggersConfig {
 	triggers: PropertyTriggerConfig[];
 }
 
+export type HideIdentifyingTagsMode = "all" | "exact-only";
+
 export interface ProjectAutosuggestSettings {
 	enableFuzzy: boolean;
 	rows: string[]; // up to 3 rows; each uses {property|flags} format
@@ -96,6 +98,7 @@ export interface TaskNotesSettings {
 	taskTag: string; // The tag that identifies tasks
 	taskIdentificationMethod: "tag" | "property"; // Method to identify tasks
 	hideIdentifyingTagsInCards: boolean; // Hide identifying tags in task card displays
+	hideIdentifyingTagsMode: HideIdentifyingTagsMode; // Whether hidden identifying tags include nested tags
 	taskPropertyName: string; // Property name for property-based identification
 	taskPropertyValue: string; // Property value for property-based identification
 	excludedFolders: string; // Comma-separated list of folders to exclude from Notes tab
@@ -103,11 +106,14 @@ export interface TaskNotesSettings {
 	defaultTaskStatus: string; // Changed to string to support custom statuses
 	taskOrgFiltersCollapsed: boolean; // Save collapse state of task organization filters
 	// Task filename settings
-	taskFilenameFormat: "title" | "zettel" | "timestamp" | "custom";
+	taskFilenameFormat: "title" | "zettel" | "timestamp" | "uuid" | "custom";
 	storeTitleInFilename: boolean;
 	customFilenameTemplate: string; // Template for custom format
+	occurrenceFilenameTemplate: string; // Template for materialized occurrence filenames ("" = legacy dedup suffix)
+	occurrenceFilenameTemplateProperty: string; // Frontmatter property on the parent that overrides the template
 	// Task creation defaults
 	taskCreationDefaults: TaskCreationDefaults;
+	openTaskAfterCreation: "none" | "same-tab" | "new-tab";
 	// Calendar view settings
 	calendarViewSettings: CalendarViewSettings;
 	// Pomodoro settings
@@ -122,13 +128,17 @@ export interface TaskNotesSettings {
 	pomodoroSoundVolume: number; // 0-100
 	pomodoroStorageLocation: "plugin" | "daily-notes"; // where to store pomodoro history data
 	pomodoroMobileSidebar: "tab" | "left" | "right"; // where to open pomodoro view on mobile
+	showPomodoroInStatusBar: boolean;
 	// Editor settings
 	enableTaskLinkOverlay: boolean;
 	disableOverlayOnAlias: boolean;
 	enableInstantTaskConvert: boolean;
 	useDefaultsOnInstantConvert: boolean;
+	preserveCheckboxOnConvert: boolean;
+	taskModalTabMovesFocus: boolean;
 	enableNaturalLanguageInput: boolean;
 	nlpDefaultToScheduled: boolean;
+	nlpEnterToSubmit: boolean; // Enter saves from the NLP input; Shift+Enter inserts a newline
 	nlpLanguage: string; // Language code for natural language processing (e.g., 'en', 'es', 'fr')
 	uiLanguage: string; // 'system' or supported locale code for UI translations
 
@@ -158,6 +168,10 @@ export interface TaskNotesSettings {
 	// Release notes tracking
 	lastSeenVersion?: string;
 	showReleaseNotesOnUpdate?: boolean;
+	checkForUpdatesOnStartup?: boolean;
+	lastNotifiedReleaseVersion?: string;
+	// Starter note onboarding
+	starterNoteCreated?: boolean;
 	// Status bar settings
 	showTrackedTasksInStatusBar: boolean;
 	// Time tracking settings
@@ -169,10 +183,15 @@ export interface TaskNotesSettings {
 	relationshipsPosition: "top" | "bottom";
 	// Task card in note settings
 	showTaskCardInNote: boolean;
+	showCompletedTaskStrikethrough: boolean;
 	// Task card expandable subtasks settings
 	showExpandableSubtasks: boolean;
+	// Expand project subtasks by default when task cards render
+	expandSubtasksByDefault: boolean;
 	// Subtask chevron position in task cards
 	subtaskChevronPosition: "left" | "right";
+	// Nest the complete/skip context-menu actions under a submenu (vs. flat menu items)
+	completionMenuAsSubmenu: boolean;
 	// Filter toolbar layout
 	viewsButtonAlignment: "left" | "right";
 	// Overdue behavior settings
@@ -184,6 +203,8 @@ export interface TaskNotesSettings {
 	// Notification settings
 	enableNotifications: boolean;
 	notificationType: "in-app" | "system";
+	notificationSoundEnabled: boolean;
+	notificationSoundVolume: number; // 0-100
 	// HTTP API settings
 	enableAPI: boolean;
 	apiPort: number;
@@ -209,26 +230,26 @@ export interface TaskNotesSettings {
 	autoCreateDefaultBasesFiles: boolean; // Auto-create missing default Base files on startup
 	// Command-to-file mappings for view commands (v4)
 	commandFileMapping: {
-		'open-calendar-view': string;
-		'open-kanban-view': string;
-		'open-tasks-view': string;
-		'open-advanced-calendar-view': string;
-		'open-agenda-view': string;
-		'relationships': string; // Bases file for unified relationships widget
+		"open-calendar-view": string;
+		"open-kanban-view": string;
+		"open-tasks-view": string;
+		"open-advanced-calendar-view": string;
+		"open-agenda-view": string;
+		"pomodoro-stats-base": string;
+		relationships: string; // Bases file for unified relationships widget
 		[key: string]: string; // Allow string indexing
 	};
 	// Recurring task behavior
 	maintainDueDateOffsetInRecurring: boolean;
 	resetCheckboxesOnRecurrence: boolean; // Reset markdown checkboxes in task body when recurring task completes
+	resetRecurringStatusAfterOccurrence: boolean; // Move a series to the first completed status's Next status after each occurrence
 	// Frontmatter link format settings
 	useFrontmatterMarkdownLinks: boolean; // Use markdown links in frontmatter (requires obsidian-frontmatter-markdown-links plugin)
 	// OAuth Calendar Integration settings
-	googleOAuthClientId: string;
-	googleOAuthClientSecret: string;
-	microsoftOAuthClientId: string;
-	microsoftOAuthClientSecret: string;
+	// OAuth client credentials and account tokens are stored in Obsidian SecretStorage.
 	enableGoogleCalendar: boolean;
 	enableMicrosoftCalendar: boolean;
+	disableCalendarOnMobile: boolean;
 	// Google Calendar selection
 	enabledGoogleCalendars: string[]; // Array of calendar IDs that should be displayed
 	// Google Calendar sync tokens (for incremental sync)
@@ -257,20 +278,29 @@ export interface DefaultReminder {
 	description?: string;
 }
 
+export type DefaultTaskTime = "none" | `${number}${number}:${number}${number}`;
+
 export interface TaskCreationDefaults {
 	// Pre-fill options
 	defaultContexts: string; // Comma-separated list
 	defaultTags: string; // Comma-separated list
 	defaultProjects: string; // Comma-separated list of project links
-	useParentNoteAsProject: boolean; // Use the parent note as a project during instant conversion
+	useParentNoteForTaskCreation: boolean; // Use the active note as a project for normal task creation
+	useParentNoteAsProject: boolean; // Use the parent note as a project during inline creation and instant conversion
+	useParentHeaderAsProject: boolean; // Use the closest markdown heading as a project during instant conversion
+	inheritParentTaskProperties: boolean; // Copy parent task projects, contexts, priority, and tags when creating subtasks
 	defaultTimeEstimate: number; // minutes, 0 = no default
 	defaultRecurrence: "none" | "daily" | "weekly" | "monthly" | "yearly";
 	// Date defaults
 	defaultDueDate: "none" | "today" | "tomorrow" | "next-week";
+	defaultDueTime: DefaultTaskTime;
 	defaultScheduledDate: "none" | "today" | "tomorrow" | "next-week";
+	defaultScheduledTime: DefaultTaskTime;
 	// Body template settings
 	bodyTemplate: string; // Path to template file for task body, empty = no template
 	useBodyTemplate: boolean; // Whether to use body template by default
+	occurrenceBodyTemplate: string; // Fallback template file for materialized occurrence notes
+	useOccurrenceBodyTemplate: boolean; // Whether to use occurrenceBodyTemplate when the parent has no occurrence_template
 	// Reminder defaults
 	defaultReminders: DefaultReminder[];
 }
@@ -288,8 +318,13 @@ export interface ICSIntegrationSettings {
 	autoExportPath: string; // Path where the ICS file should be saved
 	autoExportInterval: number; // Export interval in minutes (default: 60)
 	useDurationForExport: boolean; // Whether to use timeEstimate (duration) instead of due date for DTEND
+	excludeArchivedFromExport: boolean; // Whether to exclude archived tasks from ICS exports
+	excludeCompletedFromExport: boolean; // Whether to exclude completed tasks from ICS exports
+	requireDueDateForExport: boolean; // Whether to export only tasks with due dates
+	requireScheduledDateForExport: boolean; // Whether to export only tasks with scheduled dates
 	// Task creation from ICS events
 	useICSEndAsDue: boolean; // Whether to use ICS event end time as task due date
+	recurringEventRelatedNotesMode: "series" | "instance"; // How linked notes behave for recurring external calendar events
 }
 
 /**
@@ -307,9 +342,13 @@ export interface GoogleCalendarExportSettings {
 	eventColorId: string | null; // Optional: Google Calendar color ID for TaskNotes events (null = calendar default)
 	syncTrigger: "scheduled" | "due" | "both"; // Which date triggers event creation
 	createAsAllDay: boolean; // Create as all-day events vs timed
+	showAllDayAsFree: boolean; // All-day task exports do not block Google Calendar availability
 	defaultEventDuration: number; // Duration in minutes if timed (uses timeEstimate if available)
 	includeObsidianLink: boolean; // Include obsidian:// link in event description
-	defaultReminderMinutes: number | null; // Popup reminder X minutes before event (null = no reminder)
+	defaultReminderMinutes: number | number[] | null; // Popup reminder(s) X minutes before event (null = no reminder)
+	syncTimeblocks: boolean; // Sync daily-note timeblocks to Google Calendar (independent of task export)
+	timeblockTargetCalendarId: string; // Calendar for timeblock events (empty = same as targetCalendarId)
+	timeblockEventTitleTemplate: string; // Template for timeblock event titles
 }
 
 export type TimeblockAttachmentSearchOrder =
@@ -334,6 +373,7 @@ export interface CalendarViewSettings {
 	customDayCount: number; // Number of days to show in custom view (2-10)
 	// Time settings
 	slotDuration: "00:15:00" | "00:30:00" | "01:00:00"; // 15, 30, or 60 minutes
+	slotHeight: number; // Height of one time slot in pixels (time grid)
 	slotMinTime: string; // Start time (HH:MM:SS format)
 	slotMaxTime: string; // End time (HH:MM:SS format)
 	scrollTime: string; // Initial scroll position (HH:MM:SS format)

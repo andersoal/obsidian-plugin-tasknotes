@@ -35,6 +35,43 @@
     color: var(--text-normal);
 }
 
+.tasknotes-pomodoro-status .tasknotes-status-icon {
+    color: var(--interactive-accent);
+}
+
+.tasknotes-pomodoro-status .tasknotes-status-text {
+    max-width: 160px;
+}
+
+.tasknotes-status-bar .tasknotes-status-stop {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    min-width: 24px;
+    padding: 4px;
+    border: none;
+    background: transparent;
+    box-shadow: none;
+    color: var(--text-muted);
+}
+
+.tasknotes-status-bar .tasknotes-status-stop:hover:not(:disabled) {
+    background: var(--background-modifier-hover);
+    color: var(--text-normal);
+}
+
+.tasknotes-status-bar .tasknotes-status-stop:focus-visible {
+    outline: 2px solid var(--interactive-accent);
+    outline-offset: 2px;
+}
+
+.tasknotes-status-bar .tasknotes-status-stop:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
 /* Responsive behavior for smaller screens */
 @media (max-width: 768px) {
     .tasknotes-status-text {

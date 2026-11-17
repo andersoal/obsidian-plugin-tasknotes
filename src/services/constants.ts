@@ -26,14 +26,17 @@ export const GOOGLE_CALENDAR_CONSTANTS = {
 
 	/** Calendar view time range */
 	VIEW_RANGE: {
-		/** Days to look back from today */
-		DAYS_BEFORE: 30,
+		/** Days to look back from today during a fresh sync */
+		DAYS_BEFORE: 180,
 		/** Days to look ahead from today */
 		DAYS_AFTER: 90,
 	},
 
 	/** Default duration for newly created timed events (1 hour in milliseconds) */
 	DEFAULT_EVENT_DURATION_MS: 60 * 60 * 1000,
+
+	/** Maximum reminder offset accepted by Google Calendar (4 weeks in minutes) */
+	MAX_REMINDER_MINUTES: 40320,
 
 	/** API rate limiting and retry configuration */
 	RATE_LIMIT: {

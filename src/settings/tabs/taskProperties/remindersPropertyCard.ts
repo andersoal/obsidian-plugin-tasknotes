@@ -1,6 +1,11 @@
+import { reminderDescriptionLabel } from "../../../i18n/dataSeedLabels";
+import { uiData } from "../../../i18n/dataText";
+import { uiText } from "../../../i18n/runtime";
+import { uiNumber } from "../../../i18n/formatters";
+import { msg } from "@lingui/core/macro";
+import { setIcon } from "obsidian";
 import TaskNotesPlugin from "../../../main";
 import { DefaultReminder } from "../../../types/settings";
-import type { TranslationKey } from "../../../i18n";
 import {
 	createCard,
 	createCardInput,
@@ -9,6 +14,8 @@ import {
 	createCardNumberInput,
 	createCardSelect,
 	CardRow,
+	setCardPrimaryText,
+	setCardSecondaryText,
 } from "../../components/CardComponent";
 import { createPropertyDescription, TranslateFn } from "./helpers";
 
@@ -23,7 +30,7 @@ export function renderRemindersPropertyCard(
 ): void {
 	const propertyKeyInput = createCardInput(
 		"text",
-		"reminders",
+		uiData("reminders", "Editable frontmatter property identifier or filename-template syntax, not a display label"),
 		plugin.settings.fieldMapping.reminders
 	);
 
@@ -33,18 +40,27 @@ export function renderRemindersPropertyCard(
 	});
 
 	// Create nested content for default reminders
-	const nestedContainer = document.createElement("div");
+	const nestedContainer = activeWindow.createDiv();
 	nestedContainer.addClass("tasknotes-settings__nested-cards");
 
 	// Create collapsible section for default reminders
 	const remindersSection = nestedContainer.createDiv("tasknotes-settings__collapsible-section");
 
-	const remindersHeader = remindersSection.createDiv("tasknotes-settings__collapsible-section-header");
-	remindersHeader.createSpan({ text: translate("settings.taskProperties.remindersCard.defaultReminders"), cls: "tasknotes-settings__collapsible-section-title" });
+	const remindersHeader = remindersSection.createDiv(
+		"tasknotes-settings__collapsible-section-header"
+	);
+	remindersHeader.createSpan({
+		text: translate(
+			msg({ message: "Default reminders", context: "settings.taskProperties.remindersCard.defaultReminders" })
+		),
+		cls: "tasknotes-settings__collapsible-section-title",
+	});
 	const chevron = remindersHeader.createSpan("tasknotes-settings__collapsible-section-chevron");
-	chevron.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>`;
+	setIcon(chevron, "chevron-down");
 
-	const remindersContent = remindersSection.createDiv("tasknotes-settings__collapsible-section-content");
+	const remindersContent = remindersSection.createDiv(
+		"tasknotes-settings__collapsible-section-content"
+	);
 
 	// Render reminder cards
 	const remindersListContainer = remindersContent.createDiv("tasknotes-reminders-container");
@@ -52,10 +68,24 @@ export function renderRemindersPropertyCard(
 
 	// Add reminder button
 	const addReminderButton = remindersContent.createEl("button", {
-		text: translate("settings.defaults.reminders.addReminder.buttonText"),
+		text: translate(
+			msg({ message: "Add reminder", context: "settings.defaults.reminders.addReminder.buttonText" })
+		),
 		cls: "tn-btn tn-btn--ghost",
 	});
-	addReminderButton.style.marginTop = "0.5rem";
+	addReminderButton.classList.remove(
+		"tn-static-font-size-12px-b0cc7e05",
+		"tn-static-margin-top-0-d462248a",
+		"tn-static-margin-top-12px-91e0f558",
+		"tn-static-margin-top-16px-1b0f4999",
+		"tn-static-margin-top-1rem-2239d6d5",
+		"tn-static-margin-top-20px-a26bda7d",
+		"tn-static-margin-top-30px-2fbbbcd4",
+		"tn-static-margin-top-4px-96ad6099",
+		"tn-static-margin-top-8px-8a77e5a3",
+		"tn-static-margin-top-8px-f4f01e68"
+	);
+	addReminderButton.classList.add("tn-static-margin-top-0-5rem-3dc98b5e");
 	addReminderButton.onclick = () => {
 		const newId = `reminder_${Date.now()}`;
 		const newReminder = {
@@ -65,7 +95,7 @@ export function renderRemindersPropertyCard(
 			offset: 1,
 			unit: "hours" as const,
 			direction: "before" as const,
-			description: "Reminder",
+			description: uiData("Reminder", "Persisted default reminder seed; translate only in the editor/notification"),
 		};
 		plugin.settings.taskCreationDefaults.defaultReminders =
 			plugin.settings.taskCreationDefaults.defaultReminders || [];
@@ -76,18 +106,27 @@ export function renderRemindersPropertyCard(
 
 	// Toggle collapse
 	remindersHeader.addEventListener("click", () => {
-		remindersSection.toggleClass("tasknotes-settings__collapsible-section--collapsed",
-			!remindersSection.hasClass("tasknotes-settings__collapsible-section--collapsed"));
+		remindersSection.toggleClass(
+			"tasknotes-settings__collapsible-section--collapsed",
+			!remindersSection.hasClass("tasknotes-settings__collapsible-section--collapsed")
+		);
 	});
 
 	// Create description element
 	const descriptionEl = createPropertyDescription(
-		translate("settings.taskProperties.properties.reminders.description")
+		translate(
+			msg({ message: "Notifications triggered before due or scheduled dates. Stored as a list of reminder objects with timing and optional description.", context: "settings.taskProperties.properties.reminders.description" })
+		)
 	);
 
 	const rows: CardRow[] = [
 		{ label: "", input: descriptionEl, fullWidth: true },
-		{ label: translate("settings.taskProperties.propertyCard.propertyKey"), input: propertyKeyInput },
+		{
+			label: translate(
+				msg({ message: "Property key:", context: "settings.taskProperties.propertyCard.propertyKey" })
+			),
+			input: propertyKeyInput,
+		},
 		{ label: "", input: nestedContainer, fullWidth: true },
 	];
 
@@ -96,7 +135,9 @@ export function renderRemindersPropertyCard(
 		collapsible: true,
 		defaultCollapsed: true,
 		header: {
-			primaryText: translate("settings.taskProperties.properties.reminders.name"),
+			primaryText: translate(
+				msg({ message: "Reminders", context: "settings.taskProperties.properties.reminders.name" })
+			),
 			secondaryText: plugin.settings.fieldMapping.reminders,
 		},
 		content: {
@@ -122,7 +163,9 @@ function renderRemindersList(
 	) {
 		showCardEmptyState(
 			container,
-			translate("settings.defaults.reminders.emptyState")
+			translate(
+				msg({ message: "No default reminders configured. Add a reminder to automatically notify you about new tasks.", context: "settings.defaults.reminders.emptyState" })
+			)
 		);
 		return;
 	}
@@ -132,19 +175,25 @@ function renderRemindersList(
 
 		const descInput = createCardInput(
 			"text",
-			translate("settings.defaults.reminders.reminderDescription"),
-			reminder.description
+			translate(
+				msg({ message: "Reminder description", context: "settings.defaults.reminders.reminderDescription" })
+			),
+			reminderDescriptionLabel(reminder.description)
 		);
 
 		const typeSelect = createCardSelect(
 			[
 				{
 					value: "relative",
-					label: translate("settings.defaults.reminders.types.relative"),
+					label: translate(
+						msg({ message: "Relative (before/after task dates)", context: "settings.defaults.reminders.types.relative" })
+					),
 				},
 				{
 					value: "absolute",
-					label: translate("settings.defaults.reminders.types.absolute"),
+					label: translate(
+						msg({ message: "Absolute (specific date/time)", context: "settings.defaults.reminders.types.absolute" })
+					),
 				},
 			],
 			reminder.type
@@ -153,15 +202,10 @@ function renderRemindersList(
 		const updateCallback = (updates: Partial<DefaultReminder>) => {
 			Object.assign(reminder, updates);
 			save();
-			const card = container.querySelector(`[data-card-id="${reminder.id}"]`);
-			if (card) {
-				const secondaryText = card.querySelector(
-					".tasknotes-settings__card-secondary-text"
-				);
-				if (secondaryText) {
-					secondaryText.textContent = formatReminderTiming(reminder, translate);
-				}
-			}
+			setCardSecondaryText(
+				container.querySelector(`[data-card-id="${reminder.id}"]`),
+				formatReminderTiming(reminder, translate)
+			);
 		};
 
 		const configRows =
@@ -176,14 +220,21 @@ function renderRemindersList(
 			header: {
 				primaryText:
 					reminder.description ||
-					translate("settings.defaults.reminders.unnamedReminder"),
+					translate(
+						msg({ message: "Unnamed reminder", context: "settings.defaults.reminders.unnamedReminder" })
+					),
 				secondaryText: timingText,
 				actions: [
-					createDeleteHeaderButton(() => {
-						plugin.settings.taskCreationDefaults.defaultReminders.splice(index, 1);
-						save();
-						renderRemindersList(container, plugin, save, translate);
-					}, translate("settings.defaults.reminders.deleteTooltip")),
+					createDeleteHeaderButton(
+						() => {
+							plugin.settings.taskCreationDefaults.defaultReminders.splice(index, 1);
+							save();
+							renderRemindersList(container, plugin, save, translate);
+						},
+						translate(
+							msg({ message: "Delete reminder", context: "settings.defaults.reminders.deleteTooltip" })
+						)
+					),
 				],
 			},
 			content: {
@@ -191,11 +242,15 @@ function renderRemindersList(
 					{
 						rows: [
 							{
-								label: translate("settings.defaults.reminders.fields.description"),
+								label: translate(
+									msg({ message: "Description:", context: "settings.defaults.reminders.fields.description" })
+								),
 								input: descInput,
 							},
 							{
-								label: translate("settings.defaults.reminders.fields.type"),
+								label: translate(
+									msg({ message: "Type:", context: "settings.defaults.reminders.fields.type" })
+								),
 								input: typeSelect,
 							},
 						],
@@ -210,12 +265,13 @@ function renderRemindersList(
 		descInput.addEventListener("input", () => {
 			reminder.description = descInput.value;
 			save();
-			const primaryText = card.querySelector(".tasknotes-settings__card-primary-text");
-			if (primaryText) {
-				primaryText.textContent =
-					reminder.description ||
-					translate("settings.defaults.reminders.unnamedReminder");
-			}
+			setCardPrimaryText(
+				card,
+				reminder.description ||
+					translate(
+						msg({ message: "Unnamed reminder", context: "settings.defaults.reminders.unnamedReminder" })
+					)
+			);
 		});
 
 		typeSelect.addEventListener("change", () => {
@@ -241,9 +297,24 @@ function renderRelativeReminderConfig(
 
 	const unitSelect = createCardSelect(
 		[
-			{ value: "minutes", label: translate("settings.defaults.reminders.units.minutes") },
-			{ value: "hours", label: translate("settings.defaults.reminders.units.hours") },
-			{ value: "days", label: translate("settings.defaults.reminders.units.days") },
+			{
+				value: "minutes",
+				label: translate(
+					msg({ message: "minutes", context: "settings.defaults.reminders.units.minutes" })
+				),
+			},
+			{
+				value: "hours",
+				label: translate(
+					msg({ message: "hours", context: "settings.defaults.reminders.units.hours" })
+				),
+			},
+			{
+				value: "days",
+				label: translate(
+					msg({ message: "days", context: "settings.defaults.reminders.units.days" })
+				),
+			},
 		],
 		reminder.unit
 	);
@@ -253,8 +324,18 @@ function renderRelativeReminderConfig(
 
 	const directionSelect = createCardSelect(
 		[
-			{ value: "before", label: translate("settings.defaults.reminders.directions.before") },
-			{ value: "after", label: translate("settings.defaults.reminders.directions.after") },
+			{
+				value: "before",
+				label: translate(
+					msg({ message: "before", context: "settings.defaults.reminders.directions.before" })
+				),
+			},
+			{
+				value: "after",
+				label: translate(
+					msg({ message: "after", context: "settings.defaults.reminders.directions.after" })
+				),
+			},
 		],
 		reminder.direction
 	);
@@ -264,10 +345,17 @@ function renderRelativeReminderConfig(
 
 	const relatedToSelect = createCardSelect(
 		[
-			{ value: "due", label: translate("settings.defaults.reminders.relatedTo.due") },
+			{
+				value: "due",
+				label: translate(
+					msg({ message: "due date", context: "settings.defaults.reminders.relatedTo.due" })
+				),
+			},
 			{
 				value: "scheduled",
-				label: translate("settings.defaults.reminders.relatedTo.scheduled"),
+				label: translate(
+					msg({ message: "scheduled date", context: "settings.defaults.reminders.relatedTo.scheduled" })
+				),
 			},
 		],
 		reminder.relatedTo
@@ -277,14 +365,28 @@ function renderRelativeReminderConfig(
 	});
 
 	return [
-		{ label: translate("settings.defaults.reminders.fields.offset"), input: offsetInput },
-		{ label: translate("settings.defaults.reminders.fields.unit"), input: unitSelect },
 		{
-			label: translate("settings.defaults.reminders.fields.direction"),
+			label: translate(
+				msg({ message: "Offset:", context: "settings.defaults.reminders.fields.offset" })
+			),
+			input: offsetInput,
+		},
+		{
+			label: translate(
+				msg({ message: "Unit:", context: "settings.defaults.reminders.fields.unit" })
+			),
+			input: unitSelect,
+		},
+		{
+			label: translate(
+				msg({ message: "Direction:", context: "settings.defaults.reminders.fields.direction" })
+			),
 			input: directionSelect,
 		},
 		{
-			label: translate("settings.defaults.reminders.fields.relatedTo"),
+			label: translate(
+				msg({ message: "Related to:", context: "settings.defaults.reminders.fields.relatedTo" })
+			),
 			input: relatedToSelect,
 		},
 	];
@@ -309,32 +411,60 @@ function renderAbsoluteReminderConfig(
 	});
 
 	return [
-		{ label: translate("settings.defaults.reminders.fields.date"), input: dateInput },
-		{ label: translate("settings.defaults.reminders.fields.time"), input: timeInput },
+		{
+			label: translate(
+				msg({ message: "Date:", context: "settings.defaults.reminders.fields.date" })
+			),
+			input: dateInput,
+		},
+		{
+			label: translate(
+				msg({ message: "Time:", context: "settings.defaults.reminders.fields.time" })
+			),
+			input: timeInput,
+		},
 	];
 }
 
-function formatReminderTiming(
-	reminder: DefaultReminder,
-	translate: TranslateFn
-): string {
+function formatReminderTiming(reminder: DefaultReminder, translate: TranslateFn): string {
 	if (reminder.type === "relative") {
-		const direction =
-			reminder.direction === "before"
-				? translate("settings.defaults.reminders.directions.before")
-				: translate("settings.defaults.reminders.directions.after");
-		const unit = translate(
-			`settings.defaults.reminders.units.${reminder.unit || "hours"}` as TranslationKey
+		const unit =
+			reminder.unit === "minutes" ? "minute" : reminder.unit === "days" ? "day" : "hour";
+		const duration = uiNumber(reminder.offset ?? 1, {
+			style: "unit",
+			unit,
+			unitDisplay: "long",
+		});
+		return translate(
+			msg({
+				message:
+					"{relatedTo, select, due {{direction, select, before {{duration} before due date} after {{duration} after due date} other {{duration} before due date}}} scheduled {{direction, select, before {{duration} before scheduled date} after {{duration} after scheduled date} other {{duration} before scheduled date}}} other {{direction, select, before {{duration} before scheduled date} after {{duration} after scheduled date} other {{duration} before scheduled date}}}}",
+				context: "default reminder timing summary",
+			}),
+			{
+				duration,
+				relatedTo: reminder.relatedTo ?? "scheduled",
+				direction: reminder.direction ?? "before",
+			}
 		);
-		const offset = reminder.offset ?? 1;
-		const relatedTo =
-			reminder.relatedTo === "due"
-				? translate("settings.defaults.reminders.relatedTo.due")
-				: translate("settings.defaults.reminders.relatedTo.scheduled");
-		return `${offset} ${unit} ${direction} ${relatedTo}`;
 	} else {
-		const date = reminder.absoluteDate || translate("settings.defaults.reminders.fields.date");
-		const time = reminder.absoluteTime || translate("settings.defaults.reminders.fields.time");
-		return `${date} at ${time}`;
+		const date =
+			reminder.absoluteDate ||
+			translate(
+				msg({ message: "Date:", context: "settings.defaults.reminders.fields.date" })
+			);
+		const time =
+			reminder.absoluteTime ||
+			translate(
+				msg({ message: "Time:", context: "settings.defaults.reminders.fields.time" })
+			);
+		return uiText(
+			msg({
+				message: "{date} at {time}",
+				context:
+					"settings/tabs/taskProperties/remindersPropertyCard: formatReminderTiming display",
+			}),
+			{ date: date, time: time }
+		);
 	}
 }

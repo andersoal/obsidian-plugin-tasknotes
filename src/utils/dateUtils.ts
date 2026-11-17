@@ -1,3 +1,4 @@
+import { formatUIDate } from "../i18n/formatters";
 import {
 	format,
 	parseISO,
@@ -16,18 +17,19 @@ import {
 	endOfYear,
 	// subDays, subWeeks, subMonths, subYears - removed unused imports
 } from "date-fns";
+import { createTaskNotesLogger } from "./tasknotesLogger";
 
-/**
- * Smart date parsing that detects timezone info and handles appropriately
- * Supports various date formats including space-separated datetime and ISO week formats
- *
- * @deprecated Use parseDateToUTC for internal logic or parseDateToLocal for UI
- * This function will be renamed to parseDateToLocal to make its behavior explicit.
- */
-export function parseDate(dateString: string): Date {
+const tasknotesLogger = createTaskNotesLogger({ tag: "Utils/DateUtils" });
+
+function parseDateToLocalInternal(dateString: string): Date {
 	if (!dateString) {
 		const error = new Error("Date string cannot be empty");
-		console.error("Date parsing error:", { dateString, error: error.message });
+		tasknotesLogger.error("Date parsing error:", {
+			category: "validation",
+			operation: "date-parsing",
+			details: { dateString },
+			error: error.message,
+		});
 		throw error;
 	}
 
@@ -42,15 +44,16 @@ export function parseDate(dateString: string): Date {
 		if (dateWithDayNameMatch) {
 			// Extract just the date part and continue with normal parsing
 			const dateOnly = dateWithDayNameMatch[1];
-			return parseDate(dateOnly);
+			return parseDateToLocalInternal(dateOnly);
 		}
 
 		// Handle incomplete time format (e.g., "T00:00" without date)
 		if (trimmed.startsWith("T") && /^T\d{2}:\d{2}(:\d{2})?/.test(trimmed)) {
 			const error = new Error(`Invalid date format - time without date: ${dateString}`);
-			console.warn("Date parsing error - incomplete time format:", {
-				original: dateString,
-				trimmed,
+			tasknotesLogger.warn("Date parsing error - incomplete time format:", {
+				category: "validation",
+				operation: "date-parsing-incomplete-time-format",
+				details: { original: dateString, trimmed },
 				error: error.message,
 			});
 			throw error;
@@ -64,12 +67,10 @@ export function parseDate(dateString: string): Date {
 
 			if (isNaN(yearNum) || isNaN(weekNum)) {
 				const error = new Error(`Invalid numeric values in ISO week format: ${dateString}`);
-				console.warn("Date parsing error - invalid ISO week numbers:", {
-					original: dateString,
-					year,
-					week,
-					yearNum,
-					weekNum,
+				tasknotesLogger.warn("Date parsing error - invalid ISO week numbers:", {
+					category: "validation",
+					operation: "date-parsing-invalid-iso-week-numbers",
+					details: { original: dateString, year, week, yearNum, weekNum },
 				});
 				throw error;
 			}
@@ -78,9 +79,10 @@ export function parseDate(dateString: string): Date {
 				const error = new Error(
 					`Invalid week number in ISO week format: ${dateString} (week must be 1-53)`
 				);
-				console.warn("Date parsing error - week number out of range:", {
-					original: dateString,
-					weekNum,
+				tasknotesLogger.warn("Date parsing error - week number out of range:", {
+					category: "validation",
+					operation: "date-parsing-week-number-out-of-range",
+					details: { original: dateString, weekNum },
 					error: error.message,
 				});
 				throw error;
@@ -100,12 +102,16 @@ export function parseDate(dateString: string): Date {
 				const error = new Error(
 					`Failed to calculate date from ISO week format: ${dateString}`
 				);
-				console.error("Date parsing error - ISO week calculation failed:", {
-					original: dateString,
-					yearNum,
-					weekNum,
-					jan4: jan4.toISOString(),
-					targetWeekMonday: targetWeekMonday.toString(),
+				tasknotesLogger.error("Date parsing error - ISO week calculation failed:", {
+					category: "validation",
+					operation: "date-parsing-iso-week-calculation",
+					details: {
+						original: dateString,
+						yearNum,
+						weekNum,
+						jan4: jan4.toISOString(),
+						targetWeekMonday: targetWeekMonday.toString(),
+					},
 				});
 				throw error;
 			}
@@ -122,9 +128,10 @@ export function parseDate(dateString: string): Date {
 
 			if (!isValid(parsed)) {
 				const error = new Error(`Invalid space-separated datetime: ${dateString}`);
-				console.warn("Date parsing error - space-separated datetime invalid:", {
-					original: dateString,
-					converted: isoFormat,
+				tasknotesLogger.warn("Date parsing error - space-separated datetime invalid:", {
+					category: "validation",
+					operation: "date-parsing-space-separated-datetime-invalid",
+					details: { original: dateString, converted: isoFormat },
 					error: error.message,
 				});
 				throw error;
@@ -140,9 +147,10 @@ export function parseDate(dateString: string): Date {
 			const parsed = parseISO(trimmed);
 			if (!isValid(parsed)) {
 				const error = new Error(`Invalid timezone-aware date: ${dateString}`);
-				console.warn("Date parsing error - timezone-aware format invalid:", {
-					original: dateString,
-					trimmed,
+				tasknotesLogger.warn("Date parsing error - timezone-aware format invalid:", {
+					category: "validation",
+					operation: "date-parsing-timezone-aware-format-invalid",
+					details: { original: dateString, trimmed },
 					error: error.message,
 				});
 				throw error;
@@ -158,10 +166,10 @@ export function parseDate(dateString: string): Date {
 				const error = new Error(
 					`Invalid date-only string: ${dateString} (expected format: yyyy-MM-dd)`
 				);
-				console.warn("Date parsing error - date-only format invalid:", {
-					original: dateString,
-					trimmed,
-					expectedFormat: "yyyy-MM-dd",
+				tasknotesLogger.warn("Date parsing error - date-only format invalid:", {
+					category: "validation",
+					operation: "date-parsing-date-only-format-invalid",
+					details: { original: dateString, trimmed, expectedFormat: "yyyy-MM-dd" },
 					error: error.message,
 				});
 				throw error;
@@ -177,11 +185,10 @@ export function parseDate(dateString: string): Date {
 				parsed.getDate() !== parseInt(day, 10)
 			) {
 				const error = new Error(`Invalid date values: ${dateString}`);
-				console.warn("Date parsing error - invalid date values:", {
-					original: dateString,
-					year,
-					month,
-					day,
+				tasknotesLogger.warn("Date parsing error - invalid date values:", {
+					category: "validation",
+					operation: "date-parsing-invalid-date-values",
+					details: { original: dateString, year, month, day },
 					error: error.message,
 				});
 				throw error;
@@ -200,11 +207,15 @@ export function parseDate(dateString: string): Date {
 		const wrappedError = new Error(
 			`Unexpected error parsing date "${dateString}": ${error instanceof Error ? error.message : String(error)}`
 		);
-		console.error("Unexpected date parsing error:", {
-			original: dateString,
-			trimmed,
+		tasknotesLogger.error("Unexpected date parsing error:", {
+			category: "validation",
+			operation: "unexpected-date-parsing",
+			details: {
+				original: dateString,
+				trimmed,
+				stack: error instanceof Error ? error.stack : undefined,
+			},
 			error: error instanceof Error ? error.message : String(error),
-			stack: error instanceof Error ? error.stack : undefined,
 		});
 		throw wrappedError;
 	}
@@ -224,7 +235,12 @@ export function parseDate(dateString: string): Date {
 export function parseDateToUTC(dateString: string): Date {
 	if (!dateString) {
 		const error = new Error("Date string cannot be empty");
-		console.error("Date parsing error:", { dateString, error: error.message });
+		tasknotesLogger.error("Date parsing error:", {
+			category: "validation",
+			operation: "date-parsing",
+			details: { dateString },
+			error: error.message,
+		});
 		throw error;
 	}
 
@@ -277,14 +293,18 @@ export function parseDateToUTC(dateString: string): Date {
 		// For datetime strings, ISO week format, or any other format,
 		// delegate to parseDateToLocal to handle the complexity
 		// This maintains backward compatibility for complex formats
-		return parseDateToLocal(trimmed);
+		return parseDateToLocalInternal(trimmed);
 	} catch (error) {
 		const wrappedError = new Error(`Failed to parse date to UTC: ${trimmed}`);
-		console.error("Date parsing error:", {
-			dateString,
-			trimmed,
+		tasknotesLogger.error("Date parsing error:", {
+			category: "validation",
+			operation: "date-parsing",
+			details: {
+				dateString,
+				trimmed,
+				stack: error instanceof Error ? error.stack : undefined,
+			},
 			error: error instanceof Error ? error.message : String(error),
-			stack: error instanceof Error ? error.stack : undefined,
 		});
 		throw wrappedError;
 	}
@@ -298,7 +318,19 @@ export function parseDateToUTC(dateString: string): Date {
  * Use this for UI display and user-facing date operations.
  * For internal logic, prefer parseDateToUTC.
  */
-export const parseDateToLocal = parseDate;
+export function parseDateToLocal(dateString: string): Date {
+	return parseDateToLocalInternal(dateString);
+}
+
+/**
+ * Smart date parsing that detects timezone info and handles appropriately
+ * Supports various date formats including space-separated datetime and ISO week formats
+ *
+ * @deprecated Use parseDateToUTC for internal logic or parseDateToLocal for UI.
+ */
+export function parseDate(dateString: string): Date {
+	return parseDateToLocalInternal(dateString);
+}
 
 /**
  * Safe date comparison that handles mixed timezone contexts
@@ -315,7 +347,12 @@ export function isSameDateSafe(date1: string, date2: string): boolean {
 		const d2 = parseDateToUTC(date2Part);
 		return d1.getTime() === d2.getTime();
 	} catch (error) {
-		console.error("Error comparing dates:", { date1, date2, error });
+		tasknotesLogger.error("Error comparing dates:", {
+			category: "validation",
+			operation: "comparing-dates",
+			details: { date1, date2 },
+			error: error,
+		});
 		return false;
 	}
 }
@@ -333,7 +370,12 @@ export function isBeforeDateSafe(date1: string, date2: string): boolean {
 		const d2 = parseDateToUTC(date2Part);
 		return d1.getTime() < d2.getTime();
 	} catch (error) {
-		console.error("Error comparing dates for before:", { date1, date2, error });
+		tasknotesLogger.error("Error comparing dates for before:", {
+			category: "validation",
+			operation: "comparing-dates",
+			details: { date1, date2 },
+			error: error,
+		});
 		return false;
 	}
 }
@@ -384,8 +426,8 @@ export function parseDateAsLocal(dateString: string): Date {
 		return parsed;
 	}
 
-	// For datetime strings, use the existing parseDate logic
-	return parseDate(dateString);
+	// For datetime strings, use the shared local-date parser
+	return parseDateToLocalInternal(dateString);
 }
 
 /**
@@ -418,7 +460,12 @@ export function normalizeDateString(dateString: string): string {
 		}
 		return dateString;
 	} catch (error) {
-		console.error("Error normalizing date string:", { dateString, error });
+		tasknotesLogger.error("Error normalizing date string:", {
+			category: "validation",
+			operation: "normalizing-date-string",
+			details: { dateString },
+			error: error,
+		});
 		return dateString; // Return original if parsing fails
 	}
 }
@@ -461,9 +508,9 @@ export function validateDateInput(dateValue: string): boolean {
 	}
 
 	try {
-		parseDate(dateValue);
+		parseDateToLocalInternal(dateValue);
 		return true;
-	} catch (error) {
+	} catch {
 		return false;
 	}
 }
@@ -473,11 +520,16 @@ export function validateDateInput(dateValue: string): boolean {
  */
 export function addDaysToDateString(dateString: string, days: number): string {
 	try {
-		const parsed = parseDate(dateString);
+		const parsed = parseDateToLocalInternal(dateString);
 		const result = addDaysFns(parsed, days);
 		return format(result, "yyyy-MM-dd");
 	} catch (error) {
-		console.error("Error adding days to date string:", { dateString, days, error });
+		tasknotesLogger.error("Error adding days to date string:", {
+			category: "validation",
+			operation: "adding-days-date-string",
+			details: { dateString, days },
+			error: error,
+		});
 		throw error;
 	}
 }
@@ -487,11 +539,16 @@ export function addDaysToDateString(dateString: string, days: number): string {
  */
 export function addWeeksToDateString(dateString: string, weeks: number): string {
 	try {
-		const parsed = parseDate(dateString);
+		const parsed = parseDateToLocalInternal(dateString);
 		const result = addWeeks(parsed, weeks);
 		return format(result, "yyyy-MM-dd");
 	} catch (error) {
-		console.error("Error adding weeks to date string:", { dateString, weeks, error });
+		tasknotesLogger.error("Error adding weeks to date string:", {
+			category: "validation",
+			operation: "adding-weeks-date-string",
+			details: { dateString, weeks },
+			error: error,
+		});
 		throw error;
 	}
 }
@@ -501,11 +558,16 @@ export function addWeeksToDateString(dateString: string, weeks: number): string 
  */
 export function addMonthsToDateString(dateString: string, months: number): string {
 	try {
-		const parsed = parseDate(dateString);
+		const parsed = parseDateToLocalInternal(dateString);
 		const result = addMonths(parsed, months);
 		return format(result, "yyyy-MM-dd");
 	} catch (error) {
-		console.error("Error adding months to date string:", { dateString, months, error });
+		tasknotesLogger.error("Error adding months to date string:", {
+			category: "validation",
+			operation: "adding-months-date-string",
+			details: { dateString, months },
+			error: error,
+		});
 		throw error;
 	}
 }
@@ -515,11 +577,16 @@ export function addMonthsToDateString(dateString: string, months: number): strin
  */
 export function addYearsToDateString(dateString: string, years: number): string {
 	try {
-		const parsed = parseDate(dateString);
+		const parsed = parseDateToLocalInternal(dateString);
 		const result = addYears(parsed, years);
 		return format(result, "yyyy-MM-dd");
 	} catch (error) {
-		console.error("Error adding years to date string:", { dateString, years, error });
+		tasknotesLogger.error("Error adding years to date string:", {
+			category: "validation",
+			operation: "adding-years-date-string",
+			details: { dateString, years },
+			error: error,
+		});
 		throw error;
 	}
 }
@@ -532,7 +599,11 @@ export function getStartOfWeekString(weekStartsOn: 0 | 1 | 2 | 3 | 4 | 5 | 6 = 1
 		const result = startOfWeek(new Date(), { weekStartsOn });
 		return format(result, "yyyy-MM-dd");
 	} catch (error) {
-		console.error("Error getting start of week:", { error });
+		tasknotesLogger.error("Error getting start of week:", {
+			category: "validation",
+			operation: "getting-start-of-week",
+			error: error,
+		});
 		throw error;
 	}
 }
@@ -545,7 +616,11 @@ export function getEndOfWeekString(weekStartsOn: 0 | 1 | 2 | 3 | 4 | 5 | 6 = 1):
 		const result = endOfWeek(new Date(), { weekStartsOn });
 		return format(result, "yyyy-MM-dd");
 	} catch (error) {
-		console.error("Error getting end of week:", { error });
+		tasknotesLogger.error("Error getting end of week:", {
+			category: "validation",
+			operation: "getting-end-of-week",
+			error: error,
+		});
 		throw error;
 	}
 }
@@ -558,7 +633,11 @@ export function getStartOfMonthString(): string {
 		const result = startOfMonth(new Date());
 		return format(result, "yyyy-MM-dd");
 	} catch (error) {
-		console.error("Error getting start of month:", { error });
+		tasknotesLogger.error("Error getting start of month:", {
+			category: "validation",
+			operation: "getting-start-of-month",
+			error: error,
+		});
 		throw error;
 	}
 }
@@ -571,7 +650,11 @@ export function getEndOfMonthString(): string {
 		const result = endOfMonth(new Date());
 		return format(result, "yyyy-MM-dd");
 	} catch (error) {
-		console.error("Error getting end of month:", { error });
+		tasknotesLogger.error("Error getting end of month:", {
+			category: "validation",
+			operation: "getting-end-of-month",
+			error: error,
+		});
 		throw error;
 	}
 }
@@ -584,7 +667,11 @@ export function getStartOfYearString(): string {
 		const result = startOfYear(new Date());
 		return format(result, "yyyy-MM-dd");
 	} catch (error) {
-		console.error("Error getting start of year:", { error });
+		tasknotesLogger.error("Error getting start of year:", {
+			category: "validation",
+			operation: "getting-start-of-year",
+			error: error,
+		});
 		throw error;
 	}
 }
@@ -597,7 +684,11 @@ export function getEndOfYearString(): string {
 		const result = endOfYear(new Date());
 		return format(result, "yyyy-MM-dd");
 	} catch (error) {
-		console.error("Error getting end of year:", { error });
+		tasknotesLogger.error("Error getting end of year:", {
+			category: "validation",
+			operation: "getting-end-of-year",
+			error: error,
+		});
 		throw error;
 	}
 }
@@ -611,7 +702,12 @@ export function startOfDayForDateString(dateString: string): Date {
 		const parsed = parseDateToUTC(dateString);
 		return parsed; // parseDateToUTC already returns midnight UTC for date-only strings
 	} catch (error) {
-		console.error("Error getting start of day for date string:", { dateString, error });
+		tasknotesLogger.error("Error getting start of day for date string:", {
+			category: "validation",
+			operation: "getting-start-of-day-date-string",
+			details: { dateString },
+			error: error,
+		});
 		throw error;
 	}
 }
@@ -626,7 +722,12 @@ export function isToday(dateString: string): boolean {
 		const today = getTodayLocal();
 		return isSameDay(date, today);
 	} catch (error) {
-		console.error("Error checking if date is today:", { dateString, error });
+		tasknotesLogger.error("Error checking if date is today:", {
+			category: "validation",
+			operation: "checking-if-date-today",
+			details: { dateString },
+			error: error,
+		});
 		return false;
 	}
 }
@@ -643,10 +744,15 @@ export function isPastDate(dateString: string): boolean {
  */
 export function formatDateForDisplay(dateString: string, formatString = "MMM d, yyyy"): string {
 	try {
-		const parsed = parseDate(dateString);
-		return format(parsed, formatString);
+		const parsed = parseDateToLocalInternal(dateString);
+		return formatUIDate(parsed, formatString);
 	} catch (error) {
-		console.error("Error formatting date for display:", { dateString, error });
+		tasknotesLogger.error("Error formatting date for display:", {
+			category: "validation",
+			operation: "formatting-date-display",
+			details: { dateString },
+			error: error,
+		});
 		return dateString; // Return original if formatting fails
 	}
 }
@@ -704,7 +810,12 @@ export function parseTimestamp(timestampString: string): Date {
 		}
 		return parsed;
 	} catch (error) {
-		console.error("Error parsing timestamp:", { timestampString, error });
+		tasknotesLogger.error("Error parsing timestamp:", {
+			category: "validation",
+			operation: "parsing-timestamp",
+			details: { timestampString },
+			error: error,
+		});
 		throw error;
 	}
 }
@@ -730,11 +841,16 @@ export function formatTimestampForDisplay(
 			// Use custom format if provided, otherwise use time format preference
 			const finalFormat =
 				formatString || (timeFormat === "12" ? "MMM d, yyyy h:mm a" : "MMM d, yyyy HH:mm");
-			return format(parsed, finalFormat);
+			return formatUIDate(parsed, finalFormat);
 		}
 		return timestampString;
 	} catch (error) {
-		console.error("Error formatting timestamp for display:", { timestampString, error });
+		tasknotesLogger.error("Error formatting timestamp for display:", {
+			category: "validation",
+			operation: "formatting-timestamp-display",
+			details: { timestampString },
+			error: error,
+		});
 		return timestampString; // Return original if formatting fails
 	}
 }
@@ -774,7 +890,12 @@ export function getDatePart(dateString: string): string {
 		const parsed = parseDateToUTC(dateString);
 		return formatDateForStorage(parsed);
 	} catch (error) {
-		console.error("Error extracting date part:", { dateString, error });
+		tasknotesLogger.error("Error extracting date part:", {
+			category: "validation",
+			operation: "extracting-date-part",
+			details: { dateString },
+			error: error,
+		});
 		return dateString;
 	}
 }
@@ -788,10 +909,15 @@ export function getTimePart(dateString: string): string | null {
 	}
 
 	try {
-		const parsed = parseDate(dateString);
+		const parsed = parseDateToLocalInternal(dateString);
 		return format(parsed, "HH:mm");
 	} catch (error) {
-		console.error("Error extracting time part:", { dateString, error });
+		tasknotesLogger.error("Error extracting time part:", {
+			category: "validation",
+			operation: "extracting-time-part",
+			details: { dateString },
+			error: error,
+		});
 		return null;
 	}
 }
@@ -804,11 +930,15 @@ export function getTimePart(dateString: string): string | null {
  */
 export function formatTime(date: Date, timeFormat: "12" | "24" = "24"): string {
 	if (!isValid(date)) {
-		console.warn("Invalid date provided to formatTime:", date);
+		tasknotesLogger.warn("Invalid date provided to formatTime:", {
+			category: "validation",
+			operation: "invalid-date-provided-formattime",
+			details: { value: date },
+		});
 		return "";
 	}
 
-	return format(date, timeFormat === "12" ? "h:mm a" : "HH:mm");
+	return formatUIDate(date, timeFormat === "12" ? "h:mm a" : "HH:mm");
 }
 
 /**
@@ -819,11 +949,15 @@ export function formatTime(date: Date, timeFormat: "12" | "24" = "24"): string {
  */
 export function formatDateTime(date: Date, timeFormat: "12" | "24" = "24"): string {
 	if (!isValid(date)) {
-		console.warn("Invalid date provided to formatDateTime:", date);
+		tasknotesLogger.warn("Invalid date provided to formatDateTime:", {
+			category: "validation",
+			operation: "invalid-date-provided-formatdatetime",
+			details: { value: date },
+		});
 		return "";
 	}
 
-	return format(date, timeFormat === "12" ? "MMM d, yyyy h:mm a" : "MMM d, yyyy HH:mm");
+	return formatUIDate(date, timeFormat === "12" ? "MMM d, yyyy h:mm a" : "MMM d, yyyy HH:mm");
 }
 
 /**
@@ -841,7 +975,12 @@ export function formatDateStringTime(dateString: string, timeFormat: "12" | "24"
 		const parsed = parseDateToLocal(dateString);
 		return formatTime(parsed, timeFormat);
 	} catch (error) {
-		console.error("Error formatting date string time:", { dateString, error });
+		tasknotesLogger.error("Error formatting date string time:", {
+			category: "validation",
+			operation: "formatting-date-string-time",
+			details: { dateString },
+			error: error,
+		});
 		return dateString;
 	}
 }
@@ -884,7 +1023,11 @@ export function combineDateAndTime(dateString: string, timeString: string): stri
 		if (dateOnlyMatch) {
 			// Validate time format (HH:mm)
 			if (!/^\d{2}:\d{2}$/.test(timeString)) {
-				console.warn("Invalid time format, expected HH:mm:", timeString);
+				tasknotesLogger.warn("Invalid time format, expected HH:mm:", {
+					category: "validation",
+					operation: "invalid-time-format-expected-hh-mm",
+					details: { value: timeString },
+				});
 				return dateString;
 			}
 			return `${dateOnlyMatch[1]}T${timeString}`;
@@ -895,19 +1038,32 @@ export function combineDateAndTime(dateString: string, timeString: string): stri
 
 		// Validate that we got a valid date part (YYYY-MM-DD format)
 		if (!datePart || !/^\d{4}-\d{2}-\d{2}$/.test(datePart)) {
-			console.warn("Invalid date part from dateString:", { dateString, datePart });
+			tasknotesLogger.warn("Invalid date part from dateString:", {
+				category: "validation",
+				operation: "invalid-date-part-datestring",
+				details: { dateString, datePart },
+			});
 			return dateString;
 		}
 
 		// Validate time format (HH:mm)
 		if (!/^\d{2}:\d{2}$/.test(timeString)) {
-			console.warn("Invalid time format, expected HH:mm:", timeString);
+			tasknotesLogger.warn("Invalid time format, expected HH:mm:", {
+				category: "validation",
+				operation: "invalid-time-format-expected-hh-mm",
+				details: { value: timeString },
+			});
 			return dateString;
 		}
 
 		return `${datePart}T${timeString}`;
 	} catch (error) {
-		console.error("Error combining date and time:", { dateString, timeString, error });
+		tasknotesLogger.error("Error combining date and time:", {
+			category: "validation",
+			operation: "combining-date-and-time",
+			details: { dateString, timeString },
+			error: error,
+		});
 		return dateString;
 	}
 }
@@ -937,26 +1093,31 @@ export function formatDateTimeForDisplay(
 	const finalTimeFormat = timeFormat || (userTimeFormat === "12" ? "h:mm a" : "HH:mm");
 
 	try {
-		const parsed = parseDate(dateString);
+		const parsed = parseDateToLocalInternal(dateString);
 		const hasTime = hasTimeComponent(dateString);
 
 		if (hasTime && showTime) {
 			// Handle empty dateFormat case (e.g., for "Today at" scenarios)
 			if (!dateFormat || dateFormat.trim() === "") {
-				return format(parsed, finalTimeFormat);
+				return formatUIDate(parsed, finalTimeFormat);
 			} else {
-				return format(parsed, `${dateFormat} ${finalTimeFormat}`);
+				return formatUIDate(parsed, `${dateFormat} ${finalTimeFormat}`);
 			}
 		} else {
 			// For date-only, return the dateFormat or fallback
 			if (!dateFormat || dateFormat.trim() === "") {
 				return ""; // Return empty for time-only requests when no time available
 			} else {
-				return format(parsed, dateFormat);
+				return formatUIDate(parsed, dateFormat);
 			}
 		}
 	} catch (error) {
-		console.error("Error formatting datetime for display:", { dateString, error });
+		tasknotesLogger.error("Error formatting datetime for display:", {
+			category: "validation",
+			operation: "formatting-datetime-display",
+			details: { dateString },
+			error: error,
+		});
 		return dateString;
 	}
 }
@@ -1009,7 +1170,12 @@ export function isBeforeDateTimeAware(date1: string, date2: string): boolean {
 		// Step 4: Direct comparison with consistent UTC timestamps
 		return d1Final.getTime() < d2Final.getTime();
 	} catch (error) {
-		console.error("Error comparing dates time-aware:", { date1, date2, error });
+		tasknotesLogger.error("Error comparing dates time-aware:", {
+			category: "validation",
+			operation: "comparing-dates-time-aware",
+			details: { date1, date2 },
+			error: error,
+		});
 		return false;
 	}
 }
@@ -1044,7 +1210,12 @@ export function isOverdueTimeAware(
 			return isBefore(taskDateUTC, todayUTCAnchor);
 		}
 	} catch (error) {
-		console.error("Error checking overdue status:", { dateString, error });
+		tasknotesLogger.error("Error checking overdue status:", {
+			category: "validation",
+			operation: "checking-overdue-status",
+			details: { dateString },
+			error: error,
+		});
 		return false;
 	}
 }
@@ -1057,13 +1228,18 @@ export function isTodayTimeAware(dateString: string): boolean {
 
 	try {
 		const taskDate = hasTimeComponent(dateString)
-			? parseDate(dateString)
+			? parseDateToLocalInternal(dateString)
 			: parseDateAsLocal(dateString);
 		const now = new Date();
 
 		return isSameDay(taskDate, now);
 	} catch (error) {
-		console.error("Error checking if today:", { dateString, error });
+		tasknotesLogger.error("Error checking if today:", {
+			category: "validation",
+			operation: "checking-if-today",
+			details: { dateString },
+			error: error,
+		});
 		return false;
 	}
 }
@@ -1095,7 +1271,7 @@ export function validateDateTimeInput(dateValue: string, timeValue?: string): bo
 		}
 
 		return true;
-	} catch (error) {
+	} catch {
 		return false;
 	}
 }
@@ -1104,13 +1280,13 @@ export function validateDateTimeInput(dateValue: string, timeValue?: string): bo
  * Validates and filters a complete_instances array to contain only valid YYYY-MM-DD dates
  * This prevents issues with invalid time-only entries like "T00:00"
  */
-export function validateCompleteInstances(instances: any[]): string[] {
+export function validateCompleteInstances(instances: unknown[]): string[] {
 	if (!Array.isArray(instances)) {
 		return [];
 	}
 
 	return instances
-		.filter((instance) => {
+		.filter((instance): instance is string => {
 			// Must be a non-empty string
 			if (typeof instance !== "string" || !instance.trim()) {
 				return false;
@@ -1132,14 +1308,15 @@ export function validateCompleteInstances(instances: any[]): string[] {
 
 			// Must be a valid date (this should not fail for YYYY-MM-DD format, but check anyway)
 			try {
-				parseDate(trimmed);
+				parseDateToLocalInternal(trimmed);
 				return true;
 			} catch (error) {
-				console.warn(
-					"Invalid complete_instances entry (date parsing failed):",
-					instance,
-					error
-				);
+				tasknotesLogger.warn("Invalid complete_instances entry (date parsing failed):", {
+					category: "validation",
+					operation: "invalid-complete-instances-entry-date-parsing",
+					details: { value: instance },
+					error: error,
+				});
 				return false;
 			}
 		})
@@ -1159,7 +1336,7 @@ export function getCurrentDateTimeString(): string {
  */
 export function addDaysToDateTime(dateString: string, days: number): string {
 	try {
-		const parsed = parseDate(dateString);
+		const parsed = parseDateToLocalInternal(dateString);
 		const result = addDaysFns(parsed, days);
 
 		// Preserve time format if original had time
@@ -1169,7 +1346,12 @@ export function addDaysToDateTime(dateString: string, days: number): string {
 			return format(result, "yyyy-MM-dd");
 		}
 	} catch (error) {
-		console.error("Error adding days to datetime:", { dateString, days, error });
+		tasknotesLogger.error("Error adding days to datetime:", {
+			category: "validation",
+			operation: "adding-days-datetime",
+			details: { dateString, days },
+			error: error,
+		});
 		throw error;
 	}
 }
@@ -1216,7 +1398,12 @@ export function createUTCDateForRRule(dateString: string): Date {
 
 		return utcDate;
 	} catch (error) {
-		console.error("Error creating UTC date for RRULE:", { dateString, error });
+		tasknotesLogger.error("Error creating UTC date for RRULE:", {
+			category: "validation",
+			operation: "creating-utc-date-rrule",
+			details: { dateString },
+			error: error,
+		});
 		throw error;
 	}
 }
@@ -1260,7 +1447,11 @@ export function isTodayUTC(date: Date): boolean {
 			date.getUTCDate() === todayUTCAnchor.getUTCDate()
 		);
 	} catch (error) {
-		console.error("Error in isTodayUTC:", error);
+		tasknotesLogger.error("Error in isTodayUTC:", {
+			category: "validation",
+			operation: "istodayutc",
+			error: error,
+		});
 		return false;
 	}
 }
@@ -1284,10 +1475,11 @@ export function normalizeCalendarBoundariesToUTC(
 
 		return { utcStart, utcEnd };
 	} catch (error) {
-		console.error("Error normalizing calendar boundaries to UTC:", {
-			startDate,
-			endDate,
-			error,
+		tasknotesLogger.error("Error normalizing calendar boundaries to UTC:", {
+			category: "provider",
+			operation: "normalizing-calendar-boundaries-utc",
+			details: { startDate, endDate },
+			error: error,
 		});
 		throw error;
 	}
@@ -1304,7 +1496,12 @@ export function formatDateAsUTCString(date: Date): string {
 		const day = String(date.getUTCDate()).padStart(2, "0");
 		return `${year}-${month}-${day}`;
 	} catch (error) {
-		console.error("Error formatting date as UTC string:", { date, error });
+		tasknotesLogger.error("Error formatting date as UTC string:", {
+			category: "validation",
+			operation: "formatting-date-as-utc-string",
+			details: { date },
+			error: error,
+		});
 		// Fallback to ISO string date part
 		return date.toISOString().split("T")[0];
 	}
@@ -1325,7 +1522,11 @@ export function formatDateForStorage(date: Date): string {
 	try {
 		// Validate input
 		if (!date || !(date instanceof Date) || isNaN(date.getTime())) {
-			console.warn("formatDateForStorage received invalid date:", date);
+			tasknotesLogger.warn("formatDateForStorage received invalid date:", {
+				category: "validation",
+				operation: "formatdateforstorage-received-invalid-date",
+				details: { value: date },
+			});
 			return "";
 		}
 
@@ -1337,7 +1538,12 @@ export function formatDateForStorage(date: Date): string {
 
 		return `${year}-${month}-${day}`;
 	} catch (error) {
-		console.error("Error formatting date for storage:", { date, error });
+		tasknotesLogger.error("Error formatting date for storage:", {
+			category: "validation",
+			operation: "formatting-date-storage",
+			details: { date },
+			error: error,
+		});
 		// Return empty string for invalid dates rather than potentially incorrect fallback
 		return "";
 	}
@@ -1463,7 +1669,7 @@ export function isValidDateInput(value: string): boolean {
 
 	// Check if it's a valid ISO date format
 	try {
-		const parsed = parseDate(trimmed);
+		const parsed = parseDateToLocalInternal(trimmed);
 		return isValid(parsed);
 	} catch {
 		return false;
@@ -1488,7 +1694,12 @@ export function resolveNaturalLanguageDate(value: string): string {
 				normalized as keyof typeof NATURAL_LANGUAGE_DATE_PATTERNS
 			]();
 		} catch (error) {
-			console.error("Error resolving natural language date:", { value, error });
+			tasknotesLogger.error("Error resolving natural language date:", {
+				category: "validation",
+				operation: "resolving-natural-language-date",
+				details: { value },
+				error: error,
+			});
 			return value;
 		}
 	}
@@ -1523,7 +1734,12 @@ export function resolveNaturalLanguageDate(value: string): string {
 			return addWeeksToDateString(getTodayString(), -weeks);
 		}
 	} catch (error) {
-		console.error("Error parsing relative natural language date:", { value, error });
+		tasknotesLogger.error("Error parsing relative natural language date:", {
+			category: "validation",
+			operation: "parsing-relative-natural-language-date",
+			details: { value },
+			error: error,
+		});
 	}
 
 	// Return original value if not a natural language pattern

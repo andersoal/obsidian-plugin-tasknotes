@@ -1,12 +1,11 @@
 import { TaskCreationModal } from '../../../src/modals/TaskCreationModal';
-import { MockObsidian } from '../../__mocks__/obsidian';
+import { MockObsidian } from '../../helpers/obsidian-runtime';
 import type { App } from 'obsidian';
 
 // @ts-ignore helper to cast the mock app
 const createMockApp = (mockApp: any): App => mockApp as unknown as App;
 
 // Do NOT mock helpers here to keep sanitizeTags available
-jest.mock('obsidian');
 
 describe('TaskCreationModal - projects with commas', () => {
   let mockApp: App;
@@ -59,9 +58,9 @@ describe('TaskCreationModal - projects with commas', () => {
 
   it('should preserve a wikilink project containing commas as a single entry when building task data', () => {
     const modal = new TaskCreationModal(mockApp, mockPlugin);
-    (modal as any).title = 'Test';
-    ;(modal as any).projects = '[[Money, Org & Adm]]';
-    ;(modal as any).tags = '';
+    (modal as any).form.values.title = 'Test';
+    ;(modal as any).form.values.projects = '[[Money, Org & Adm]]';
+    ;(modal as any).form.values.tags = '';
 
     const data = (modal as any).buildTaskData();
     expect(data.projects).toEqual(['[[Money, Org & Adm]]']);
@@ -69,9 +68,9 @@ describe('TaskCreationModal - projects with commas', () => {
 
   it('should preserve multiple mixed projects including wikilinks with commas', () => {
     const modal = new TaskCreationModal(mockApp, mockPlugin);
-    (modal as any).title = 'Test';
-    ;(modal as any).projects = '[[Money, Org & Adm]], [[Wellbeing|Health, Fitness & Mindset]]';
-    ;(modal as any).tags = '';
+    (modal as any).form.values.title = 'Test';
+    ;(modal as any).form.values.projects = '[[Money, Org & Adm]], [[Wellbeing|Health, Fitness & Mindset]]';
+    ;(modal as any).form.values.tags = '';
 
     const data = (modal as any).buildTaskData();
     expect(data.projects).toEqual([

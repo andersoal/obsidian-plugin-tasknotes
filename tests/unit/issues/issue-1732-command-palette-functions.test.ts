@@ -1,0 +1,35 @@
+import { observeTranslation as mockObserveTranslation, englishText as mockEnglishText, conceptDescriptor as mockConceptDescriptor } from "../../helpers/real-i18n";
+import { msg } from "@lingui/core/macro";
+import { createTaskNotesCommandDefinitions } from "../../../src/commands/taskNotesCommands";
+
+describe("Issue #1732: command palette task functions", () => {
+	it("registers direct command-palette actions for current task workflows", async () => {
+		const definitions = createTaskNotesCommandDefinitions({} as any);
+		const editCurrentTask = definitions.find(
+			(definition) => definition.id === "edit-current-task"
+		);
+		const addProject = definitions.find(
+			(definition) => definition.id === "add-project-to-current-task"
+		);
+		const addSubtask = definitions.find(
+			(definition) => definition.id === "add-subtask-to-current-note"
+		);
+		const ctx = {
+			openTaskEditModalForCurrentTask: jest.fn(),
+			addProjectToCurrentTask: jest.fn(),
+			addSubtaskToCurrentNote: jest.fn(),
+		};
+
+		expect(editCurrentTask?.nameKey).toEqual(msg({ message: "Edit current task", context: "commands.editCurrentTask" }));
+		expect(addProject?.nameKey).toEqual(msg({ message: "Add project to current task", context: "commands.addProjectToCurrentTask" }));
+		expect(addSubtask?.nameKey).toEqual(msg({ message: "Add subtask to current note", context: "commands.addSubtaskToCurrentNote" }));
+
+		await editCurrentTask?.callback?.(ctx as any);
+		await addProject?.callback?.(ctx as any);
+		await addSubtask?.callback?.(ctx as any);
+
+		expect(ctx.openTaskEditModalForCurrentTask).toHaveBeenCalledTimes(1);
+		expect(ctx.addProjectToCurrentTask).toHaveBeenCalledTimes(1);
+		expect(ctx.addSubtaskToCurrentNote).toHaveBeenCalledTimes(1);
+	});
+});

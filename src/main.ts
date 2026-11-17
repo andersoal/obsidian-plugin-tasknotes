@@ -1,15 +1,23 @@
-/* eslint-disable no-console */
+import { uiData } from "./i18n/dataText";
+import { displayError } from "./i18n/runtime";
+import { configLabel } from "./i18n/configLabels";
+import { uiText } from "./i18n/runtime";
+import { msg } from "@lingui/core/macro";
 import {
 	Notice,
 	Plugin,
 	WorkspaceLeaf,
 	Editor,
-	MarkdownView,
+	Menu,
+	TAbstractFile,
 	TFile,
 	getLanguage,
-	normalizePath,
 } from "obsidian";
-import { format } from "date-fns";
+
+type Nullable<T> = T | null;
+
+import { completeRecurringTaskWithUndo } from "./services/task-service/recurringCompletionUndo";
+import { showRecurringCompletionNotice } from "./ui/recurringCompletionNotice";
 import {
 	createDailyNote,
 	getDailyNote,
@@ -17,10 +25,10 @@ import {
 	appHasDailyNotesPluginLoaded,
 } from "obsidian-daily-notes-interface";
 import { TaskNotesSettings } from "./types/settings";
-import { DEFAULT_SETTINGS } from "./settings/defaults";
 import { generateBasesFileTemplate } from "./templates/defaultBasesFiles";
 import {
 	MINI_CALENDAR_VIEW_TYPE,
+	RecurringCompletionOptions,
 	TaskInfo,
 	EVENT_DATA_CHANGED,
 	EVENT_TASK_UPDATED,
@@ -30,9 +38,10 @@ import {
 import { TaskCreationModal } from "./modals/TaskCreationModal";
 import { TaskEditModal } from "./modals/TaskEditModal";
 import { openTaskSelector } from "./modals/TaskSelectorWithCreateModal";
+import { ProjectSelectModal } from "./modals/ProjectSelectModal";
 import { PomodoroService } from "./services/PomodoroService";
 import { formatTime, getActiveTimeEntry } from "./utils/helpers";
-import { convertUTCToLocalCalendarDate, getCurrentTimestamp } from "./utils/dateUtils";
+import { convertUTCToLocalCalendarDate } from "./utils/dateUtils";
 import { TaskManager } from "./utils/TaskManager";
 import { DependencyCache } from "./utils/DependencyCache";
 import { RequestDeduplicator, PredictivePrefetcher } from "./utils/RequestDeduplicator";
@@ -41,51 +50,97 @@ import { FieldMapper } from "./services/FieldMapper";
 import { StatusManager } from "./services/StatusManager";
 import { PriorityManager } from "./services/PriorityManager";
 import { TaskService } from "./services/TaskService";
+import { isMaterializedOccurrenceTask } from "@tasknotes/model/operations";
 import { FilterService } from "./services/FilterService";
 import { TaskStatsService } from "./services/TaskStatsService";
-import { ViewPerformanceService } from "./services/ViewPerformanceService";
+import type { ViewPerformanceService } from "./services/ViewPerformanceService";
 import { AutoArchiveService } from "./services/AutoArchiveService";
 import { ViewStateManager } from "./services/ViewStateManager";
 import { DragDropManager } from "./utils/DragDropManager";
-import {
-	formatDateForStorage,
-	createUTCDateFromLocalCalendarDate,
-	parseDateToLocal,
-	getTodayLocal,
-} from "./utils/dateUtils";
+import { formatDateForStorage, getTodayLocal } from "./utils/dateUtils";
 import { ICSSubscriptionService } from "./services/ICSSubscriptionService";
 import { ICSNoteService } from "./services/ICSNoteService";
-import { StatusBarService } from "./services/StatusBarService";
+import { StatusBarService } from "./ui/StatusBarService";
 import { ProjectSubtasksService } from "./services/ProjectSubtasksService";
 import { ExpandedProjectsService } from "./services/ExpandedProjectsService";
-import { NotificationService } from "./services/NotificationService";
+import { NotificationService } from "./ui/NotificationService";
 import { AutoExportService } from "./services/AutoExportService";
 // Type-only import for HTTPAPIService (actual import is dynamic on desktop only)
 import type { HTTPAPIService } from "./services/HTTPAPIService";
 import { createI18nService, I18nService } from "./i18n";
+import { languagePackConfig } from "./i18n/languagePackConfig";
+import type { LanguagePackController } from "./i18n/LanguagePackController";
+import { createLanguagePackController } from "./bootstrap/languagePacks";
 import { OAuthService } from "./services/OAuthService";
+import { OAuthSecretStore } from "./services/OAuthSecretStore";
+import { migrateLegacyOAuthData, stripLegacyOAuthData } from "./services/oauthSecretMigration";
 import { GoogleCalendarService } from "./services/GoogleCalendarService";
 import { MicrosoftCalendarService } from "./services/MicrosoftCalendarService";
 import { CalendarProviderRegistry } from "./services/CalendarProvider";
 import { TaskCalendarSyncService } from "./services/TaskCalendarSyncService";
+import { addTaskToProject, assignTaskAsSubtask } from "./services/taskRelationshipActions";
 import {
 	initializeAfterLayoutReady,
 	initializeCalendarProviders,
 	registerBasesIntegration,
 } from "./bootstrap/pluginBootstrap";
+import { cleanupPluginRuntime, initializePluginRuntime } from "./bootstrap/pluginRuntime";
 import {
-	cleanupPluginRuntime,
-	initializePluginRuntime,
-} from "./bootstrap/pluginRuntime";
+	ensureDefaultBasesViewFiles,
+	type DefaultBasesFileResult,
+} from "./bootstrap/defaultBasesFiles";
+import { ensureStarterNote as ensureStarterNoteFile } from "./bootstrap/starterNote";
+import {
+	getAvailableTaskNotesReleaseVersion,
+	shouldNotifyForRelease,
+	TASKNOTES_COMMUNITY_PLUGIN_URL,
+} from "./api/releaseCheck";
+import { buildCurrentNoteConversionTaskInfo } from "./services/task-service/currentNoteConversion";
+import {
+	applyParentNoteProjectDefault,
+	shouldApplyParentNoteProjectDefault,
+} from "./utils/taskCreationPrepopulation";
+import type { ParentNoteProjectDefaultContext } from "./utils/taskCreationPrepopulation";
+import { applySearchQueryToView } from "./utils/obsidianSearchView";
+import { TaskContextMenu } from "./components/TaskContextMenu";
+import {
+	LoadedSettingsData,
+	buildSettingsDataForSave,
+	buildSettingsFromLoadedData,
+	loadPluginSettingsDataWithRetry,
+	pluginDataFileExists,
+} from "./settings/settingsPersistence";
+import { startDateChangeDetection } from "./bootstrap/dateChangeDetection";
+import { createTaskNotesLogger } from "./utils/tasknotesLogger";
+import { sanitizeLinkAliasText } from "./utils/linkAliasUtils";
+import { withPluginDataWriteLock } from "./utils/pluginDataWriteLock";
+import { TASKNOTES_RUNTIME_LIFECYCLE_RAW_EVENTS } from "./api/runtime-api";
+import {
+	createTaskNotesPerformanceProfiler,
+	TaskNotesPerformanceProfiler,
+} from "./utils/PerformanceProfiler";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Main" });
+
+type DailyNoteMoment = Parameters<typeof getDailyNote>[0];
+type TaskLinkDetectionServiceInstance =
+	import("./services/TaskLinkDetectionService").TaskLinkDetectionService;
+type TaskLinkMatch = ReturnType<TaskLinkDetectionServiceInstance["findWikilinks"]>[number];
+type SubmenuMenuItem = {
+	setSubmenu(): Menu;
+};
+
+function getSubmenu(item: unknown): Menu {
+	return (item as SubmenuMenuItem).setSubmenu();
+}
 
 export default class TaskNotesPlugin extends Plugin {
 	settings: TaskNotesSettings;
 	i18n: I18nService;
-
-	// Date change detection for refreshing task states at midnight
-	private lastKnownDate: string = new Date().toDateString();
-	private dateCheckInterval: number;
-	private midnightTimeout: number;
+	private languagePackController?: LanguagePackController;
+	private settingsLoadCompromised = false;
+	private settingsDataSavePromise: Promise<void> | null = null;
+	private settingsDataSaveRequested = false;
 
 	// Ready promise to signal when initialization is complete
 	private readyPromise: Promise<void>;
@@ -103,6 +158,7 @@ export default class TaskNotesPlugin extends Plugin {
 	predictivePrefetcher: PredictivePrefetcher;
 	domReconciler: DOMReconciler;
 	uiStateManager: UIStateManager;
+	performanceProfiler: TaskNotesPerformanceProfiler;
 
 	// Pomodoro service
 	pomodoroService: PomodoroService;
@@ -124,8 +180,8 @@ export default class TaskNotesPlugin extends Plugin {
 
 	// Task selection service for batch operations
 	taskSelectionService: import("./services/TaskSelectionService").TaskSelectionService;
-	workspaceNavigationService: import("./services/WorkspaceNavigationService").WorkspaceNavigationService;
-	taskActionCoordinator: import("./services/TaskActionCoordinator").TaskActionCoordinator;
+	workspaceNavigationService: import("./ui/WorkspaceNavigationService").WorkspaceNavigationService;
+	taskActionCoordinator: import("./ui/TaskActionCoordinator").TaskActionCoordinator;
 	settingsLifecycleService: import("./services/SettingsLifecycleService").SettingsLifecycleService;
 	commandRegistry: import("./commands/TranslatedCommandRegistry").TranslatedCommandRegistry;
 
@@ -154,8 +210,13 @@ export default class TaskNotesPlugin extends Plugin {
 	// HTTP API service
 	apiService?: HTTPAPIService;
 
-	// OAuth service
+	// Public JavaScript API for in-vault scripts
+	api: import("./api/TaskNotesAPI").TaskNotesPublicAPI;
+
+	// OAuth services
 	oauthService: OAuthService;
+	oauthSecretStore: OAuthSecretStore;
+	private oauthSecretStorageReady = false;
 
 	// Google Calendar service
 	googleCalendarService: GoogleCalendarService;
@@ -168,6 +229,7 @@ export default class TaskNotesPlugin extends Plugin {
 
 	// Task-to-Google Calendar sync service
 	taskCalendarSyncService: TaskCalendarSyncService;
+	taskFileLifecycleReconciliationService?: import("./services/TaskFileLifecycleReconciliationService").TaskFileLifecycleReconciliationService;
 
 	// mdbase-spec generation service
 	mdbaseSpecService: import("./services/MdbaseSpecService").MdbaseSpecService;
@@ -176,7 +238,7 @@ export default class TaskNotesPlugin extends Plugin {
 	basesFilterConverter: import("./services/BasesFilterConverter").BasesFilterConverter;
 
 	// Event listener cleanup
-	taskUpdateListenerForEditor: import("obsidian").EventRef | null = null;
+	taskUpdateListenerForEditor: unknown = null;
 	relationshipsReadingModeCleanup: (() => void) | null = null;
 	taskCardReadingModeCleanup: (() => void) | null = null;
 
@@ -186,9 +248,11 @@ export default class TaskNotesPlugin extends Plugin {
 	// Migration state management
 	private migrationComplete = false;
 	private migrationPromise: Promise<void> | null = null;
+	private shouldCreateStarterNoteOnStartup = false;
 
 	// Bases registration state management
 	basesRegistered = false;
+	basesRegistrationRetryIntervalId: number | null = null;
 
 	/**
 	 * Get the system UI locale with proper priority order for TaskNotes plugin.
@@ -209,7 +273,7 @@ export default class TaskNotesPlugin extends Plugin {
 			if (obsidianLanguage) {
 				return obsidianLanguage;
 			}
-		} catch (error) {
+		} catch {
 			// Silently continue to next attempt if getLanguage() fails
 		}
 
@@ -227,6 +291,28 @@ export default class TaskNotesPlugin extends Plugin {
 		// For now we don't force-refresh to avoid disrupting the workspace layout.
 	}
 
+	async setUILanguage(locale: string): Promise<boolean> {
+		if (!this.languagePackController) {
+			this.i18n.setLocale(locale);
+			return true;
+		}
+		try {
+			return await this.languagePackController.setLocale(locale);
+		} catch (error) {
+			tasknotesLogger.warn("Could not load interface language pack", {
+				category: "provider",
+				operation: "load-language-pack",
+				details: { locale, error: String(error) },
+			});
+			new Notice(
+				this.i18n.translate(msg({ message: "Could not load {language}. The current language is unchanged. Retry in the interface language settings.", context: "notices.languagePackDownloadFailed" }), {
+					language: this.i18n.getNativeLanguageName(this.i18n.getPreferredLocale(locale)),
+				})
+			);
+			return false;
+		}
+	}
+
 	async onload() {
 		// Create the promise and store its resolver
 		this.readyPromise = new Promise((resolve) => {
@@ -234,6 +320,13 @@ export default class TaskNotesPlugin extends Plugin {
 		});
 
 		await this.loadSettings();
+		this.performanceProfiler = createTaskNotesPerformanceProfiler({
+			isEnabled: () => this.settings?.enableDebugLogging === true,
+			logger: createTaskNotesLogger({
+				tag: "PerformanceProfiler",
+				isDebugEnabled: () => this.settings?.enableDebugLogging === true,
+			}),
+		});
 
 		this.i18n = createI18nService({
 			initialLocale: this.settings.uiLanguage ?? "system",
@@ -241,30 +334,101 @@ export default class TaskNotesPlugin extends Plugin {
 		});
 
 		this.i18n.on("locale-changed", ({ current }) => {
+			// A cached/downloaded locale may arrive during startup, after commands register.
+			this.commandRegistry?.refreshTranslations();
 			if (!this.initializationComplete) {
 				return;
 			}
 			const languageLabel = this.i18n.getNativeLanguageName(current);
-			new Notice(this.i18n.translate("notices.languageChanged", { language: languageLabel }));
+			new Notice(this.i18n.translate(msg({ message: "Language changed to {language}.", context: "notices.languageChanged" }), { language: languageLabel }));
 			this.refreshLocalizedViews();
-			this.commandRegistry?.refreshTranslations();
 		});
 
+		if (languagePackConfig) {
+			this.languagePackController = createLanguagePackController(
+				this.app,
+				this.manifest,
+				this.i18n,
+				languagePackConfig
+			);
+			// Startup uses bundled English immediately; never wait for the network.
+			void this.setUILanguage(this.settings.uiLanguage ?? "system");
+		}
+
 		await initializePluginRuntime(this);
+		this.registerTaskNotesFileMenuActions();
 
 		// Start migration check early (before views can be opened)
 		this.migrationPromise = this.performEarlyMigrationCheck();
 
 		initializeCalendarProviders(this);
-		await registerBasesIntegration(this);
+		// Not awaited: if Bases has not loaded yet this schedules a retry timer,
+		// and initializeAfterLayoutReady attempts registration again.
+		void registerBasesIntegration(this);
 
 		// Defer expensive initialization until layout is ready
 		this.app.workspace.onLayoutReady(() => {
-			this.initializeAfterLayoutReady();
+			void this.initializeAfterLayoutReady();
 		});
 
 		// At the very end of onload, resolve the promise to signal readiness
 		this.resolveReady();
+		this.emitter.trigger(TASKNOTES_RUNTIME_LIFECYCLE_RAW_EVENTS.ready, {
+			timestamp: new Date().toISOString(),
+		});
+	}
+
+	private registerTaskNotesFileMenuActions(): void {
+		this.registerEvent(
+			this.app.workspace.on("file-menu", (menu, file, source) => {
+				this.addTaskNotesFileMenuActions(menu, file, source);
+			})
+		);
+	}
+
+	addTaskNotesFileMenuActions(menu: Menu, file: TAbstractFile, source?: string): void {
+		if (source === "tasknotes-context-menu") {
+			return;
+		}
+
+		if (!(file instanceof TFile)) {
+			return;
+		}
+
+		const metadata = this.app.metadataCache.getFileCache(file);
+		if (!metadata?.frontmatter || !this.cacheManager.isTaskFile(metadata.frontmatter)) {
+			return;
+		}
+
+		menu.addSeparator();
+		menu.addItem((item) => {
+			item.setTitle(this.i18n.translate(msg({ message: "Edit task", context: "modals.taskEdit.title" })));
+			item.setIcon("pencil");
+			item.setSection("tasknotes");
+			item.onClick(() => {
+				void this.openTaskEditModalForFile(file);
+			});
+		});
+
+		const task = this.cacheManager.getCachedTaskInfoSync(file.path);
+		if (!task) {
+			return;
+		}
+
+		menu.addItem((item) => {
+			item.setTitle(this.i18n.translate(msg({ message: "TaskNotes", context: "common.appName" })));
+			item.setIcon("list-checks");
+			item.setSection("tasknotes");
+			const submenu = getSubmenu(item);
+			TaskContextMenu.addToMenu(submenu, {
+				task,
+				plugin: this,
+				targetDate: getTodayLocal(),
+				onUpdate: () => {
+					this.app.workspace.trigger("tasknotes:refresh-views");
+				},
+			});
+		});
 	}
 
 	/**
@@ -278,7 +442,7 @@ export default class TaskNotesPlugin extends Plugin {
 	 * Initialize heavy services lazily in the background
 	 */
 	initializeServicesLazily(): void {
-		import("./bootstrap/pluginBootstrap").then(({ initializeServicesLazily }) => {
+		void import("./bootstrap/pluginBootstrap").then(({ initializeServicesLazily }) => {
 			initializeServicesLazily(this);
 		});
 	}
@@ -290,19 +454,14 @@ export default class TaskNotesPlugin extends Plugin {
 		try {
 			// Simple approach: just trigger the lazy index building once
 			// This is much more efficient than processing individual files
-			const warmupStartTime = Date.now();
-
 			// Trigger index building with a single call - this will process all files internally
 			this.cacheManager.getTasksForDate(new Date().toISOString().split("T")[0]);
-
-			const duration = Date.now() - warmupStartTime;
-			// Only log slow warmup for debugging large vaults
-			if (duration > 2000) {
-				// eslint-disable-next-line no-console
-				console.log(`[TaskNotes] Project indexes warmed up in ${duration}ms`);
-			}
 		} catch (error) {
-			console.error("[TaskNotes] Error during project index warmup:", error);
+			tasknotesLogger.error("[TaskNotes] Error during project index warmup:", {
+				category: "internal",
+				operation: "project-index-warmup",
+				error: error,
+			});
 		}
 	}
 
@@ -310,11 +469,6 @@ export default class TaskNotesPlugin extends Plugin {
 	 * Public method for views to wait for readiness
 	 */
 	async onReady(): Promise<void> {
-		// If readyPromise doesn't exist, plugin hasn't started onload yet
-		if (!this.readyPromise) {
-			throw new Error("Plugin not yet initialized");
-		}
-
 		await this.readyPromise;
 	}
 
@@ -330,7 +484,7 @@ export default class TaskNotesPlugin extends Plugin {
 		this.registerEvent(
 			this.emitter.on(EVENT_TASK_UPDATED, () => {
 				// Small delay to ensure task state changes are fully propagated
-				setTimeout(() => {
+				window.setTimeout(() => {
 					this.statusBarService.requestUpdate();
 				}, 100);
 			})
@@ -340,7 +494,7 @@ export default class TaskNotesPlugin extends Plugin {
 		this.registerEvent(
 			this.emitter.on(EVENT_DATA_CHANGED, () => {
 				// Small delay to ensure data changes are fully propagated
-				setTimeout(() => {
+				window.setTimeout(() => {
 					this.statusBarService.requestUpdate();
 				}, 100);
 			})
@@ -351,7 +505,7 @@ export default class TaskNotesPlugin extends Plugin {
 			// Listen for Pomodoro start events
 			this.registerEvent(
 				this.emitter.on("pomodoro-start", () => {
-					setTimeout(() => {
+					window.setTimeout(() => {
 						this.statusBarService.requestUpdate();
 					}, 100);
 				})
@@ -360,7 +514,7 @@ export default class TaskNotesPlugin extends Plugin {
 			// Listen for Pomodoro stop events
 			this.registerEvent(
 				this.emitter.on("pomodoro-stop", () => {
-					setTimeout(() => {
+					window.setTimeout(() => {
 						this.statusBarService.requestUpdate();
 					}, 100);
 				})
@@ -369,7 +523,7 @@ export default class TaskNotesPlugin extends Plugin {
 			// Listen for Pomodoro state changes
 			this.registerEvent(
 				this.emitter.on("pomodoro-state-changed", () => {
-					setTimeout(() => {
+					window.setTimeout(() => {
 						this.statusBarService.requestUpdate();
 					}, 100);
 				})
@@ -387,21 +541,22 @@ export default class TaskNotesPlugin extends Plugin {
 	 */
 	private async performEarlyMigrationCheck(): Promise<void> {
 		try {
-			console.log("TaskNotes: Starting early migration check...");
-
 			// Initialize saved views (handles migration if needed)
 			await this.viewStateManager.initializeSavedViews();
 
 			// Perform view state migration if needed (this is silent and fast)
 			if (this.viewStateManager.needsMigration()) {
-				console.log("TaskNotes: Performing view state migration...");
 				await this.viewStateManager.performMigration();
 			}
 
 			// Migration check complete
 			this.migrationComplete = true;
 		} catch (error) {
-			console.error("Error during early migration check:", error);
+			tasknotesLogger.error("Error during early migration check:", {
+				category: "configuration",
+				operation: "early-migration-check",
+				error: error,
+			});
 			// Don't fail the entire plugin load due to migration check issues
 			this.migrationComplete = true;
 		}
@@ -420,12 +575,14 @@ export default class TaskNotesPlugin extends Plugin {
 				const showReleaseNotes = this.settings.showReleaseNotesOnUpdate ?? true;
 				if (showReleaseNotes) {
 					// Show release notes after a delay to ensure UI is ready
-					setTimeout(async () => {
-						await this.activateReleaseNotesView();
-						// Update lastSeenVersion immediately after showing the release notes
-						// This ensures they only show once per version
-						this.settings.lastSeenVersion = currentVersion;
-						await this.saveSettings();
+					window.setTimeout(() => {
+						void (async () => {
+							await this.activateReleaseNotesView();
+							// Update lastSeenVersion immediately after showing the release notes
+							// This ensures they only show once per version
+							this.settings.lastSeenVersion = currentVersion;
+							await this.saveSettings();
+						})();
 					}, 1500); // Slightly longer delay than migration to avoid conflicts
 				} else {
 					// Still update lastSeenVersion even if not showing release notes
@@ -440,8 +597,62 @@ export default class TaskNotesPlugin extends Plugin {
 				await this.saveSettings();
 			}
 		} catch (error) {
-			console.error("Error checking for version update:", error);
+			tasknotesLogger.error("Error checking for version update:", {
+				category: "configuration",
+				operation: "checking-version-update",
+				error: error,
+			});
 		}
+	}
+
+	async checkForNewReleaseOnStartup(): Promise<void> {
+		if (this.settings.checkForUpdatesOnStartup === false) {
+			return;
+		}
+
+		try {
+			const availableVersion = await getAvailableTaskNotesReleaseVersion();
+			if (
+				!shouldNotifyForRelease(
+					this.manifest.version,
+					availableVersion,
+					this.settings.lastNotifiedReleaseVersion
+				)
+			) {
+				return;
+			}
+
+			this.settings.lastNotifiedReleaseVersion = availableVersion;
+			await this.saveSettingsDataOnly();
+			new Notice(this.createReleaseAvailableNotice(availableVersion), 15000);
+		} catch (error) {
+			tasknotesLogger.debug("Release check failed", {
+				category: "provider",
+				operation: "check-release",
+				error,
+			});
+		}
+	}
+
+	private createReleaseAvailableNotice(version: string): DocumentFragment {
+		const fragment = activeWindow.createFragment();
+		fragment.appendText(
+			this.i18n.translate(msg({ message: "TaskNotes {version} is available.", context: "notices.releaseAvailable.message" }), {
+				version,
+			})
+		);
+		fragment.appendText(" ");
+
+		const link = activeWindow.createEl("a");
+		link.textContent = this.i18n.translate(msg({ message: "Open in community plugins", context: "notices.releaseAvailable.action" }));
+		link.href = TASKNOTES_COMMUNITY_PLUGIN_URL;
+		link.addEventListener("click", (event) => {
+			event.preventDefault();
+			window.open(TASKNOTES_COMMUNITY_PLUGIN_URL, "_blank");
+		});
+
+		fragment.appendChild(link);
+		return fragment;
 	}
 
 	/**
@@ -454,7 +665,7 @@ export default class TaskNotesPlugin extends Plugin {
 
 		// Additional safety check - wait until migration is marked complete
 		while (!this.migrationComplete) {
-			await new Promise((resolve) => setTimeout(resolve, 50));
+			await new Promise((resolve) => window.setTimeout(resolve, 50));
 		}
 	}
 
@@ -477,7 +688,7 @@ export default class TaskNotesPlugin extends Plugin {
 			}
 		} else if (force) {
 			// Full cache clear if forcing
-			this.cacheManager.clearAllCaches();
+			void this.cacheManager.clearAllCaches();
 
 			// Clear task link detection cache completely
 			if (this.taskLinkDetectionService) {
@@ -488,8 +699,13 @@ export default class TaskNotesPlugin extends Plugin {
 		// Only emit refresh event if triggerRefresh is true
 		if (triggerRefresh) {
 			// Use requestAnimationFrame for better UI timing instead of setTimeout
-			requestAnimationFrame(() => {
+			window.requestAnimationFrame(() => {
 				this.emitter.trigger(EVENT_DATA_CHANGED);
+				this.emitter.trigger(TASKNOTES_RUNTIME_LIFECYCLE_RAW_EVENTS["cache.changed"], {
+					filePath,
+					force,
+					timestamp: new Date().toISOString(),
+				});
 			});
 		}
 	}
@@ -498,193 +714,136 @@ export default class TaskNotesPlugin extends Plugin {
 	 * Set up date change detection to refresh task states when the date rolls over
 	 */
 	setupDateChangeDetection(): void {
-		// Check for date changes every minute
-		const checkDateChange = () => {
-			const currentDate = new Date().toDateString();
-			if (currentDate !== this.lastKnownDate) {
-				this.lastKnownDate = currentDate;
-				// Emit date change event to trigger UI refresh
-				this.emitter.trigger(EVENT_DATE_CHANGED);
-			}
-		};
-
-		// Set up regular interval to check for date changes
-		this.dateCheckInterval = window.setInterval(checkDateChange, 60000); // Check every minute
-		this.registerInterval(this.dateCheckInterval);
-
-		// Schedule precise check at next midnight for better timing
-		this.scheduleNextMidnightCheck();
-	}
-
-	/**
-	 * Schedule a precise check at the next midnight
-	 */
-	private scheduleNextMidnightCheck(): void {
-		const now = new Date();
-		const midnight = new Date(now);
-		midnight.setHours(24, 0, 0, 0); // Next midnight
-
-		const msUntilMidnight = midnight.getTime() - now.getTime();
-
-		// Clear any existing midnight timeout
-		if (this.midnightTimeout) {
-			window.clearTimeout(this.midnightTimeout);
-		}
-
-		this.midnightTimeout = window.setTimeout(() => {
-			// Force immediate date change check at midnight
-			const currentDate = new Date().toDateString();
-			if (currentDate !== this.lastKnownDate) {
-				this.lastKnownDate = currentDate;
-				this.emitter.trigger(EVENT_DATE_CHANGED);
-			}
-
-			// Schedule the next midnight check
-			this.scheduleNextMidnightCheck();
-		}, msUntilMidnight);
-
-		// Register the timeout for cleanup
-		this.registerInterval(this.midnightTimeout);
+		startDateChangeDetection({
+			registerTimer: (timerId) => this.registerInterval(timerId),
+			emitDateChanged: () => this.emitter.trigger(EVENT_DATE_CHANGED),
+		});
 	}
 
 	onunload() {
+		this.languagePackController?.dispose();
+		this.emitter?.trigger(TASKNOTES_RUNTIME_LIFECYCLE_RAW_EVENTS.unloading, {
+			timestamp: new Date().toISOString(),
+		});
 		void cleanupPluginRuntime(this);
 	}
 
-	async loadSettings() {
-		const loadedData = await this.loadData();
+	private async pluginDataFileExists(): Promise<boolean> {
+		return pluginDataFileExists(this);
+	}
 
-		// Migration: Remove old useNativeMetadataCache setting if it exists
-		if (loadedData && "useNativeMetadataCache" in loadedData) {
-			delete loadedData.useNativeMetadataCache;
-		}
-
-		// Migration: Add API settings defaults if they don't exist
-		if (loadedData && typeof loadedData.enableAPI === "undefined") {
-			loadedData.enableAPI = false;
-		}
-		if (loadedData && typeof loadedData.apiPort === "undefined") {
-			loadedData.apiPort = 8080;
-		}
-		if (loadedData && typeof loadedData.apiAuthToken === "undefined") {
-			loadedData.apiAuthToken = "";
-		}
-		if (loadedData && typeof loadedData.enableMCP === "undefined") {
-			loadedData.enableMCP = false;
-		}
-
-		// Migration: Migrate statusSuggestionTrigger to nlpTriggers if needed
-		if (loadedData && !loadedData.nlpTriggers && loadedData.statusSuggestionTrigger !== undefined) {
-			// eslint-disable-next-line @typescript-eslint/no-require-imports
-			const { DEFAULT_NLP_TRIGGERS } = require("./settings/defaults");
-			loadedData.nlpTriggers = {
-				triggers: [...DEFAULT_NLP_TRIGGERS.triggers],
-			};
-			// Update status trigger if it was customized
-			const statusTriggerIndex = loadedData.nlpTriggers.triggers.findIndex(
-				(t: any) => t.propertyId === "status"
-			);
-			if (statusTriggerIndex !== -1 && loadedData.statusSuggestionTrigger) {
-				loadedData.nlpTriggers.triggers[statusTriggerIndex].trigger =
-					loadedData.statusSuggestionTrigger;
-			}
-		}
-
-		// Migration: Initialize modal fields configuration if not present
-		if (loadedData && !loadedData.modalFieldsConfig) {
-			// eslint-disable-next-line @typescript-eslint/no-require-imports
-			const { initializeFieldConfig } = require("./utils/fieldConfigDefaults");
-			loadedData.modalFieldsConfig = initializeFieldConfig(
-				undefined,
-				loadedData.userFields
-			);
-		}
-
-		// Migration: Force enableBases to true (issue #1187)
-		// The enableBases toggle was removed in V4 (bases is always-on), but users who
-		// had disabled it in pre-V4 still have enableBases: false saved. This prevents
-		// view registration and causes "Unknown view types" errors.
-		if (loadedData && loadedData.enableBases === false) {
-			loadedData.enableBases = true;
-		}
-
-		// Deep merge settings with proper migration for nested objects
-		this.settings = {
-			...DEFAULT_SETTINGS,
-			...loadedData,
-			// Deep merge field mapping to ensure new fields get default values
-			fieldMapping: {
-				...DEFAULT_SETTINGS.fieldMapping,
-				...(loadedData?.fieldMapping || {}),
-			},
-			// Deep merge task creation defaults to ensure new fields get default values
-			taskCreationDefaults: {
-				...DEFAULT_SETTINGS.taskCreationDefaults,
-				...(loadedData?.taskCreationDefaults || {}),
-			},
-			// Deep merge calendar view settings to ensure new fields get default values
-			calendarViewSettings: {
-				...DEFAULT_SETTINGS.calendarViewSettings,
-				...(loadedData?.calendarViewSettings || {}),
-			},
-			// Deep merge command file mapping to ensure new commands get defaults
-			commandFileMapping: {
-				...DEFAULT_SETTINGS.commandFileMapping,
-				...(loadedData?.commandFileMapping || {}),
-			},
-			// Deep merge ICS integration settings to ensure new fields get default values
-			icsIntegration: {
-				...DEFAULT_SETTINGS.icsIntegration,
-				...(loadedData?.icsIntegration || {}),
-			},
-			// Deep merge NLP triggers to ensure new triggers get defaults
-			nlpTriggers: {
-				...DEFAULT_SETTINGS.nlpTriggers,
-				...(loadedData?.nlpTriggers || {}),
-				triggers: loadedData?.nlpTriggers?.triggers || DEFAULT_SETTINGS.nlpTriggers.triggers,
-			},
-			// Modal fields configuration (already migrated above if needed)
-			modalFieldsConfig: loadedData?.modalFieldsConfig,
-			// Array handling - maintain existing arrays or use defaults
-			customStatuses: loadedData?.customStatuses || DEFAULT_SETTINGS.customStatuses,
-			customPriorities: loadedData?.customPriorities || DEFAULT_SETTINGS.customPriorities,
-			savedViews: loadedData?.savedViews || DEFAULT_SETTINGS.savedViews,
-		};
-
-		// Check if we added any new field mappings or calendar settings and save if needed
-		const hasNewFields = Object.keys(DEFAULT_SETTINGS.fieldMapping).some(
-			(key) => !loadedData?.fieldMapping?.[key]
-		);
-		const hasNewCalendarSettings = Object.keys(DEFAULT_SETTINGS.calendarViewSettings).some(
-			(key) =>
-				!loadedData?.calendarViewSettings?.[
-					key as keyof typeof DEFAULT_SETTINGS.calendarViewSettings
-				]
-		);
-		const hasNewCommandMappings = Object.keys(DEFAULT_SETTINGS.commandFileMapping).some(
-			(key) => !loadedData?.commandFileMapping?.[key]
-		);
-
-		if (hasNewFields || hasNewCalendarSettings || hasNewCommandMappings) {
-			// Save the migrated settings to include new field mappings (non-blocking)
-			setTimeout(async () => {
-				try {
-					const data = (await this.loadData()) || {};
-					// Merge only settings properties, preserving non-settings data
-					const settingsKeys = Object.keys(
-						DEFAULT_SETTINGS
-					) as (keyof TaskNotesSettings)[];
-					for (const key of settingsKeys) {
-						data[key] = this.settings[key];
-					}
-					await this.saveData(data);
-				} catch (error) {
-					console.error("Failed to save migrated settings:", error);
+	async loadPluginDataForSafeWrite(operation: string): Promise<Record<string, unknown> | null> {
+		const loadedData = (await this.loadData()) as Record<string, unknown> | null | undefined;
+		if (
+			(loadedData === null || loadedData === undefined) &&
+			(await this.pluginDataFileExists())
+		) {
+			this.settingsLoadCompromised = true;
+			tasknotesLogger.warn(
+				"[TaskNotes] Skipping plugin data save because data.json exists but could not be read.",
+				{
+					category: "configuration",
+					operation: "load-plugin-data-for-safe-write",
+					details: {
+						requestedOperation: operation,
+						settingsSavesBlocked: true,
+					},
 				}
+			);
+			return null;
+		}
+
+		if (loadedData === null || loadedData === undefined) {
+			return {};
+		}
+
+		if (typeof loadedData === "object" && !Array.isArray(loadedData)) {
+			return loadedData;
+		}
+
+		tasknotesLogger.warn(
+			"[TaskNotes] Skipping plugin data save because loaded plugin data was not an object.",
+			{
+				category: "configuration",
+				operation: "load-plugin-data-for-safe-write",
+				details: {
+					requestedOperation: operation,
+					dataType: Array.isArray(loadedData) ? "array" : typeof loadedData,
+				},
+			}
+		);
+		return null;
+	}
+
+	private async loadSettingsData(): Promise<LoadedSettingsData | null> {
+		this.settingsLoadCompromised = false;
+
+		const result = await loadPluginSettingsDataWithRetry(this);
+		this.settingsLoadCompromised = result.compromised;
+		if (result.compromised) {
+			tasknotesLogger.error("Settings data could not be read safely", {
+				category: "internal",
+				operation: "load-settings-data",
+				details: {
+					reason: "Settings data file exists, but Obsidian returned no settings data.",
+					settingsSavesBlocked: true,
+				},
+			});
+		}
+		if (result.compromised)
+			throw new Error(
+				"TaskNotes settings are unreadable; restore settings before loading the plugin."
+			);
+		return result.data;
+	}
+
+	async loadSettings() {
+		let loadedData = await this.loadSettingsData();
+		this.oauthSecretStore ??= new OAuthSecretStore(this.app.secretStorage);
+		this.oauthSecretStorageReady = false;
+
+		if (!this.settingsLoadCompromised) {
+			const migration = migrateLegacyOAuthData(loadedData, this.oauthSecretStore);
+			if (migration.changed && migration.data) {
+				await super.saveData(migration.data);
+			}
+			loadedData = migration.data;
+			this.oauthSecretStorageReady = true;
+		}
+
+		const { settings, shouldPersistMigratedSettings } = buildSettingsFromLoadedData(loadedData);
+		this.settings = settings;
+		this.shouldCreateStarterNoteOnStartup = !settings.lastSeenVersion;
+
+		if (shouldPersistMigratedSettings) {
+			// Save the migrated settings to include new field mappings (non-blocking)
+			window.setTimeout(() => {
+				void (async () => {
+					try {
+						await this.saveSettingsDataOnly();
+					} catch (error) {
+						tasknotesLogger.error("Failed to save migrated settings:", {
+							category: "configuration",
+							operation: "save-migrated-settings",
+							error: error,
+						});
+					}
+				})();
 			}, 100);
 		}
 
 		// Cache setting migration is no longer needed (native cache only)
+	}
+
+	async saveData(data: unknown): Promise<void> {
+		const sanitizedData =
+			this.oauthSecretStorageReady &&
+			typeof data === "object" &&
+			data !== null &&
+			!Array.isArray(data)
+				? stripLegacyOAuthData(data as Record<string, unknown>)
+				: data;
+		await super.saveData(sanitizedData);
 	}
 
 	async saveSettings() {
@@ -696,14 +855,48 @@ export default class TaskNotesPlugin extends Plugin {
 	 * Intended for background/internal updates (e.g., sync token writes).
 	 */
 	async saveSettingsDataOnly(): Promise<void> {
-		// Load existing plugin data to preserve non-settings data like pomodoroHistory
-		const data = (await this.loadData()) || {};
-		// Merge only settings properties, preserving non-settings data
-		const settingsKeys = Object.keys(DEFAULT_SETTINGS) as (keyof TaskNotesSettings)[];
-		for (const key of settingsKeys) {
-			data[key] = this.settings[key];
+		this.settingsDataSaveRequested = true;
+		if (!this.settingsDataSavePromise) {
+			this.settingsDataSavePromise = this.drainSettingsDataSaves();
 		}
-		await this.saveData(data);
+
+		await this.settingsDataSavePromise;
+	}
+
+	private async drainSettingsDataSaves(): Promise<void> {
+		try {
+			while (this.settingsDataSaveRequested) {
+				this.settingsDataSaveRequested = false;
+				await this.writeSettingsDataOnlyOnce();
+			}
+		} finally {
+			this.settingsDataSavePromise = null;
+			if (this.settingsDataSaveRequested) {
+				await this.saveSettingsDataOnly();
+			}
+		}
+	}
+
+	private async writeSettingsDataOnlyOnce(): Promise<void> {
+		if (this.settingsLoadCompromised) {
+			tasknotesLogger.warn(
+				"[TaskNotes] Skipping settings save because settings data could not be read safely during startup.",
+				{
+					category: "configuration",
+					operation: "skipping-settings-save-because-settings-data-read-safely-startup",
+				}
+			);
+			return;
+		}
+
+		await withPluginDataWriteLock(this, async () => {
+			const data = await this.loadPluginDataForSafeWrite("save-settings-data-only");
+			if (!data) {
+				return;
+			}
+
+			await this.saveData(buildSettingsDataForSave(data, this.settings));
+		});
 	}
 
 	async onExternalSettingsChange(): Promise<void> {
@@ -752,108 +945,91 @@ export default class TaskNotesPlugin extends Plugin {
 	 * Create default .base files in TaskNotes/Views/ directory
 	 * Called from settings UI
 	 */
-	async createDefaultBasesFiles(): Promise<void> {
-		const { created, skipped } = await this.ensureBasesViewFiles();
+	async createDefaultBasesFiles(options: { overwriteExisting?: boolean } = {}): Promise<void> {
+		const { created, updated, skipped } = await this.ensureBasesViewFiles(options);
 
 		if (created.length > 0) {
 			new Notice(
-				`Created ${created.length} default Bases file(s):\n${created.join('\n')}`,
+				this.i18n.translate(msg({ message: "Created default Bases files ({count}):\n{files}", context: "notices.commands.basesCreated" }), {
+					count: created.length,
+					files: created.join("\n"),
+				}),
 				8000
 			);
 		}
 
-		if (skipped.length > 0 && created.length === 0) {
+		if (updated.length > 0) {
 			new Notice(
-				`Default Bases files already exist:\n${skipped.join('\n')}`,
+				this.i18n.translate(msg({ message: "Updated default Bases files ({count}):\n{files}", context: "notices.commands.basesUpdated" }), {
+					count: updated.length,
+					files: updated.join("\n"),
+				}),
+				8000
+			);
+		}
+
+		if (skipped.length > 0 && created.length === 0 && updated.length === 0) {
+			new Notice(
+				this.i18n.translate(msg({ message: "Default Bases files already exist:\n{files}", context: "notices.commands.basesExist" }), { files: skipped.join("\n") }),
 				8000
 			);
 		}
 	}
 
-	private async ensureFolderHierarchy(folderPath: string): Promise<void> {
-		if (!folderPath) {
-			return;
-		}
-
-		const normalized = normalizePath(folderPath);
-		const adapter = this.app.vault.adapter;
-		const segments = normalized.split("/").filter((segment) => segment.length > 0);
-
-		if (segments.length === 0) {
-			return;
-		}
-
-		let currentPath = "";
-		for (const segment of segments) {
-			currentPath = currentPath ? `${currentPath}/${segment}` : segment;
-
-			// eslint-disable-next-line no-await-in-loop
-			if (await adapter.exists(currentPath)) {
-				continue;
-			}
-
-			try {
-				// eslint-disable-next-line no-await-in-loop
-				await this.app.vault.createFolder(currentPath);
-			} catch (error) {
-				// eslint-disable-next-line no-await-in-loop
-				if (!(await adapter.exists(currentPath))) {
-					throw error;
-				}
-			}
-		}
+	async updateDefaultBasesFiles(): Promise<DefaultBasesFileResult> {
+		return this.ensureBasesViewFiles({ overwriteExisting: true });
 	}
 
-	async ensureBasesViewFiles(): Promise<{ created: string[]; skipped: string[] }> {
-		const created: string[] = [];
-		const skipped: string[] = [];
+	async ensureBasesViewFiles(
+		options: { overwriteExisting?: boolean } = {}
+	): Promise<{ created: string[]; updated: string[]; skipped: string[] }> {
+		return ensureDefaultBasesViewFiles(
+			{
+				app: this.app,
+				settings: this.settings,
+				generateTemplate: (commandId) => generateBasesFileTemplate(commandId, this),
+				warn: (message, error) => {
+					if (error === undefined) {
+						tasknotesLogger.warn(message, {
+							category: "configuration",
+							operation: "ensure-bases-view-files",
+						});
+					} else {
+						tasknotesLogger.warn(message, {
+							category: "configuration",
+							operation: "ensure-bases-view-files",
+							error: error,
+						});
+					}
+				},
+			},
+			options
+		);
+	}
 
-		try {
-			const adapter = this.app.vault.adapter;
-			const commandFileMapping = {
-				...DEFAULT_SETTINGS.commandFileMapping,
-				...(this.settings.commandFileMapping ?? {}),
-			};
-			this.settings.commandFileMapping = commandFileMapping;
-			const entries = Object.entries(commandFileMapping);
-
-			for (const [commandId, rawPath] of entries) {
-				if (!rawPath) {
-					continue;
+	async ensureStarterNote(): Promise<void> {
+		const shouldCreateStarterNote = this.shouldCreateStarterNoteOnStartup;
+		this.shouldCreateStarterNoteOnStartup = false;
+		await ensureStarterNoteFile({
+			app: this.app,
+			settings: this.settings,
+			shouldCreateStarterNote,
+			saveSettings: () => this.saveSettingsDataOnly(),
+			warn: (message, error) => {
+				if (error === undefined) {
+					tasknotesLogger.warn(message, {
+						category: "configuration",
+						operation: "ensure-starter-note",
+					});
+				} else {
+					tasknotesLogger.warn(message, {
+						category: "configuration",
+						operation: "ensure-starter-note",
+						error,
+					});
 				}
-
-				const normalizedPath = normalizePath(rawPath);
-				// eslint-disable-next-line no-await-in-loop
-				if (await adapter.exists(normalizedPath)) {
-					skipped.push(rawPath);
-					continue;
-				}
-
-				// Generate template with user settings
-				const template = generateBasesFileTemplate(commandId, this);
-				if (!template) {
-					skipped.push(rawPath);
-					continue;
-				}
-
-				// Only create folder hierarchy if we're actually creating the file
-				const lastSlashIndex = normalizedPath.lastIndexOf("/");
-				const directory = lastSlashIndex >= 0 ? normalizedPath.substring(0, lastSlashIndex) : "";
-
-				if (directory) {
-					// eslint-disable-next-line no-await-in-loop
-					await this.ensureFolderHierarchy(directory);
-				}
-
-				// eslint-disable-next-line no-await-in-loop
-				await this.app.vault.create(normalizedPath, template);
-				created.push(rawPath);
-			}
-		} catch (error) {
-			console.warn("[TaskNotes][Bases] Failed to ensure Bases command files:", error);
-		}
-
-		return { created, skipped };
+			},
+		});
 	}
 
 	/**
@@ -872,7 +1048,10 @@ export default class TaskNotesPlugin extends Plugin {
 				const leftLeaf = workspace.getLeftLeaf(false);
 
 				if (!leftLeaf) {
-					console.warn("Could not get left leaf for search pane");
+					tasknotesLogger.warn("Could not get left leaf for search pane", {
+						category: "configuration",
+						operation: "get-left-leaf-search-pane",
+					});
 					return false;
 				}
 
@@ -883,55 +1062,52 @@ export default class TaskNotesPlugin extends Plugin {
 					});
 					searchLeaf = leftLeaf;
 				} catch (error) {
-					console.warn("Failed to create search view:", error);
+					tasknotesLogger.warn("Failed to create search view:", {
+						category: "persistence",
+						operation: "create-search-view",
+						error: error,
+					});
 					return false;
 				}
 			}
 
 			if (!searchLeaf) {
-				console.warn("No search leaf available");
+				tasknotesLogger.warn("No search leaf available", {
+					category: "configuration",
+					operation: "no-search-leaf",
+				});
 				return false;
 			}
 
 			await this.revealLeafReady(searchLeaf);
 
-			// Set the search query to "tag:#tagname"
 			const searchQuery = `tag:${tag}`;
-			const searchView = searchLeaf.view as any;
-
-			// Try different methods to set the search query based on Obsidian version
-			if (typeof searchView.setQuery === "function") {
-				// Newer Obsidian versions
-				searchView.setQuery(searchQuery);
-			} else if (typeof searchView.searchComponent?.setValue === "function") {
-				// Alternative method
-				searchView.searchComponent.setValue(searchQuery);
-			} else if (searchView.searchInputEl) {
-				// Fallback: set the input value directly
-				searchView.searchInputEl.value = searchQuery;
-				// Trigger search if possible
-				if (typeof searchView.startSearch === "function") {
-					searchView.startSearch();
-				}
-			} else {
-				console.warn("[TaskNotes] Could not find method to set search query");
-				new Notice("Search pane opened but could not set tag query");
+			if (!applySearchQueryToView(searchLeaf.view, searchQuery)) {
+				tasknotesLogger.warn("[TaskNotes] Could not find method to set search query", {
+					category: "stale-data",
+					operation: "find-method-set-search-query",
+				});
+				new Notice(this.i18n.translate(msg({ message: "Search pane opened but could not set tag query", context: "notices.commands.tagQueryFailed" })));
 				return false;
 			}
 
 			return true;
 		} catch (error) {
-			console.error("[TaskNotes] Error opening search pane with tag:", error);
-			new Notice(`Failed to open search pane for tag: ${tag}`);
+			tasknotesLogger.error("[TaskNotes] Error opening search pane with tag:", {
+				category: "internal",
+				operation: "opening-search-pane-tag",
+				error: error,
+			});
+			new Notice(this.i18n.translate(msg({ message: "Failed to open search pane for tag: {tag}", context: "notices.commands.tagSearchFailed" }), { tag }));
 			return false;
 		}
 	}
 
-	getLeafOfType(viewType: string): WorkspaceLeaf | null {
+	getLeafOfType(viewType: string): unknown {
 		return this.workspaceNavigationService.getLeafOfType(viewType);
 	}
 
-	getCalendarLeaf(): WorkspaceLeaf | null {
+	getCalendarLeaf(): unknown {
 		return this.getLeafOfType(MINI_CALENDAR_VIEW_TYPE);
 	}
 
@@ -946,9 +1122,7 @@ export default class TaskNotesPlugin extends Plugin {
 		try {
 			// Check if Daily Notes plugin is enabled
 			if (!appHasDailyNotesPluginLoaded()) {
-				new Notice(
-					"Daily Notes core plugin is not enabled. Please enable it in Settings > Core plugins."
-				);
+				new Notice(this.i18n.translate(msg({ message: "Daily notes core plugin is not enabled. Please enable it in settings > core plugins.", context: "notices.commands.dailyNotesDisabled" })));
 				return;
 			}
 
@@ -957,7 +1131,9 @@ export default class TaskNotesPlugin extends Plugin {
 			// before passing to moment() to ensure correct day is used
 			// Fix for issue #1223: Skip conversion if the date is already local (e.g., from getTodayLocal())
 			const localDate = options?.isAlreadyLocal ? date : convertUTCToLocalCalendarDate(date);
-			const moment = (window as Window & { moment: (date: Date) => any }).moment(localDate);
+			const moment = (window as Window & { moment: (date: Date) => DailyNoteMoment }).moment(
+				localDate
+			);
 
 			// Get all daily notes to check if one exists for this date
 			const allDailyNotes = getAllDailyNotes();
@@ -971,8 +1147,16 @@ export default class TaskNotesPlugin extends Plugin {
 					noteWasCreated = true;
 				} catch (error) {
 					const errorMessage = error instanceof Error ? error.message : String(error);
-					console.error("Failed to create daily note:", error);
-					new Notice(`Failed to create daily note: ${errorMessage}`);
+					tasknotesLogger.error("Failed to create daily note:", {
+						category: "persistence",
+						operation: "create-daily-note",
+						error: error,
+					});
+					new Notice(
+						this.i18n.translate(msg({ message: "Failed to create daily note: {message}", context: "notices.commands.dailyNoteCreateFailed" }), {
+							message: displayError(errorMessage),
+						})
+					);
 					return;
 				}
 			}
@@ -991,98 +1175,156 @@ export default class TaskNotesPlugin extends Plugin {
 			}
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : String(error);
-			console.error("Failed to navigate to daily note:", error);
-			new Notice(`Failed to navigate to daily note: ${errorMessage}`);
+			tasknotesLogger.error("Failed to navigate to daily note:", {
+				category: "persistence",
+				operation: "navigate-daily-note",
+				error: error,
+			});
+			new Notice(
+				this.i18n.translate(msg({ message: "Failed to navigate to daily note: {message}", context: "notices.commands.dailyNoteOpenFailed" }), {
+					message: displayError(errorMessage),
+				})
+			);
 		}
 	}
 
 	/**
-	 * Inject dynamic CSS for custom statuses and priorities
+	 * Apply dynamic CSS variables for custom statuses and priorities.
 	 */
 	injectCustomStyles(): void {
-		// Remove existing custom styles
-		const existingStyle = document.getElementById("tasknotes-custom-styles");
-		if (existingStyle) {
-			existingStyle.remove();
+		// Remove the style element used by TaskNotes 4.12.0 and earlier.
+		activeDocument.getElementById("tasknotes-custom-styles")?.remove();
+
+		const rootStyle = activeDocument.documentElement.style;
+		for (let index = rootStyle.length - 1; index >= 0; index -= 1) {
+			const propertyName = rootStyle.item(index);
+			if (propertyName.startsWith("--status-") || propertyName.startsWith("--priority-")) {
+				rootStyle.removeProperty(propertyName);
+			}
 		}
 
-		// Generate new styles
-		const statusStyles = this.statusManager.getStatusStyles();
-		const priorityStyles = this.priorityManager.getPriorityStyles();
-
-		// Create style element
-		const styleEl = document.createElement("style");
-		styleEl.id = "tasknotes-custom-styles";
-		styleEl.textContent = `
-		${statusStyles}
-		${priorityStyles}
-	`;
-
-		// Inject into document head
-		document.head.appendChild(styleEl);
+		for (const [propertyName, value] of [
+			...this.statusManager.getStatusColorVariables(),
+			...this.priorityManager.getPriorityColorVariables(),
+		]) {
+			rootStyle.setProperty(propertyName, value);
+		}
 	}
 
 	async updateTaskProperty(
 		task: TaskInfo,
 		property: keyof TaskInfo,
 		value: TaskInfo[keyof TaskInfo],
-		options: { silent?: boolean } = {}
+		options: {
+			silent?: boolean;
+			completionDate?: string;
+			confirmClearInstances?: (cleared: {
+				complete: string[];
+				skipped: string[];
+			}) => Promise<boolean>;
+		} = {}
 	): Promise<TaskInfo> {
 		try {
-			const updatedTask = await this.taskService.updateProperty(
-				task,
-				property,
-				value,
-				options
-			);
+			// A declined clear-confirmation aborts the reschedule, so the success notice is suppressed below.
+			let cancelledByUser = false;
+			const confirmClearInstances =
+				options.confirmClearInstances ??
+				(options.silent
+					? undefined
+					: async (cleared: { complete: string[]; skipped: string[] }) => {
+							const proceed = await this.confirmClearRescheduledInstances(cleared);
+							if (!proceed) {
+								cancelledByUser = true;
+							}
+							return proceed;
+						});
 
-			// Provide user feedback unless silent
-			if (!options.silent) {
+			const updatedTask = await this.taskService.updateProperty(task, property, value, {
+				...options,
+				confirmClearInstances,
+			});
+
+			if (!options.silent && !cancelledByUser) {
 				if (property === "status") {
 					const statusValue = typeof value === "string" ? value : String(value);
 					const statusConfig = this.statusManager.getStatusConfig(statusValue);
-					new Notice(`Task marked as '${statusConfig?.label || statusValue}'`);
+					new Notice(
+						this.i18n.translate(msg({ message: "Task marked as ''{status}''", context: "notices.commands.statusChanged" }), {
+							status: uiData(configLabel(statusConfig) || statusValue, "User-configured status label/value; never rewrite stored metadata"),
+						})
+					);
 				} else {
-					new Notice(`Task ${property} updated`);
+					new Notice(this.i18n.translate(msg({ message: "Task updated", context: "notices.commands.taskUpdated" })));
 				}
 			}
 
 			return updatedTask;
 		} catch (error) {
-			console.error(`Failed to update task ${property}:`, error);
-			new Notice(`Failed to update task ${property}`);
+			tasknotesLogger.error(`Failed to update task ${property}:`, {
+				category: "validation",
+				operation: "update-task",
+				error: error,
+			});
+			new Notice(this.i18n.translate(msg({ message: "Failed to update task", context: "notices.commands.taskUpdateFailed" })));
 			throw error;
 		}
 	}
 
 	/**
+	 * Ask the user to confirm clearing recorded completed/skipped instances that a
+	 * reschedule would remove (those on or after the new scheduled date).
+	 */
+	private async confirmClearRescheduledInstances(cleared: {
+		complete: string[];
+		skipped: string[];
+	}): Promise<boolean> {
+		const { showConfirmationModal } = await import("./modals/ConfirmationModal");
+		const dates = Array.from(new Set([...cleared.complete, ...cleared.skipped])).sort();
+		return showConfirmationModal(this.app, {
+			title: this.i18n.translate(msg({ message: "Clear recorded instances?", context: "contextMenus.task.completion.clearInstancesConfirmTitle" })),
+			message: this.i18n.translate(
+				msg({ message: "Rescheduling will clear these recorded completed/skipped instances on or after the new date: {dates}. They will no longer be marked complete or skipped. Continue?", context: "contextMenus.task.completion.clearInstancesConfirmMessage" }),
+				{ dates: dates.join(", ") }
+			),
+			confirmText: this.i18n.translate(
+				msg({ message: "Reschedule and clear", context: "contextMenus.task.completion.clearInstancesConfirmButton" })
+			),
+		});
+	}
+
+	/**
 	 * Toggles a recurring task's completion status for the selected date
 	 */
-	async toggleRecurringTaskComplete(task: TaskInfo, date?: Date): Promise<TaskInfo> {
+	async toggleRecurringTaskComplete(
+		task: TaskInfo,
+		date?: Date,
+		options?: RecurringCompletionOptions
+	): Promise<TaskInfo> {
 		try {
-			// Let TaskService handle the date logic (defaults to local today, not selectedDate)
-			const updatedTask = await this.taskService.toggleRecurringTaskComplete(task, date);
-
-			// For notification, determine the actual completion date from the task
-			// Use local today if no explicit date provided
-			const targetDate =
-				date ||
-				(() => {
-					const todayLocal = getTodayLocal();
-					return createUTCDateFromLocalCalendarDate(todayLocal);
-				})();
-
-			const dateStr = formatDateForStorage(targetDate);
-			const wasCompleted = updatedTask.complete_instances?.includes(dateStr);
-			const action = wasCompleted ? "completed" : "marked incomplete";
-
-			// Format date for display: convert UTC-anchored date back to local display
-			const displayDate = parseDateToLocal(dateStr);
-			new Notice(`Recurring task ${action} for ${format(displayDate, "MMM d")}`);
+			const targetDate = await this.taskService.resolveRecurringTaskActionDate(task, date);
+			const { updatedTask, completed, changed, undo } = await completeRecurringTaskWithUndo(
+				this,
+				task,
+				targetDate,
+				options
+			);
+			if (changed) {
+				showRecurringCompletionNotice(
+					this,
+					updatedTask,
+					formatDateForStorage(targetDate),
+					completed,
+					undo
+				);
+			}
 			return updatedTask;
 		} catch (error) {
-			console.error("Failed to toggle recurring task completion:", error);
-			new Notice("Failed to update recurring task");
+			tasknotesLogger.error("Failed to toggle recurring task completion:", {
+				category: "persistence",
+				operation: "toggle-recurring-task-completion",
+				error: error,
+			});
+			new Notice(this.i18n.translate(msg({ message: "Failed to update recurring task", context: "notices.commands.recurringUpdateFailed" })));
 			throw error;
 		}
 	}
@@ -1090,12 +1332,21 @@ export default class TaskNotesPlugin extends Plugin {
 	async toggleTaskArchive(task: TaskInfo): Promise<TaskInfo> {
 		try {
 			const updatedTask = await this.taskService.toggleArchive(task);
-			const action = updatedTask.archived ? "archived" : "unarchived";
-			new Notice(`Task ${action}`);
+			new Notice(
+				this.i18n.translate(
+					updatedTask.archived
+						? msg({ message: "Task archived", context: "notices.commands.archived" })
+						: msg({ message: "Task unarchived", context: "notices.commands.unarchived" })
+				)
+			);
 			return updatedTask;
 		} catch (error) {
-			console.error("Failed to toggle task archive:", error);
-			new Notice("Failed to update task archive status");
+			tasknotesLogger.error("Failed to toggle task archive:", {
+				category: "persistence",
+				operation: "toggle-task-archive",
+				error: error,
+			});
+			new Notice(this.i18n.translate(msg({ message: "Failed to update task archive status", context: "notices.commands.archiveFailed" })));
 			throw error;
 		}
 	}
@@ -1104,17 +1355,46 @@ export default class TaskNotesPlugin extends Plugin {
 		try {
 			const updatedTask = await this.taskService.toggleStatus(task);
 			const statusConfig = this.statusManager.getStatusConfig(updatedTask.status);
-			new Notice(`Task marked as '${statusConfig?.label || updatedTask.status}'`);
+			new Notice(
+				this.i18n.translate(msg({ message: "Task marked as ''{status}''", context: "notices.commands.statusChanged" }), {
+					status: uiData(configLabel(statusConfig) || updatedTask.status, "User-configured status label/value; never rewrite stored metadata"),
+				})
+			);
 			return updatedTask;
 		} catch (error) {
-			console.error("Failed to toggle task status:", error);
-			new Notice("Failed to update task status");
+			tasknotesLogger.error("Failed to toggle task status:", {
+				category: "persistence",
+				operation: "toggle-task-status",
+				error: error,
+			});
+			new Notice(this.i18n.translate(msg({ message: "Failed to update task status", context: "notices.commands.statusFailed" })));
 			throw error;
 		}
 	}
 
 	openTaskCreationModal(prePopulatedValues?: Partial<TaskInfo>) {
-		new TaskCreationModal(this.app, this, { prePopulatedValues }).open();
+		new TaskCreationModal(this.app, this, {
+			prePopulatedValues: this.applyParentNoteProjectDefault(
+				prePopulatedValues,
+				"task-creation"
+			),
+		}).open();
+	}
+
+	private applyParentNoteProjectDefault(
+		prePopulatedValues: Partial<TaskInfo> | undefined,
+		context: ParentNoteProjectDefaultContext
+	): Partial<TaskInfo> | undefined {
+		if (!shouldApplyParentNoteProjectDefault(this.settings.taskCreationDefaults, context)) {
+			return prePopulatedValues;
+		}
+
+		const currentFile = this.app.workspace.getActiveFile();
+		const parentNote = currentFile
+			? this.app.fileManager.generateMarkdownLink(currentFile, currentFile.path)
+			: undefined;
+
+		return applyParentNoteProjectDefault(prePopulatedValues, parentNote);
 	}
 
 	/**
@@ -1124,65 +1404,37 @@ export default class TaskNotesPlugin extends Plugin {
 	async convertCurrentNoteToTask(): Promise<void> {
 		const activeFile = this.app.workspace.getActiveFile();
 		if (!activeFile) {
-			new Notice(this.i18n.translate("commands.convertCurrentNoteToTask.noActiveFile"));
+			new Notice(this.i18n.translate(msg({ message: "No active file to convert", context: "commands.convertCurrentNoteToTask.noActiveFile" })));
 			return;
 		}
 
 		// Check if this note is already a task
 		const existingTask = await this.cacheManager.getTaskInfo(activeFile.path);
 		if (existingTask) {
-			new Notice(this.i18n.translate("commands.convertCurrentNoteToTask.alreadyTask"));
+			new Notice(this.i18n.translate(msg({ message: "This note is already a task", context: "commands.convertCurrentNoteToTask.alreadyTask" })));
 			return;
 		}
 
 		// Read existing frontmatter and body from the file
 		const metadata = this.app.metadataCache.getFileCache(activeFile);
-		const frontmatter: Record<string, any> = metadata?.frontmatter || {};
+		const frontmatter: Record<string, unknown> = metadata?.frontmatter || {};
 		const content = await this.app.vault.read(activeFile);
 
-		// Extract body content (everything after frontmatter)
-		let details = "";
-		const frontmatterMatch = content.match(/^---\n[\s\S]*?\n---\n*/);
-		if (frontmatterMatch) {
-			details = content.slice(frontmatterMatch[0].length).trim();
-		} else {
-			details = content.trim();
-		}
-
-		// Build a TaskInfo object from the note's existing data
-		// Use defaults for required fields that don't exist
-		// Use ?? (nullish coalescing) to properly handle empty string defaults
-		const now = getCurrentTimestamp();
-		const taskInfo: TaskInfo = {
+		const taskInfo = buildCurrentNoteConversionTaskInfo({
 			path: activeFile.path,
-			title: frontmatter.title || activeFile.basename,
-			status: frontmatter.status ?? this.settings.defaultTaskStatus,
-			priority: frontmatter.priority ?? this.settings.defaultTaskPriority,
-			archived: false,
-			due: frontmatter.due || undefined,
-			scheduled: frontmatter.scheduled || undefined,
-			contexts: frontmatter.contexts
-				? (Array.isArray(frontmatter.contexts) ? frontmatter.contexts : [frontmatter.contexts])
-				: undefined,
-			projects: frontmatter.projects
-				? (Array.isArray(frontmatter.projects) ? frontmatter.projects : [frontmatter.projects])
-				: undefined,
-			tags: frontmatter.tags
-				? (Array.isArray(frontmatter.tags) ? frontmatter.tags : [frontmatter.tags])
-				: [],
-			timeEstimate: frontmatter.timeEstimate || undefined,
-			recurrence: frontmatter.recurrence || undefined,
-			dateCreated: frontmatter.dateCreated || now,
-			dateModified: now,
-			details: details,
-		};
+			basename: activeFile.basename,
+			content,
+			frontmatter,
+			settings: this.settings,
+			fieldMapper: this.fieldMapper,
+		});
 
 		// Open the task edit modal with the constructed TaskInfo
 		new TaskEditModal(this.app, this, {
 			task: taskInfo,
 			onTaskUpdated: (updatedTask) => {
 				new Notice(
-					this.i18n.translate("commands.convertCurrentNoteToTask.success", {
+					this.i18n.translate(msg({ message: "Converted ''{title}'' to a task", context: "commands.convertCurrentNoteToTask.success" }), {
 						title: updatedTask.title,
 					})
 				);
@@ -1198,106 +1450,12 @@ export default class TaskNotesPlugin extends Plugin {
 		await this.taskActionCoordinator.openTaskSelectorWithCreate();
 	}
 
-	/**
-	 * Apply a filter to show subtasks of a project
-	 */
-	async applyProjectSubtaskFilter(projectTask: TaskInfo): Promise<void> {
-		try {
-			const file = this.app.vault.getAbstractFileByPath(projectTask.path);
-			if (!file) {
-				new Notice("Project file not found");
-				return;
-			}
-
-			// Note: This feature was part of the old view system (deprecated in v4)
-			// TODO: Re-implement for Bases views if needed
-			new Notice("Project subtask filtering not available");
-		} catch (error) {
-			console.error("Error applying project subtask filter:", error);
-			new Notice("Failed to apply project filter");
-		}
+	async openTaskSelectorWithCreateAndStartTracking(): Promise<void> {
+		await this.taskActionCoordinator.openTaskSelectorWithCreateAndStartTracking();
 	}
 
-	/**
-	 * Legacy method: Add a project filter condition (no longer used)
-	 * Uses the same pattern as search to ensure correct AND/OR logic
-	 */
-	private addProjectCondition(filterBar: any, projectName: string): void {
-		// Remove existing project conditions first
-		this.removeProjectConditions(filterBar);
-
-		// Defensive check: ensure children array exists
-		if (!Array.isArray(filterBar.currentQuery.children)) {
-			filterBar.currentQuery.children = [];
-		}
-
-		// Create condition for wikilink format [[Project Name]]
-		const projectCondition = {
-			type: "condition",
-			id: `project_${this.generateFilterId()}`,
-			property: "projects",
-			operator: "contains",
-			value: `[[${projectName}]]`,
-		};
-
-		// Get existing non-project filters
-		const existingFilters = filterBar.currentQuery.children.filter((child: any) => {
-			return !(
-				child.type === "condition" &&
-				child.property === "projects" &&
-				child.operator === "contains" &&
-				child.id.startsWith("project_")
-			);
-		});
-
-		if (existingFilters.length === 0) {
-			// No existing filters, just add the project condition
-			filterBar.currentQuery.children = [projectCondition];
-		} else {
-			// Create a group containing all existing filters
-			const existingFiltersGroup = {
-				type: "group",
-				id: this.generateFilterId(),
-				conjunction: filterBar.currentQuery.conjunction, // Preserve the current conjunction
-				children: existingFilters,
-			};
-
-			// Replace query children with the project condition AND the existing filters group
-			filterBar.currentQuery.children = [projectCondition, existingFiltersGroup];
-			filterBar.currentQuery.conjunction = "and"; // Connect project with existing filters using AND
-		}
-
-		// Update the filter bar UI and emit changes
-		filterBar.updateFilterBuilder();
-		filterBar.emit("queryChange", filterBar.currentQuery);
-	}
-
-	/**
-	 * Remove existing project filter conditions
-	 */
-	private removeProjectConditions(filterBar: any): void {
-		if (!Array.isArray(filterBar.currentQuery.children)) {
-			filterBar.currentQuery.children = [];
-			return;
-		}
-
-		filterBar.currentQuery.children = filterBar.currentQuery.children.filter((child: any) => {
-			if (child.type === "condition") {
-				return !(
-					child.property === "projects" &&
-					child.operator === "contains" &&
-					child.id.startsWith("project_")
-				);
-			}
-			return true;
-		});
-	}
-
-	/**
-	 * Generate a unique filter ID
-	 */
-	private generateFilterId(): string {
-		return `filter-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+	async rolloverOverdueScheduledTasks(): Promise<void> {
+		await this.taskActionCoordinator.rolloverOverdueScheduledTasks();
 	}
 
 	/**
@@ -1312,6 +1470,10 @@ export default class TaskNotesPlugin extends Plugin {
 	 */
 	async stopTimeTracking(task: TaskInfo): Promise<TaskInfo> {
 		return this.taskActionCoordinator.stopTimeTracking(task);
+	}
+
+	async stopActiveTimeTracking(): Promise<void> {
+		await this.taskActionCoordinator.stopActiveTimeTracking();
 	}
 
 	/**
@@ -1352,29 +1514,43 @@ export default class TaskNotesPlugin extends Plugin {
 	 * Opens a date/time picker modal for the given task date field.
 	 */
 	async openDueDateModal(task: TaskInfo) {
-		this.openTaskDatePicker(task, "due");
+		void this.openTaskDatePicker(task, "due");
 	}
 
 	async openScheduledDateModal(task: TaskInfo) {
-		this.openTaskDatePicker(task, "scheduled");
+		void this.openTaskDatePicker(task, "scheduled");
 	}
 
 	private async openTaskDatePicker(task: TaskInfo, field: "due" | "scheduled") {
 		try {
 			const { DateTimePickerModal } = await import("./modals/DateTimePickerModal");
-			const { getDatePart, getTimePart, combineDateAndTime } = await import("./utils/dateUtils");
+			const { getDatePart, getTimePart, combineDateAndTime } = await import(
+				"./utils/dateUtils"
+			);
 			const currentValue = (field === "due" ? task.due : task.scheduled) || "";
 			const modal = new DateTimePickerModal(this.app, {
 				currentDate: getDatePart(currentValue) || null,
 				currentTime: getTimePart(currentValue) || null,
-				onSelect: async (date, time) => {
-					const value = date && time ? combineDateAndTime(date, time) : date || undefined;
-					await this.taskService.updateProperty(task, field, value);
+				dateRole: field,
+				plugin: this,
+				onSelect: (date, time) => {
+					void (async () => {
+						const value =
+							date && time ? combineDateAndTime(date, time) : date || undefined;
+						await this.taskService.updateProperty(task, field, value, {
+							confirmClearInstances: (cleared) =>
+								this.confirmClearRescheduledInstances(cleared),
+						});
+					})();
 				},
 			});
 			modal.open();
 		} catch (error) {
-			console.error("Error loading DateTimePickerModal:", error);
+			tasknotesLogger.error("Error loading DateTimePickerModal:", {
+				category: "validation",
+				operation: "loading-datetimepickermodal",
+				error: error,
+			});
 		}
 	}
 
@@ -1384,20 +1560,31 @@ export default class TaskNotesPlugin extends Plugin {
 	async refreshCache(): Promise<void> {
 		try {
 			// Show loading notice
-			const loadingNotice = new Notice("Refreshing TaskNotes cache...", 0);
+			const loadingNotice = new Notice(
+				this.i18n.translate(msg({ message: "Refreshing TaskNotes cache...", context: "notices.commands.cacheRefreshing" })),
+				0
+			);
 
 			// Clear all caches
 			await this.cacheManager.clearAllCaches();
 
 			// Notify all views to refresh
 			this.notifyDataChanged(undefined, true, true);
+			this.emitter.trigger(TASKNOTES_RUNTIME_LIFECYCLE_RAW_EVENTS["cache.rebuilt"], {
+				force: true,
+				timestamp: new Date().toISOString(),
+			});
 
 			// Hide loading notice and show success
 			loadingNotice.hide();
-			new Notice("TaskNotes cache refreshed successfully");
+			new Notice(this.i18n.translate(msg({ message: "TaskNotes cache refreshed successfully", context: "notices.commands.cacheRefreshed" })));
 		} catch (error) {
-			console.error("Error refreshing cache:", error);
-			new Notice("Failed to refresh cache. Please try again.");
+			tasknotesLogger.error("Error refreshing cache:", {
+				category: "stale-data",
+				operation: "refreshing-cache",
+				error: error,
+			});
+			new Notice(this.i18n.translate(msg({ message: "Failed to refresh cache. Please try again.", context: "notices.commands.cacheFailed" })));
 		}
 	}
 
@@ -1407,19 +1594,24 @@ export default class TaskNotesPlugin extends Plugin {
 	 */
 	async convertTaskToTaskNote(editor: Editor): Promise<void> {
 		try {
-			const cursor = editor.getCursor();
+			// The selection's head may be at ch:0 of the next, unselected line.
+			const cursor = editor.getCursor("from");
 
 			// Check if instant convert service is available
 			if (!this.instantTaskConvertService) {
-				new Notice("Task conversion service not available. Please try again.");
+				new Notice(this.i18n.translate(msg({ message: "Task conversion service not available. Please try again.", context: "notices.commands.conversionUnavailable" })));
 				return;
 			}
 
 			// Use the instant convert service for immediate conversion without modal
 			await this.instantTaskConvertService.instantConvertTask(editor, cursor.line);
 		} catch (error) {
-			console.error("Error converting task:", error);
-			new Notice("Failed to convert task. Please try again.");
+			tasknotesLogger.error("Error converting task:", {
+				category: "validation",
+				operation: "converting-task",
+				error: error,
+			});
+			new Notice(this.i18n.translate(msg({ message: "Failed to convert task. Please try again.", context: "services.instantTaskConvert.notices.conversionFailed" })));
 		}
 	}
 
@@ -1430,15 +1622,19 @@ export default class TaskNotesPlugin extends Plugin {
 		try {
 			// Check if instant convert service is available
 			if (!this.instantTaskConvertService) {
-				new Notice("Task conversion service not available. Please try again.");
+				new Notice(this.i18n.translate(msg({ message: "Task conversion service not available. Please try again.", context: "notices.commands.conversionUnavailable" })));
 				return;
 			}
 
 			// Use the instant convert service for batch conversion
 			await this.instantTaskConvertService.batchConvertAllTasks(editor);
 		} catch (error) {
-			console.error("Error batch converting tasks:", error);
-			new Notice("Failed to batch convert tasks. Please try again.");
+			tasknotesLogger.error("Error batch converting tasks:", {
+				category: "validation",
+				operation: "batch-converting-tasks",
+				error: error,
+			});
+			new Notice(this.i18n.translate(msg({ message: "Failed to batch convert tasks. Please try again.", context: "notices.commands.batchConversionFailed" })));
 		}
 	}
 
@@ -1456,11 +1652,11 @@ export default class TaskNotesPlugin extends Plugin {
 				if (selectedTask) {
 					// Create link using Obsidian's generateMarkdownLink (respects user's link format settings)
 					const file = this.app.vault.getAbstractFileByPath(selectedTask.path);
-					if (file) {
+					if (file instanceof TFile) {
 						const currentFile = this.app.workspace.getActiveFile();
 						const sourcePath = currentFile?.path || "";
 						const properLink = this.app.fileManager.generateMarkdownLink(
-							file as TFile,
+							file,
 							sourcePath,
 							"",
 							selectedTask.title // Use task title as alias
@@ -1477,13 +1673,17 @@ export default class TaskNotesPlugin extends Plugin {
 						};
 						editor.setCursor(newCursor);
 					} else {
-						new Notice("Failed to create link - file not found");
+						new Notice(this.i18n.translate(msg({ message: "Failed to create link - file not found", context: "notices.commands.linkFileMissing" })));
 					}
 				}
 			});
 		} catch (error) {
-			console.error("Error inserting tasknote link:", error);
-			new Notice("Failed to insert tasknote link");
+			tasknotesLogger.error("Error inserting tasknote link:", {
+				category: "persistence",
+				operation: "inserting-tasknote-link",
+				error: error,
+			});
+			new Notice(this.i18n.translate(msg({ message: "Failed to insert task link", context: "notices.commands.linkInsertFailed" })));
 		}
 	}
 
@@ -1569,27 +1769,381 @@ export default class TaskNotesPlugin extends Plugin {
 			// Get currently active file
 			const activeFile = this.app.workspace.getActiveFile();
 			if (!activeFile) {
-				new Notice("No file is currently open");
+				new Notice(this.i18n.translate(msg({ message: "No file is currently open", context: "notices.commands.noOpenFile" })));
 				return;
 			}
 
-			// Check if it's a TaskNote
+			await this.openQuickActionsForTaskFile(activeFile, uiText(msg({ message: "Current file is not a tasknote", context: "main: TaskNotesPlugin.openQuickActionsForCurrentTask display" })));
+		} catch (error) {
+			tasknotesLogger.error("Error opening quick actions:", {
+				category: "internal",
+				operation: "opening-quick-actions",
+				error: error,
+			});
+			new Notice(this.i18n.translate(msg({ message: "Failed to open quick actions", context: "notices.commands.quickActionsFailed" })));
+		}
+	}
+
+	async openQuickActionsForTaskUnderCursor(
+		editor: Editor,
+		sourceFile?: Nullable<TFile>
+	): Promise<void> {
+		try {
+			const activeFile = sourceFile ?? this.app.workspace.getActiveFile();
+			if (!activeFile) {
+				new Notice(this.i18n.translate(msg({ message: "No file is currently open", context: "notices.commands.noOpenFile" })));
+				return;
+			}
+
+			const detectionService = await this.getTaskLinkDetectionService();
+			const link = this.getTaskLinkAtCursor(editor, detectionService);
+			if (!link) {
+				new Notice(this.i18n.translate(msg({ message: "No task link found", context: "notices.commands.noTaskLink" })));
+				return;
+			}
+
+			const detected = await detectionService.detectTaskLink(
+				link.match,
+				activeFile.path,
+				link.type
+			);
+			if (!detected.isValidTaskLink || !detected.taskInfo) {
+				new Notice(this.i18n.translate(msg({ message: "No task link found", context: "notices.commands.noTaskLink" })));
+				return;
+			}
+
+			await this.openQuickActionsForTaskInfo(detected.taskInfo);
+		} catch (error) {
+			tasknotesLogger.error("Error opening quick actions for task under cursor:", {
+				category: "persistence",
+				operation: "opening-quick-actions-task-under-cursor",
+				error: error,
+			});
+			new Notice(this.i18n.translate(msg({ message: "Failed to open quick actions", context: "notices.commands.quickActionsFailed" })));
+		}
+	}
+
+	async openTaskEditModalForCurrentTask(): Promise<void> {
+		const activeFile = this.app.workspace.getActiveFile();
+		if (!activeFile) {
+			new Notice(this.i18n.translate(msg({ message: "No file is currently open", context: "notices.commands.noOpenFile" })));
+			return;
+		}
+
+		await this.openTaskEditModalForFile(activeFile, uiText(msg({ message: "Current file is not a tasknote", context: "main: TaskNotesPlugin.openTaskEditModalForCurrentTask display" })));
+	}
+
+	private currentTaskTimeTrackingPending = false;
+
+	async setCurrentTaskTimeTracking(action: "start" | "stop"): Promise<void> {
+		if (this.currentTaskTimeTrackingPending) {
+			return;
+		}
+		this.currentTaskTimeTrackingPending = true;
+		try {
+			const task = await this.getCurrentTaskForCommand();
+			if (!task) {
+				return;
+			}
+
+			try {
+				if (action === "start") {
+					await this.startTimeTracking(task);
+				} else {
+					await this.stopTimeTracking(task);
+				}
+			} catch {
+				// The coordinator already logs the failure and shows a specific notice.
+			}
+		} catch (error) {
+			tasknotesLogger.error("Failed to resolve current task for time tracking:", {
+				category: "persistence",
+				operation: "current-task-time-tracking",
+				error,
+			});
+			new Notice(this.i18n.translate(msg({ message: "Failed to load current task", context: "notices.commands.taskLoadFailed" })));
+		} finally {
+			this.currentTaskTimeTrackingPending = false;
+		}
+	}
+
+	async cycleCurrentTaskStatus(): Promise<void> {
+		try {
+			const taskInfo = await this.getCurrentTaskForCommand();
+			if (!taskInfo) {
+				return;
+			}
+
+			const nextStatus = this.statusManager.getNextStatus(taskInfo.status);
+			await this.updateTaskProperty(taskInfo, "status", nextStatus);
+		} catch (error) {
+			tasknotesLogger.error("Failed to cycle current task status:", {
+				category: "persistence",
+				operation: "cycle-current-task-status",
+				error: error,
+			});
+			new Notice(this.i18n.translate(msg({ message: "Failed to cycle task status", context: "notices.commands.statusCycleFailed" })));
+		}
+	}
+
+	async repeatCurrentTask(): Promise<void> {
+		try {
+			const taskInfo = await this.getCurrentTaskForCommand();
+			if (!taskInfo) {
+				return;
+			}
+			if (taskInfo.recurrence) {
+				new Notice(this.i18n.translate(msg({ message: "Recurring tasks already track each occurrence", context: "notices.commands.repeatRecurring" })));
+				return;
+			}
+			if (isMaterializedOccurrenceTask(taskInfo)) {
+				new Notice(this.i18n.translate(msg({ message: "This task is an occurrence of a recurring task", context: "notices.commands.repeatOccurrence" })));
+				return;
+			}
+			if (!this.statusManager.isCompletedStatus(taskInfo.status)) {
+				new Notice(this.i18n.translate(msg({ message: "Current task is not completed", context: "notices.commands.repeatNotCompleted" })));
+				return;
+			}
+
+			const { showConfirmationModal } = await import("./modals/ConfirmationModal");
+			const confirmed = await showConfirmationModal(this.app, {
+				title: this.i18n.translate(msg({ message: "Repeat current task", context: "commands.repeatCurrentTask" })),
+				message: this.i18n.translate(msg({ message: "Reopen this task, save its completion date and unarchive it? Body checkboxes will reset if enabled. You can edit dates afterwards; cancelling that editor will not undo these changes.", context: "commands.repeatCurrentTask.confirm" })),
+			});
+			if (!confirmed) {
+				return;
+			}
+
+			const repeatedTask = await this.taskService.repeatTask(taskInfo);
+			await this.openTaskEditModal(repeatedTask);
+		} catch (error) {
+			tasknotesLogger.error("Failed to repeat current task:", {
+				category: "persistence",
+				operation: "repeat-current-task",
+				error,
+			});
+			new Notice(this.i18n.translate(msg({ message: "Could not finish repeating task. Earlier changes were kept; check the task before trying again.", context: "notices.commands.repeatFailed" })));
+		}
+	}
+
+	async cycleCurrentTaskPriority(): Promise<void> {
+		try {
+			const taskInfo = await this.getCurrentTaskForCommand();
+			if (!taskInfo) {
+				return;
+			}
+
+			const currentPriority = taskInfo.priority || this.settings.defaultTaskPriority;
+			const nextPriority = this.priorityManager.getNextPriority(currentPriority);
+			await this.updateTaskProperty(taskInfo, "priority", nextPriority);
+		} catch (error) {
+			tasknotesLogger.error("Failed to cycle current task priority:", {
+				category: "persistence",
+				operation: "cycle-current-task-priority",
+				error: error,
+			});
+			new Notice(this.i18n.translate(msg({ message: "Failed to cycle task priority", context: "notices.commands.priorityCycleFailed" })));
+		}
+	}
+
+	private async getCurrentTaskForCommand(
+		notTaskNotice = uiText(msg({ message: "Current file is not a task", context: "main: TaskNotesPlugin.getCurrentTaskForCommand display" }))
+	): Promise<TaskInfo | null> {
+		const activeFile = this.app.workspace.getActiveFile();
+		if (!activeFile) {
+			new Notice(this.i18n.translate(msg({ message: "No file is currently open", context: "notices.commands.noOpenFile" })));
+			return null;
+		}
+
+		const taskInfo = await this.cacheManager.getTaskInfo(activeFile.path);
+		if (!taskInfo) {
+			new Notice(notTaskNotice);
+			return null;
+		}
+
+		return taskInfo;
+	}
+
+	private async getTaskLinkDetectionService(): Promise<TaskLinkDetectionServiceInstance> {
+		if (!this.taskLinkDetectionService) {
+			const { TaskLinkDetectionService } = await import(
+				"./services/TaskLinkDetectionService"
+			);
+			this.taskLinkDetectionService = new TaskLinkDetectionService(this);
+		}
+
+		return this.taskLinkDetectionService;
+	}
+
+	private getTaskLinkAtCursor(
+		editor: Editor,
+		detectionService: TaskLinkDetectionServiceInstance
+	): TaskLinkMatch | null {
+		const cursor = editor.getCursor();
+		const line = editor.getLine(cursor.line);
+		const links = detectionService.findWikilinks(line);
+
+		return (
+			links.find(
+				(link) =>
+					cursor.ch >= link.start &&
+					cursor.ch <= link.end &&
+					(link.type === "wikilink" || link.type === "markdown")
+			) ?? null
+		);
+	}
+
+	private async openTaskEditModalForFile(file: TFile, notTaskNotice?: string): Promise<void> {
+		try {
+			const taskInfo = await this.cacheManager.getTaskInfo(file.path);
+			if (!taskInfo) {
+				new Notice(
+					notTaskNotice ??
+						this.i18n.translate(msg({ message: "Could not find task file: {path}", context: "modals.taskEdit.notices.fileMissing" }), {
+							path: file.path,
+						})
+				);
+				return;
+			}
+
+			await this.openTaskEditModal(taskInfo);
+		} catch (error) {
+			tasknotesLogger.error("Error opening task edit modal from file menu:", {
+				category: "persistence",
+				operation: "opening-task-edit-modal-file-menu",
+				error: error,
+			});
+			new Notice(this.i18n.translate(msg({ message: "Failed to open task note", context: "modals.taskEdit.notices.openNoteFailure" })));
+		}
+	}
+
+	private async openQuickActionsForTaskFile(
+		file: TFile,
+		notTaskNotice = uiText(msg({ message: "Selected file is not a tasknote", context: "main: TaskNotesPlugin.openQuickActionsForTaskFile display" }))
+	): Promise<void> {
+		const taskInfo = await this.cacheManager.getTaskInfo(file.path);
+		if (!taskInfo) {
+			new Notice(notTaskNotice);
+			return;
+		}
+
+		await this.openQuickActionsForTaskInfo(taskInfo);
+	}
+
+	private async openQuickActionsForTaskInfo(taskInfo: TaskInfo): Promise<void> {
+		const { TaskActionPaletteModal } = await import("./modals/TaskActionPaletteModal");
+		// Use fresh UTC-anchored "today" for recurring task handling
+		const now = new Date();
+		const today = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
+		const modal = new TaskActionPaletteModal(this.app, taskInfo, this, today);
+		modal.open();
+	}
+
+	async addProjectToCurrentTask(): Promise<void> {
+		try {
+			const activeFile = this.app.workspace.getActiveFile();
+			if (!activeFile) {
+				new Notice(this.i18n.translate(msg({ message: "No file is currently open", context: "notices.commands.noOpenFile" })));
+				return;
+			}
+
 			const taskInfo = await this.cacheManager.getTaskInfo(activeFile.path);
 			if (!taskInfo) {
-				new Notice("Current file is not a TaskNote");
+				new Notice(
+					this.i18n.translate(
+						msg({ message: "Current file is not a task", context: "settings.integrations.googleCalendarExport.notices.notATask" })
+					)
+				);
 				return;
 			}
 
-			// Open TaskActionPaletteModal with detected task
-			const { TaskActionPaletteModal } = await import("./modals/TaskActionPaletteModal");
-			// Use fresh UTC-anchored "today" for recurring task handling
-			const now = new Date();
-			const today = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
-			const modal = new TaskActionPaletteModal(this.app, taskInfo, this, today);
-			modal.open();
+			const selector = new ProjectSelectModal(this.app, this, (projectFile) => {
+				if (!(projectFile instanceof TFile)) {
+					new Notice(
+						this.i18n.translate(
+							msg({ message: "Failed to open project selector", context: "contextMenus.task.organization.notices.projectSelectFailed" })
+						)
+					);
+					return;
+				}
+				void this.addSelectedProjectToTask(taskInfo, projectFile);
+			});
+			selector.open();
 		} catch (error) {
-			console.error("Error opening quick actions:", error);
-			new Notice("Failed to open quick actions");
+			tasknotesLogger.error("Failed to add project to current task:", {
+				category: "persistence",
+				operation: "add-project-current-task",
+				error: error,
+			});
+			new Notice(
+				this.i18n.translate(msg({ message: "Failed to add task to project", context: "contextMenus.task.organization.notices.addToProjectFailed" }))
+			);
+		}
+	}
+
+	async addSubtaskToCurrentNote(): Promise<void> {
+		try {
+			const activeFile = this.app.workspace.getActiveFile();
+			if (!activeFile) {
+				new Notice(this.i18n.translate(msg({ message: "No file is currently open", context: "notices.commands.noOpenFile" })));
+				return;
+			}
+
+			const allTasks = await this.cacheManager.getAllTasks();
+			const candidates = allTasks.filter((candidate) => candidate.path !== activeFile.path);
+			if (candidates.length === 0) {
+				new Notice(
+					this.i18n.translate(msg({ message: "No eligible tasks available to assign as subtasks", context: "contextMenus.task.organization.notices.noEligibleSubtasks" }))
+				);
+				return;
+			}
+
+			openTaskSelector(this, candidates, (subtask) => {
+				if (!subtask) return;
+				void this.assignSelectedSubtaskToCurrentNote(activeFile, subtask);
+			});
+		} catch (error) {
+			tasknotesLogger.error("Failed to add subtask to current note:", {
+				category: "persistence",
+				operation: "add-subtask-current-note",
+				error: error,
+			});
+			new Notice(
+				this.i18n.translate(msg({ message: "Failed to open subtask selector", context: "contextMenus.task.organization.notices.subtaskSelectFailed" }))
+			);
+		}
+	}
+
+	private async addSelectedProjectToTask(task: TaskInfo, projectFile: TFile): Promise<void> {
+		try {
+			await addTaskToProject(this, task, projectFile);
+		} catch (error) {
+			tasknotesLogger.error("Failed to add selected project to task:", {
+				category: "persistence",
+				operation: "add-selected-project-task",
+				error: error,
+			});
+			new Notice(
+				this.i18n.translate(msg({ message: "Failed to add task to project", context: "contextMenus.task.organization.notices.addToProjectFailed" }))
+			);
+		}
+	}
+
+	private async assignSelectedSubtaskToCurrentNote(
+		parentFile: TFile,
+		subtask: TaskInfo
+	): Promise<void> {
+		try {
+			await assignTaskAsSubtask(this, parentFile, subtask);
+		} catch (error) {
+			tasknotesLogger.error("Failed to assign selected subtask to current note:", {
+				category: "persistence",
+				operation: "assign-selected-subtask-current-note",
+				error: error,
+			});
+			new Notice(
+				this.i18n.translate(msg({ message: "Failed to add task as subtask", context: "contextMenus.task.organization.notices.addAsSubtaskFailed" }))
+			);
 		}
 	}
 
@@ -1627,25 +2181,15 @@ export default class TaskNotesPlugin extends Plugin {
 				insertionPoint,
 			};
 
-			// Prepare pre-populated values
-			const prePopulatedValues: Partial<TaskInfo> = {};
-
-			// Include current note as project if enabled
-			if (this.settings.taskCreationDefaults.useParentNoteAsProject) {
-				const currentFile = this.app.workspace.getActiveFile();
-				if (currentFile) {
-					const parentNote = this.app.fileManager.generateMarkdownLink(
-						currentFile,
-						currentFile.path
-					);
-					prePopulatedValues.projects = [parentNote];
-				}
-			}
+			const prePopulatedValues = this.applyParentNoteProjectDefault(
+				undefined,
+				"inline-creation"
+			);
 
 			// Open task creation modal with callback to insert link
 			// Use modal-inline-creation context for inline folder behavior (Issue #1424)
 			const modal = new TaskCreationModal(this.app, this, {
-				prePopulatedValues: Object.keys(prePopulatedValues).length > 0 ? prePopulatedValues : undefined,
+				prePopulatedValues,
 				onTaskCreated: (task: TaskInfo) => {
 					this.handleInlineTaskCreated(task, insertionContext);
 				},
@@ -1654,8 +2198,12 @@ export default class TaskNotesPlugin extends Plugin {
 
 			modal.open();
 		} catch (error) {
-			console.error("Error creating inline task:", error);
-			new Notice("Failed to create inline task");
+			tasknotesLogger.error("Error creating inline task:", {
+				category: "persistence",
+				operation: "creating-inline-task",
+				error: error,
+			});
+			new Notice(this.i18n.translate(msg({ message: "Failed to create inline task", context: "notices.commands.inlineCreateFailed" })));
 		}
 	}
 
@@ -1674,18 +2222,18 @@ export default class TaskNotesPlugin extends Plugin {
 
 			// Create link using Obsidian's generateMarkdownLink
 			const file = this.app.vault.getAbstractFileByPath(task.path);
-			if (!file) {
-				new Notice("Failed to create link - file not found");
+			if (!(file instanceof TFile)) {
+				new Notice(this.i18n.translate(msg({ message: "Failed to create link - file not found", context: "notices.commands.linkFileMissing" })));
 				return;
 			}
 
 			const currentFile = this.app.workspace.getActiveFile();
 			const sourcePath = currentFile?.path || "";
 			const properLink = this.app.fileManager.generateMarkdownLink(
-				file as TFile,
+				file,
 				sourcePath,
 				"",
-				task.title // Use task title as alias
+				sanitizeLinkAliasText(task.title)
 			);
 
 			// Insert the link at the determined insertion point
@@ -1698,11 +2246,16 @@ export default class TaskNotesPlugin extends Plugin {
 			};
 			editor.setCursor(newCursor);
 
-			new Notice(`Inline task "${task.title}" created and linked successfully`);
+			new Notice(
+				this.i18n.translate(msg({ message: "Inline task \"{title}\" created and linked successfully", context: "notices.commands.inlineCreated" }), { title: task.title })
+			);
 		} catch (error) {
-			console.error("Error handling inline task creation:", error);
-			new Notice("Failed to insert task link");
+			tasknotesLogger.error("Error handling inline task creation:", {
+				category: "persistence",
+				operation: "handling-inline-task-creation",
+				error: error,
+			});
+			new Notice(this.i18n.translate(msg({ message: "Failed to insert task link", context: "notices.commands.linkInsertFailed" })));
 		}
 	}
-
 }

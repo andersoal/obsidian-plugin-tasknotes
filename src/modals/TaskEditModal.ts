@@ -1,33 +1,32 @@
-/* eslint-disable no-console, @typescript-eslint/no-non-null-assertion */
-import { App, Notice, TFile, TAbstractFile, setIcon, setTooltip } from "obsidian";
+import { displayError } from "../i18n/runtime";
+import { msg } from "@lingui/core/macro";
+/* eslint-disable @typescript-eslint/no-non-null-assertion -- Modal lifecycle initializes required controls before event handlers run. */
+import { App, Notice, TFile, setIcon, setTooltip } from "obsidian";
 import TaskNotesPlugin from "../main";
 import { TaskModal } from "./TaskModal";
+import { TimeEntryEditorModal } from "./TimeEntryEditorModal";
+import type { TaskModalLeadingButton, TaskModalOverflowAction } from "./taskModalActionButtons";
+import type { TaskSaveOutcome } from "./taskModalSave";
 import { TaskDependency, TaskInfo, TimeEntry } from "../types";
+import { formatTimestampForDisplay, getCurrentTimestamp } from "../utils/dateUtils";
+import { extractTaskInfo, calculateTotalTimeSpent, formatTime } from "../utils/helpers";
+import { stringifyUnknown } from "../utils/stringUtils";
+import { showConfirmationModal } from "./ConfirmationModal";
+import { createCompletionsCalendarSection } from "./taskEditCompletions";
+import { BlockingUpdates } from "./taskEditChanges";
+import { showTaskModalReminderContextMenu } from "./taskModalActionMenus";
+import { buildTaskEditChangesFromModalState } from "./taskEditChangeState";
+import { buildTaskEditFormStateFromTask } from "./taskEditFormState";
 import {
-	getCurrentTimestamp,
-	formatDateForStorage,
-	generateUTCCalendarDates,
-	getUTCStartOfWeek,
-	getUTCEndOfWeek,
-	getUTCStartOfMonth,
-	getUTCEndOfMonth,
-	getTodayLocal,
-	parseDateAsLocal,
-} from "../utils/dateUtils";
-import { formatTimestampForDisplay } from "../utils/dateUtils";
-import {
-	generateRecurringInstances,
-	extractTaskInfo,
-	calculateTotalTimeSpent,
-	formatTime,
-	updateToNextScheduledOccurrence,
-	sanitizeTags,
-} from "../utils/helpers";
-import { splitListPreservingLinksAndQuotes } from "../utils/stringSplit";
-import { ReminderContextMenu } from "../components/ReminderContextMenu";
-import { generateLinkWithDisplay, parseLinkToPath } from "../utils/linkUtils";
-import { EmbeddableMarkdownEditor } from "../editor/EmbeddableMarkdownEditor";
-import { ConfirmationModal } from "./ConfirmationModal";
+	createLinkedAttachmentEntries,
+	getLinkedAttachmentReferences,
+	hasPendingAttachments,
+	haveAttachmentsChanged,
+} from "./taskModalAttachments";
+import { applyTaskEditSubtaskChanges, hasTaskEditSubtaskChanges } from "./taskEditSubtasks";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Modals/TaskEditModal" });
 
 export interface TaskEditOptions {
 	task: TaskInfo;
@@ -35,24 +34,19 @@ export interface TaskEditOptions {
 }
 
 export class TaskEditModal extends TaskModal {
+	protected readonly mode = "edit";
+	protected isExpanded = true;
 	private task: TaskInfo;
 	private options: TaskEditOptions;
-	private metadataContainer: HTMLElement;
-	private editModalKeyboardHandler: ((e: KeyboardEvent) => void) | null = null;
 	// Changed from Set to array for consistency with other state management
 	private completedInstancesChanges: string[] = [];
-	private calendarWrapper: HTMLElement | null = null;
+	private skippedInstancesChanges: string[] = [];
 	private initialBlockedBy: TaskDependency[] = [];
 	private initialBlockingPaths: string[] = [];
-	private pendingBlockingUpdates: {
-		added: string[];
-		removed: string[];
-		raw: Record<string, TaskDependency>;
-	} = { added: [], removed: [], raw: {} };
+	private pendingBlockingUpdates: BlockingUpdates = { added: [], removed: [], raw: {} };
 	private unresolvedBlockingEntries: string[] = [];
 	private initialTags = "";
-	private isShowingConfirmation = false;
-	private pendingClose = false;
+	private isConvertingNoteToTask = false;
 	private timeEntries: TimeEntry[] = [];
 	private metadataTotalTimeValue: HTMLElement | null = null;
 
@@ -67,60 +61,62 @@ export class TaskEditModal extends TaskModal {
 	}
 
 	getModalTitle(): string {
-		return this.t("modals.taskEdit.title");
+		return this.t(msg({ message: "Edit task", context: "modals.taskEdit.title" }));
 	}
 
-	protected isEditMode(): boolean {
-		return true;
+	protected focusTitleInput(): void {
+		if (this.isMobileLikeEnvironment()) {
+			return;
+		}
+		super.focusTitleInput();
 	}
 
 	async initializeFormData(): Promise<void> {
-		// Initialize form fields with current task data
-		this.title = this.task.title;
-		this.dueDate = this.task.due || "";
-		this.scheduledDate = this.task.scheduled || "";
-		this.priority = this.task.priority;
-		this.status = this.task.status;
-		this.contexts = this.task.contexts ? this.task.contexts.join(", ") : "";
+		this.completedInstancesChanges = [];
+		this.skippedInstancesChanges = [];
+
+		// Refresh task data from file before opening
+		await this.refreshTaskData();
+
+		const formState = buildTaskEditFormStateFromTask({
+			app: this.app,
+			task: this.task,
+			details: this.form.values.details,
+			settings: {
+				taskIdentificationMethod: this.plugin.settings.taskIdentificationMethod,
+				taskTag: this.plugin.settings.taskTag,
+				hideIdentifyingTagsInCards: this.plugin.settings.hideIdentifyingTagsInCards,
+				hideIdentifyingTagsMode: this.plugin.settings.hideIdentifyingTagsMode,
+				userFields: this.plugin.settings?.userFields,
+			},
+			normalizeDetails: (value) => this.normalizeDetails(value),
+		});
+
+		this.form.values.title = formState.title;
+		this.form.values.dueDate = formState.dueDate;
+		this.form.values.scheduledDate = formState.scheduledDate;
+		this.form.values.priority = formState.priority;
+		this.form.values.status = formState.status;
+		this.form.values.contexts = formState.contexts;
 
 		// Initialize projects using the new method that handles both old and new formats
-		if (this.task.projects && this.task.projects.length > 0) {
-			// Filter out null, undefined, or empty strings before checking if we have valid projects
-			const validProjects = this.task.projects.filter(
-				(p) => p && typeof p === "string" && p.trim() !== ""
-			);
-			if (validProjects.length > 0) {
-				this.initializeProjectsFromStrings(this.task.projects);
-			} else {
-				this.projects = "";
-				this.selectedProjectItems = [];
-			}
+		if (formState.hasValidProjects) {
+			this.initializeProjectsFromStrings(formState.projectValues);
 		} else {
-			this.projects = "";
+			this.form.values.projects = "";
 			this.selectedProjectItems = [];
 		}
 
-		const shouldFilterTaskTag =
-			this.plugin.settings.taskIdentificationMethod === "tag";
-		const rawTags = this.task.tags || [];
-		const visibleTags = shouldFilterTaskTag
-			? rawTags.filter((tag) => tag !== this.plugin.settings.taskTag)
-			: rawTags;
-		this.tags = rawTags.length > 0 ? sanitizeTags(visibleTags.join(", ")) : "";
-		this.initialTags = this.tags;
-		this.timeEstimate = this.task.timeEstimate || 0;
-
-		// Handle recurrence
-		this.recurrenceRule = this.task.recurrence || "";
-
-		// Initialize recurrence anchor
-		this.recurrenceAnchor = this.task.recurrence_anchor || 'scheduled';
-
-		// Initialize reminders
-		this.reminders = this.task.reminders ? [...this.task.reminders] : [];
-
-		this.details = this.normalizeDetails(this.details);
-		this.originalDetails = this.details;
+		this.form.values.tags = formState.tags;
+		this.initialTags = formState.initialTags;
+		this.form.values.timeEstimate = formState.timeEstimate;
+		this.form.values.recurrenceRule = formState.recurrenceRule;
+		this.form.values.recurrenceAnchor = formState.recurrenceAnchor;
+		this.form.values.reminders = formState.reminders;
+		this.attachmentEntries = createLinkedAttachmentEntries(this.task.attachments, this.task.path);
+		this.form.values.details = formState.details;
+		this.originalDetails = formState.originalDetails;
+		this.form.values.userFields = formState.userFields;
 
 		// Initialize subtasks (tasks that have this task as a project)
 		await this.initializeSubtasks();
@@ -139,158 +135,51 @@ export class TaskEditModal extends TaskModal {
 		this.pendingBlockingUpdates = { added: [], removed: [], raw: {} };
 		this.unresolvedBlockingEntries = [];
 
-		// Initialize time entries
 		this.timeEntries = this.task.timeEntries ? [...this.task.timeEntries] : [];
-
-		// Initialize user fields from frontmatter
-		await this.initializeUserFields();
-	}
-
-	private async initializeUserFields(): Promise<void> {
-		try {
-			// Get the file and read its frontmatter
-			const file = this.app.vault.getAbstractFileByPath(this.task.path);
-			if (!file || !(file instanceof TFile)) {
-				return;
-			}
-
-			const metadata = this.app.metadataCache.getFileCache(file);
-			const frontmatter = metadata?.frontmatter;
-
-			if (!frontmatter) {
-				return;
-			}
-
-			// Load user field values from frontmatter
-			const userFieldConfigs = this.plugin.settings?.userFields || [];
-			for (const field of userFieldConfigs) {
-				if (!field || !field.key) continue;
-
-				const value = frontmatter[field.key];
-				if (value !== undefined) {
-					this.userFields[field.key] = value;
-				}
-			}
-		} catch (error) {
-			console.error("Error initializing user fields:", error);
-		}
-	}
-
-	private dependenciesEqual(a: TaskDependency[], b: TaskDependency[]): boolean {
-		if (a.length !== b.length) {
-			return false;
-		}
-
-		const sortDependencies = (deps: TaskDependency[]) =>
-			[...deps].sort((left, right) => left.uid.localeCompare(right.uid));
-
-		const sortedA = sortDependencies(a);
-		const sortedB = sortDependencies(b);
-
-		for (let i = 0; i < sortedA.length; i++) {
-			const depA = sortedA[i];
-			const depB = sortedB[i];
-			if (
-				depA.uid !== depB.uid ||
-				depA.reltype !== depB.reltype ||
-				(depA.gap || "") !== (depB.gap || "")
-			) {
-				return false;
-			}
-		}
-
-		return true;
 	}
 
 	protected showReminderContextMenu(event: MouseEvent): void {
 		// Override parent method to use the actual task with its path
 		// Update the task object with current form values before showing menu
-		const currentTask: TaskInfo = {
-			...this.task,
-			title: this.title,
-			due: this.dueDate,
-			scheduled: this.scheduledDate,
-			reminders: this.reminders,
-		};
-
-		const menu = new ReminderContextMenu(
-			this.plugin,
-			currentTask, // Use task with current form values and correct path
-			event.target as HTMLElement,
-			(updatedTask: TaskInfo) => {
-				this.reminders = updatedTask.reminders || [];
-				this.updateReminderIconState();
-			}
-		);
-
-		menu.show(event);
-	}
-
-	async onOpen() {
-		// Clear any previous completion changes
-		this.completedInstancesChanges = [];
-
-		// Refresh task data from file before opening
-		await this.refreshTaskData();
-
-		this.containerEl.addClass("tasknotes-plugin", "minimalist-task-modal", "expanded");
-		if (this.plugin.settings.enableModalSplitLayout) {
-			this.containerEl.addClass("split-layout-enabled");
-		}
-		this.modalEl.addClass("mod-tasknotes");
-
-		// Set the modal title using the standard Obsidian approach (preserves close button)
-		this.titleEl.setText(this.getModalTitle());
-
-		// Add global keyboard shortcut handler for CMD/Ctrl+Enter
-		this.editModalKeyboardHandler = async (e: KeyboardEvent) => {
-			if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
-				e.preventDefault();
-				await this.handleSave();
-				this.forceClose();
-			}
-		};
-		this.containerEl.addEventListener("keydown", this.editModalKeyboardHandler);
-
-		this.initializeFormData().then(() => {
-			this.createModalContent();
-			// Render projects list after modal content is created
-			this.renderProjectsList();
-			// Update icon states after creating the action bar
-			this.updateIconStates();
-			this.focusTitleInput();
-		});
+		showTaskModalReminderContextMenu(this.getActionMenuContext(), event, this.task);
 	}
 
 	private async refreshTaskData(): Promise<void> {
 		try {
 			const file = this.app.vault.getAbstractFileByPath(this.task.path);
 			if (!file || !(file instanceof TFile)) {
-				console.warn("Could not find file for task:", this.task.path);
+				tasknotesLogger.warn("Could not find file for task:", {
+					category: "stale-data",
+					operation: "find-file-task",
+					details: { value: this.task.path },
+				});
 				return;
 			}
 
 			const content = await this.app.vault.read(file);
-			this.details = this.extractDetailsFromContent(content);
-			this.originalDetails = this.details;
+			this.form.values.details = this.extractDetailsFromContent(content);
+			this.originalDetails = this.form.values.details;
 
 			// Check if this file is actually a task (has task tag/property)
 			// If not, keep the original task data (e.g., for "convert note to task" flow)
 			const metadata = this.app.metadataCache.getFileCache(file);
-			const isRecognizedTask = metadata?.frontmatter &&
-				this.plugin.cacheManager.isTaskFile(metadata.frontmatter);
+			const isRecognizedTask =
+				metadata?.frontmatter && this.plugin.cacheManager.isTaskFile(metadata.frontmatter);
 
 			if (!isRecognizedTask) {
 				// File is not yet a task - keep the original task data passed to constructor
 				// This preserves user's default settings for status/priority during conversion
-				this.task.details = this.details;
+				this.isConvertingNoteToTask = true;
+				this.task.details = this.form.values.details;
 				return;
 			}
+
+			this.isConvertingNoteToTask = false;
 
 			const cachedTaskInfo = await this.plugin.cacheManager.getTaskInfo(this.task.path);
 
 			if (cachedTaskInfo) {
-				cachedTaskInfo.details = this.details;
+				cachedTaskInfo.details = this.form.values.details;
 				this.task = cachedTaskInfo;
 				this.options.task = cachedTaskInfo;
 			} else {
@@ -305,370 +194,121 @@ export class TaskEditModal extends TaskModal {
 				);
 
 				if (freshTaskInfo) {
-					freshTaskInfo.details = this.details;
+					freshTaskInfo.details = this.form.values.details;
 					this.task = freshTaskInfo;
 					this.options.task = freshTaskInfo;
 				}
 			}
 		} catch (error) {
-			console.warn("Could not refresh task data:", error);
+			tasknotesLogger.warn("Could not refresh task data:", {
+				category: "stale-data",
+				operation: "refresh-task-data",
+				error: error,
+			});
 		}
-	}
-
-	/**
-	 * Edit modal has no primary input at top - title is in the details section
-	 */
-	protected createPrimaryInput(container: HTMLElement): void {
-		// No-op: Edit modal shows title in the details section, not at top
 	}
 
 	/**
 	 * Add completions calendar and metadata sections after details
 	 */
 	protected createAdditionalSections(container: HTMLElement): void {
-		this.createCompletionsCalendarSection(container);
+		createCompletionsCalendarSection(container, {
+			task: this.task,
+			plugin: this.plugin,
+			completedInstancesChanges: this.completedInstancesChanges,
+			skippedInstancesChanges: this.skippedInstancesChanges,
+			translate: (key, params) => this.t(key, params),
+		});
 		this.createMetadataSection(container);
 	}
 
-	/**
-	 * Force close the modal without checking for unsaved changes.
-	 * Use this after a successful save or when discarding is intentional.
-	 */
-	forceClose(): void {
-		this.pendingClose = true;
-		super.close();
-	}
-
-	/**
-	 * Override close() to detect unsaved changes and prompt user.
-	 * This method is synchronous to match Obsidian's Modal.close() signature.
-	 */
-	close(): void {
-		// If we're already forcing close or showing confirmation, proceed
-		if (this.pendingClose) {
-			this.pendingClose = false;
-			super.close();
-			return;
-		}
-
-		// Prevent re-entrancy if confirmation is already showing
-		if (this.isShowingConfirmation) {
-			return;
-		}
-
-		// Check for unsaved changes
-		const changes = this.getChanges();
-		const hasChanges = Object.keys(changes).length > 0;
-
-		if (!hasChanges) {
-			// No changes, close immediately
-			super.close();
-			return;
-		}
-
-		// Show confirmation modal asynchronously
-		this.showUnsavedChangesConfirmation();
-	}
-
-	/**
-	 * Show confirmation modal for unsaved changes.
-	 * Handles the async flow separately from the synchronous close() method.
-	 */
-	private async showUnsavedChangesConfirmation(): Promise<void> {
-		this.isShowingConfirmation = true;
-
-		try {
-			const result = await this.showThreeButtonConfirmation();
-
-			if (result === "save") {
-				// User wants to save - attempt save and close on success
-				try {
-					await this.handleSave();
-					this.forceClose();
-				} catch (error) {
-					// Save failed - stay open so user can fix issues
-					// handleSave() already shows a notice with the error
-					console.error("Save failed during close confirmation:", error);
-				}
-			} else if (result === "discard") {
-				// User wants to discard changes
-				this.forceClose();
-			}
-			// result === "cancel" - do nothing, user wants to keep editing
-		} finally {
-			this.isShowingConfirmation = false;
-		}
-	}
-
-	/**
-	 * Show a three-button confirmation dialog for unsaved changes.
-	 * Returns: "save" | "discard" | "cancel"
-	 */
-	private showThreeButtonConfirmation(): Promise<"save" | "discard" | "cancel"> {
-		return new Promise((resolve) => {
-			const modal = new ConfirmationModal(this.app, {
-				title: this.t("modals.task.unsavedChanges.title"),
-				message: this.t("modals.task.unsavedChanges.message"),
-				confirmText: this.t("modals.task.unsavedChanges.save"),
-				cancelText: this.t("modals.task.unsavedChanges.discard"),
-				thirdButtonText: this.t("modals.task.unsavedChanges.cancel"),
-				defaultToConfirm: true,
-				onThirdButton: () => resolve("cancel"),
-			});
-
-			modal.show().then((confirmed) => {
-				if (confirmed) {
-					resolve("save");
-				} else {
-					resolve("discard");
-				}
-			});
-		});
-	}
-
-	onClose(): void {
-		// Clean up keyboard handler
-		if (this.editModalKeyboardHandler) {
-			this.containerEl.removeEventListener("keydown", this.editModalKeyboardHandler);
-			this.editModalKeyboardHandler = null;
-		}
-
-		// Base class handles detailsMarkdownEditor cleanup
-		super.onClose();
-	}
-
-	private createCompletionsCalendarSection(container: HTMLElement): void {
-		// Only show calendar for recurring tasks
-		if (this.task.recurrence) {
-			const calendarContainer = container.createDiv("completions-calendar-container");
-
-			const calendarLabel = calendarContainer.createDiv("detail-label");
-			calendarLabel.textContent = this.t("modals.taskEdit.sections.completions");
-
-			const calendarContent = calendarContainer.createDiv("completions-calendar-content");
-			this.createRecurringCalendar(calendarContent);
-		}
+	protected hasUnsavedChanges(): boolean {
+		return Object.keys(this.getChanges()).length > 0 || this.hasSubtaskChanges();
 	}
 
 	private createMetadataSection(container: HTMLElement): void {
-		this.metadataContainer = container.createDiv("metadata-container");
+		const metadataContainer = container.createEl("details", { cls: "metadata-container" });
 
-		const metadataLabel = this.metadataContainer.createDiv("detail-label");
-		metadataLabel.textContent = this.t("modals.taskEdit.sections.taskInfo");
+		const metadataLabel = metadataContainer.createEl("summary", { cls: "detail-label" });
+		metadataLabel.textContent = this.t(msg({ message: "Task information", context: "modals.taskEdit.sections.taskInfo" }));
 
-		const metadataContent = this.metadataContainer.createDiv("metadata-content");
+		const metadataContent = metadataContainer.createDiv("metadata-content");
 
 		// Total tracked time
-		const timeDiv = metadataContent.createDiv("metadata-item");
-		timeDiv.createSpan("metadata-key").textContent =
-			this.t("modals.taskEdit.metadata.totalTrackedTime") + " ";
-		
-		this.metadataTotalTimeValue = timeDiv.createSpan("metadata-value");
+		const timeItem = metadataContent.createDiv("metadata-item");
+		timeItem.createSpan("metadata-key").textContent =
+			this.t(msg({ message: "Total tracked time:", context: "modals.taskEdit.metadata.totalTrackedTime" })) + " ";
+		this.metadataTotalTimeValue = timeItem.createSpan("metadata-value");
 		this.refreshTotalTimeDisplay();
 
-		// Edit button
-		const editBtn = timeDiv.createEl("button", {
+		const editTimeEntriesButton = timeItem.createEl("button", {
 			cls: "tasknotes-edit-button clickable-icon",
 		});
-		setIcon(editBtn, "pencil");
-		setTooltip(editBtn, this.t("modals.taskEdit.buttons.editTimeEntries"), { placement: "top" });
-		editBtn.addEventListener("click", (e) => {
-			e.preventDefault();
-			e.stopPropagation();
-			const { TimeEntryEditorModal } = require("./TimeEntryEditorModal");
-			new TimeEntryEditorModal(this.app, this.plugin, { ...this.task, timeEntries: this.timeEntries }, (updatedEntries: TimeEntry[]) => {
-				this.timeEntries = updatedEntries;
-				this.refreshTotalTimeDisplay();
-			}).open();
+		setIcon(editTimeEntriesButton, "pencil");
+		setTooltip(editTimeEntriesButton, this.t(msg({ message: "Edit time entries", context: "modals.taskEdit.buttons.editTimeEntries" })), {
+			placement: "top",
+		});
+		editTimeEntriesButton.addEventListener("click", (event) => {
+			event.preventDefault();
+			event.stopPropagation();
+			new TimeEntryEditorModal(
+				this.app,
+				this.plugin,
+				{ ...this.task, timeEntries: this.timeEntries },
+				(updatedEntries: TimeEntry[]) => {
+					this.timeEntries = updatedEntries;
+					this.refreshTotalTimeDisplay();
+				}
+			).open();
 		});
 
 		// Created date
 		if (this.task.dateCreated) {
-			const createdDiv = metadataContent.createDiv("metadata-item");
-			createdDiv.createSpan("metadata-key").textContent =
-				this.t("modals.taskEdit.metadata.created") + " ";
-			createdDiv.createSpan("metadata-value").textContent = formatTimestampForDisplay(
-				this.task.dateCreated
+			this.createMetadataItem(
+				metadataContent,
+				this.t(msg({ message: "Created:", context: "modals.taskEdit.metadata.created" })),
+				formatTimestampForDisplay(this.task.dateCreated)
 			);
 		}
 
 		// Modified date
 		if (this.task.dateModified) {
-			const modifiedDiv = metadataContent.createDiv("metadata-item");
-			modifiedDiv.createSpan("metadata-key").textContent =
-				this.t("modals.taskEdit.metadata.modified") + " ";
-			modifiedDiv.createSpan("metadata-value").textContent = formatTimestampForDisplay(
-				this.task.dateModified
+			this.createMetadataItem(
+				metadataContent,
+				this.t(msg({ message: "Modified:", context: "modals.taskEdit.metadata.modified" })),
+				formatTimestampForDisplay(this.task.dateModified)
 			);
 		}
 
 		// File path (if available)
 		if (this.task.path) {
-			const pathDiv = metadataContent.createDiv("metadata-item");
-			pathDiv.createSpan("metadata-key").textContent =
-				this.t("modals.taskEdit.metadata.file") + " ";
-			pathDiv.createSpan("metadata-value").textContent = this.task.path;
+			this.createMetadataItem(
+				metadataContent,
+				this.t(msg({ message: "File:", context: "modals.taskEdit.metadata.file" })),
+				this.task.path
+			);
 		}
+	}
+
+	private createMetadataItem(container: HTMLElement, key: string, value: string): void {
+		const item = container.createDiv("metadata-item");
+		item.createSpan("metadata-key").textContent = `${key} `;
+		item.createSpan("metadata-value").textContent = value;
 	}
 
 	private refreshTotalTimeDisplay(): void {
 		if (this.metadataTotalTimeValue) {
-			const totalTimeSpent = calculateTotalTimeSpent(this.timeEntries);
-			this.metadataTotalTimeValue.textContent = formatTime(totalTimeSpent);
+			this.metadataTotalTimeValue.textContent = formatTime(calculateTotalTimeSpent(this.timeEntries));
 		}
 	}
 
-	private createRecurringCalendar(container: HTMLElement): void {
-		// Calendar wrapper
-		this.calendarWrapper = container.createDiv("recurring-calendar");
-
-		// Show current month by default, or the month with most recent completions
-		// Use local dates for calendar display
-		const currentDate = getTodayLocal();
-		let mostRecentCompletion = currentDate;
-
-		if (this.task.complete_instances && this.task.complete_instances.length > 0) {
-			const validCompletions = this.task.complete_instances
-				.filter((d) => d && typeof d === "string" && /^\d{4}-\d{2}-\d{2}$/.test(d.trim())) // Only valid YYYY-MM-DD dates
-				.map((d) => parseDateAsLocal(d).getTime())
-				.filter((time) => !isNaN(time)); // Filter out invalid dates
-
-			if (validCompletions.length > 0) {
-				mostRecentCompletion = new Date(Math.max(...validCompletions));
-			}
-		}
-
-		this.renderCalendarMonth(this.calendarWrapper, mostRecentCompletion);
-	}
-
-	private renderCalendarMonth(container: HTMLElement, displayDate: Date): void {
-		container.empty();
-
-		// Minimalist header
-		const header = container.createDiv("recurring-calendar__header");
-		const prevButton = header.createEl("button", {
-			cls: "recurring-calendar__nav",
-			text: "‹",
-		});
-		const monthLabel = header.createSpan("recurring-calendar__month");
-		const locale = this.plugin.i18n.getCurrentLocale() || "en";
-		const monthFormatter = new Intl.DateTimeFormat(locale, { month: "short", year: "numeric" });
-		monthLabel.textContent = monthFormatter.format(displayDate);
-		const nextButton = header.createEl("button", {
-			cls: "recurring-calendar__nav",
-			text: "›",
-		});
-
-		// Minimalist grid
-		const grid = container.createDiv("recurring-calendar__grid");
-
-		// Get all dates to display (including padding from previous/next month)
-		// Use UTC dates consistently to avoid timezone issues
-		const monthStart = getUTCStartOfMonth(displayDate);
-		const monthEnd = getUTCEndOfMonth(displayDate);
-
-		// Respect the week start setting from calendar view settings
-		const firstDaySetting = this.plugin.settings.calendarViewSettings.firstDay || 0;
-
-		const calendarStart = getUTCStartOfWeek(monthStart, firstDaySetting);
-		const calendarEnd = getUTCEndOfWeek(monthEnd, firstDaySetting);
-		const allDays = generateUTCCalendarDates(calendarStart, calendarEnd);
-
-		// Generate recurring instances for this month (with some buffer)
-		const bufferStart = getUTCStartOfMonth(displayDate);
-		bufferStart.setUTCMonth(bufferStart.getUTCMonth() - 1);
-		const bufferEnd = getUTCEndOfMonth(displayDate);
-		bufferEnd.setUTCMonth(bufferEnd.getUTCMonth() + 1);
-
-		const recurringDates = generateRecurringInstances(this.task, bufferStart, bufferEnd);
-		const recurringDateStrings = new Set(recurringDates.map((d) => formatDateForStorage(d)));
-
-		// Get current completed instances (original + changes)
-		const completedInstances = new Set(this.task.complete_instances || []);
-		for (const dateStr of this.completedInstancesChanges) {
-			if (completedInstances.has(dateStr)) {
-				completedInstances.delete(dateStr);
-			} else {
-				completedInstances.add(dateStr);
-			}
-		}
-
-		// Get skipped instances (read-only display)
-		const skippedInstances = new Set(this.task.skipped_instances || []);
-
-		// Render each day (no headers, just numbers)
-		allDays.forEach((day) => {
-			const dayStr = formatDateForStorage(day);
-			// FIX: Use UTC-to-UTC comparison instead of mixing local and UTC dates
-			const isCurrentMonth = day.getUTCMonth() === displayDate.getUTCMonth();
-			const isRecurring = recurringDateStrings.has(dayStr);
-			const isCompleted = completedInstances.has(dayStr);
-			const isSkipped = skippedInstances.has(dayStr);
-
-			const dayElement = grid.createDiv("recurring-calendar__day");
-			// FIX: Use UTC date method instead of timezone-sensitive format()
-			dayElement.textContent = String(day.getUTCDate());
-
-			// Apply BEM modifier classes
-			if (!isCurrentMonth) {
-				dayElement.addClass("recurring-calendar__day--faded");
-			}
-
-			// Make all dates clickable
-			dayElement.addClass("recurring-calendar__day--clickable");
-
-			if (isRecurring) {
-				dayElement.addClass("recurring-calendar__day--recurring");
-			}
-
-			if (isCompleted) {
-				dayElement.addClass("recurring-calendar__day--completed");
-			}
-
-			if (isSkipped) {
-				dayElement.addClass("recurring-calendar__day--skipped");
-			}
-
-			// Make all dates clickable
-			dayElement.addEventListener("click", () => {
-				this.toggleCompletedInstance(dayStr);
-				this.renderCalendarMonth(container, displayDate);
-			});
-		});
-
-		// Navigation event handlers
-		prevButton.addEventListener("click", () => {
-			// FIX: Use UTC methods to prevent timezone drift
-			const prevMonth = new Date(displayDate);
-			prevMonth.setUTCMonth(prevMonth.getUTCMonth() - 1);
-			this.renderCalendarMonth(container, prevMonth);
-		});
-
-		nextButton.addEventListener("click", () => {
-			// FIX: Use UTC methods to prevent timezone drift
-			const nextMonth = new Date(displayDate);
-			nextMonth.setUTCMonth(nextMonth.getUTCMonth() + 1);
-			this.renderCalendarMonth(container, nextMonth);
-		});
-	}
-
-	private toggleCompletedInstance(dateStr: string): void {
-		const index = this.completedInstancesChanges.indexOf(dateStr);
-		if (index !== -1) {
-			this.completedInstancesChanges.splice(index, 1);
-		} else {
-			this.completedInstancesChanges.push(dateStr);
-		}
-	}
-
-	async handleSave(): Promise<void> {
+	async handleSave(): Promise<TaskSaveOutcome> {
 		if (!this.validateForm()) {
-			new Notice(this.t("modals.taskEdit.notices.titleRequired"));
-			return;
+			return { status: "failed" };
 		}
 
 		try {
-			const changes = this.getChanges();
+			const changes = this.getChanges({ includeConversionWrite: true });
 			const hasBlockingChanges =
 				this.pendingBlockingUpdates.added.length > 0 ||
 				this.pendingBlockingUpdates.removed.length > 0;
@@ -677,7 +317,7 @@ export class TaskEditModal extends TaskModal {
 
 			if (this.unresolvedBlockingEntries.length > 0 && !hasBlockingChanges) {
 				new Notice(
-					this.t("modals.taskEdit.notices.blockingUnresolved", {
+					this.t(msg({ message: "Could not resolve: {entries}", context: "modals.taskEdit.notices.blockingUnresolved" }), {
 						entries: this.unresolvedBlockingEntries.join(", "),
 					})
 				);
@@ -685,19 +325,33 @@ export class TaskEditModal extends TaskModal {
 			}
 
 			if (!hasTaskChanges && !hasBlockingChanges && !hasSubtaskChanges) {
-				new Notice(this.t("modals.taskEdit.notices.noChanges"));
-				this.close();
-				return;
+				new Notice(this.t(msg({ message: "No changes to save", context: "modals.taskEdit.notices.noChanges" })));
+				return { status: "saved" };
 			}
 
 			let updatedTask = this.task;
 
+			const imported = hasPendingAttachments(this.attachmentEntries)
+				? await this.importPendingAttachments(this.task.path)
+				: undefined;
+			if (imported) {
+				changes.attachments = imported.references;
+			}
+
 			if (hasTaskChanges) {
-				updatedTask = await this.plugin.taskService.updateTask(this.task, changes);
+				try {
+					updatedTask = await this.plugin.taskService.updateTask(this.task, changes);
+				} catch (error) {
+					// Don't leave imported files behind if the task wasn't updated.
+					await imported?.rollback();
+					throw error;
+				}
 				this.task = updatedTask;
-				if (Object.prototype.hasOwnProperty.call(changes as any, "details")) {
-					const updatedDetails = ((changes as any).details ?? "").toString();
-					this.details = updatedDetails;
+				if (Object.prototype.hasOwnProperty.call(changes, "details")) {
+					const updatedDetails = stringifyUnknown(
+						(changes as Record<string, unknown>).details
+					);
+					this.form.values.details = updatedDetails;
 					this.originalDetails = updatedDetails;
 				}
 			}
@@ -723,7 +377,7 @@ export class TaskEditModal extends TaskModal {
 
 			if (this.unresolvedBlockingEntries.length > 0) {
 				new Notice(
-					this.t("modals.taskEdit.notices.blockingUnresolved", {
+					this.t(msg({ message: "Could not resolve: {entries}", context: "modals.taskEdit.notices.blockingUnresolved" }), {
 						entries: this.unresolvedBlockingEntries.join(", "),
 					})
 				);
@@ -735,308 +389,86 @@ export class TaskEditModal extends TaskModal {
 
 			if (hasTaskChanges) {
 				new Notice(
-					this.t("modals.taskEdit.notices.updateSuccess", { title: updatedTask.title })
+					this.t(msg({ message: "Task \"{title}\" updated successfully", context: "modals.taskEdit.notices.updateSuccess" }), { title: updatedTask.title })
 				);
 			} else if (hasBlockingChanges) {
-				new Notice(this.t("modals.taskEdit.notices.dependenciesUpdateSuccess"));
+				new Notice(this.t(msg({ message: "Dependencies updated", context: "modals.taskEdit.notices.dependenciesUpdateSuccess" })));
 			}
 
 			this.pendingBlockingUpdates = { added: [], removed: [], raw: {} };
 			this.unresolvedBlockingEntries = [];
+			return { status: "saved" };
 		} catch (error) {
-			console.error("Failed to update task:", error);
+			tasknotesLogger.error("Failed to update task:", {
+				category: "validation",
+				operation: "update-task",
+				error: error,
+			});
 			const message = error instanceof Error && error.message ? error.message : String(error);
-			new Notice(this.t("modals.taskEdit.notices.updateFailure", { message }));
+			new Notice(this.t(msg({ message: "Failed to update task: {message}", context: "modals.taskEdit.notices.updateFailure" }), { message: displayError(message) }));
+			return { status: "failed" };
 		}
 	}
 
-	private getChanges(): Partial<TaskInfo> {
-		const changes: Partial<TaskInfo> = {};
-
-		// Check for changes and only include modified fields
-		if (this.title.trim() !== this.task.title) {
-			changes.title = this.title.trim();
-		}
-
-		if (this.dueDate !== (this.task.due || "")) {
-			changes.due = this.dueDate || undefined;
-		}
-
-		if (this.scheduledDate !== (this.task.scheduled || "")) {
-			changes.scheduled = this.scheduledDate || undefined;
-		}
-
-		if (this.priority !== this.task.priority) {
-			changes.priority = this.priority;
-		}
-
-		if (this.status !== this.task.status) {
-			changes.status = this.status;
-		}
-
-		// Parse and compare contexts
-		const newContexts = this.contexts
-			.split(",")
-			.map((c) => c.trim())
-			.filter((c) => c.length > 0);
-		const oldContexts = this.task.contexts || [];
-
-		if (JSON.stringify(newContexts.sort()) !== JSON.stringify(oldContexts.sort())) {
-			changes.contexts = newContexts.length > 0 ? newContexts : undefined;
-		}
-
-		// Parse and compare projects
-		const newProjects = splitListPreservingLinksAndQuotes(this.projects);
-		const oldProjects = this.task.projects || [];
-
-		const normalizeProjectList = (projects: string[]): string[] =>
-			projects
-				.map((project) => {
-					if (!project || typeof project !== "string") return "";
-					const trimmed = project.trim();
-					if (!trimmed) return "";
-					return parseLinkToPath(trimmed).trim();
-				})
-				.filter((project) => project.length > 0);
-
-		const normalizedNewProjects = normalizeProjectList(newProjects).sort();
-		const normalizedOldProjects = normalizeProjectList(oldProjects).sort();
-
-		if (
-			JSON.stringify(normalizedNewProjects) !== JSON.stringify(normalizedOldProjects)
-		) {
-			changes.projects = newProjects.length > 0 ? newProjects : [];
-		}
-
-		// Parse and compare tags
-		const tagsUnchanged =
-			sanitizeTags(this.tags) === sanitizeTags(this.initialTags);
-		const newTags = this.tags
-			.split(",")
-			.map((t) => t.trim())
-			.filter((t) => t.length > 0);
-
-		// Add the task tag if using tag-based identification and it's not already present
-		if (
-			this.plugin.settings.taskIdentificationMethod === 'tag' &&
-			this.plugin.settings.taskTag &&
-			!newTags.includes(this.plugin.settings.taskTag)
-		) {
-			newTags.push(this.plugin.settings.taskTag);
-		}
-
-		const oldTags = this.task.tags || [];
-
-		if (!tagsUnchanged && JSON.stringify(newTags.sort()) !== JSON.stringify(oldTags.sort())) {
-			changes.tags = newTags.length > 0 ? newTags : undefined;
-		}
-
-		// Compare time estimate
-		const newTimeEstimate = this.timeEstimate > 0 ? this.timeEstimate : undefined;
-		const oldTimeEstimate = this.task.timeEstimate;
-
-		if (newTimeEstimate !== oldTimeEstimate) {
-			changes.timeEstimate = newTimeEstimate;
-		}
-
-		// Compare recurrence
-		const oldRecurrence = typeof this.task.recurrence === "string" ? this.task.recurrence : "";
-
-		if (this.recurrenceRule !== oldRecurrence) {
-			changes.recurrence = this.recurrenceRule || undefined;
-		}
-
-		// Compare recurrence anchor
-		const oldRecurrenceAnchor = this.task.recurrence_anchor || 'scheduled';
-
-		if (this.recurrenceAnchor !== oldRecurrenceAnchor) {
-			changes.recurrence_anchor = this.recurrenceAnchor;
-		}
-
-		// Compare reminders
-		const oldReminders = this.task.reminders || [];
-		const newReminders = this.reminders || [];
-
-		if (JSON.stringify(newReminders) !== JSON.stringify(oldReminders)) {
-			changes.reminders = newReminders.length > 0 ? newReminders : undefined;
-		}
-
-		const newBlockedDependencies = this.blockedByItems.map((item) => ({
-			...item.dependency,
-		}));
-		if (!this.dependenciesEqual(newBlockedDependencies, this.initialBlockedBy)) {
-			changes.blockedBy =
-				newBlockedDependencies.length > 0 ? newBlockedDependencies : undefined;
-		}
-
-		const resolvedBlocking = new Map<string, TaskDependency>();
-		const unresolvedEntries: string[] = [];
-
-		this.blockingItems.forEach((item) => {
-			if (item.path) {
-				resolvedBlocking.set(item.path, { ...item.dependency });
-			} else {
-				unresolvedEntries.push(item.dependency.uid);
-			}
+	private getChanges(options: { includeConversionWrite?: boolean } = {}): Partial<TaskInfo> {
+		const result = buildTaskEditChangesFromModalState({
+			app: this.app,
+			task: this.task,
+			title: this.form.values.title,
+			dueDate: this.form.values.dueDate,
+			scheduledDate: this.form.values.scheduledDate,
+			priority: this.form.values.priority,
+			status: this.form.values.status,
+			contexts: this.form.values.contexts,
+			projects: this.form.values.projects,
+			tags: this.form.values.tags,
+			initialTags: this.initialTags,
+			timeEstimate: this.form.values.timeEstimate,
+			recurrenceRule: this.form.values.recurrenceRule,
+			recurrenceAnchor: this.form.values.recurrenceAnchor,
+			reminders: this.form.values.reminders,
+			blockedByItems: this.blockedByItems,
+			initialBlockedBy: this.initialBlockedBy,
+			blockingItems: this.blockingItems,
+			initialBlockingPaths: this.initialBlockingPaths,
+			details: this.form.values.details,
+			originalDetails: this.originalDetails,
+			completedInstancesChanges: this.completedInstancesChanges,
+			skippedInstancesChanges: this.skippedInstancesChanges,
+			userFields: this.form.values.userFields,
+			settings: {
+				userFields: this.plugin.settings?.userFields,
+				taskIdentificationMethod: this.plugin.settings.taskIdentificationMethod,
+				taskTag: this.plugin.settings.taskTag,
+				hideIdentifyingTagsInCards: this.plugin.settings.hideIdentifyingTagsInCards,
+				hideIdentifyingTagsMode: this.plugin.settings.hideIdentifyingTagsMode,
+				maintainDueDateOffsetInRecurring:
+					this.plugin.settings.maintainDueDateOffsetInRecurring,
+			},
+			normalizeDetails: (value) => this.normalizeDetails(value),
 		});
 
-		const newBlockingPaths = Array.from(resolvedBlocking.keys());
-		const originalPaths = new Set(this.initialBlockingPaths);
-		const newPathSet = new Set(newBlockingPaths);
-
-		const addedPaths = newBlockingPaths.filter((path) => !originalPaths.has(path));
-		const removedPaths = this.initialBlockingPaths.filter((path) => !newPathSet.has(path));
-
-		const rawAdditions: Record<string, TaskDependency> = {};
-		for (const path of addedPaths) {
-			const raw = resolvedBlocking.get(path);
-			if (raw) {
-				rawAdditions[path] = { ...raw };
-			}
+		if (haveAttachmentsChanged(this.attachmentEntries, this.task.attachments)) {
+			// Pending disk files are added to this list when the save imports them.
+			result.changes.attachments = getLinkedAttachmentReferences(this.attachmentEntries);
 		}
 
-		this.pendingBlockingUpdates = {
-			added: addedPaths,
-			removed: removedPaths,
-			raw: rawAdditions,
-		};
-		this.unresolvedBlockingEntries = unresolvedEntries;
-
-		const normalizedDetails = this.normalizeDetails(this.details);
-		const normalizedOriginal = this.normalizeDetails(this.originalDetails);
-		if (normalizedDetails !== normalizedOriginal) {
-			changes.details = normalizedDetails.trimEnd();
-		}
-
-		// Apply completed instances changes
-		if (this.completedInstancesChanges.length > 0) {
-			const currentCompleted = new Set(this.task.complete_instances || []);
-			let latestAddedCompletion: string | null = null;
-
-			for (const dateStr of this.completedInstancesChanges) {
-				if (currentCompleted.has(dateStr)) {
-					currentCompleted.delete(dateStr);
-				} else {
-					currentCompleted.add(dateStr);
-					// Track the latest date being added (for completion-based recurrence)
-					if (!latestAddedCompletion || dateStr > latestAddedCompletion) {
-						latestAddedCompletion = dateStr;
-					}
-				}
-			}
-			changes.complete_instances = Array.from(currentCompleted);
-
-			// If task has recurrence, handle DTSTART update and scheduled date calculation
-			if (this.task.recurrence && typeof this.task.recurrence === 'string') {
-				const recurrenceAnchor = this.task.recurrence_anchor || 'scheduled';
-
-				// For completion-based recurrence, update DTSTART when adding a completion
-				if (recurrenceAnchor === 'completion' && latestAddedCompletion) {
-					const { updateDTSTARTInRecurrenceRule } = require('../utils/helpers');
-					const updatedRecurrence = updateDTSTARTInRecurrenceRule(
-						this.task.recurrence,
-						latestAddedCompletion
-					);
-					if (updatedRecurrence) {
-						changes.recurrence = updatedRecurrence;
-					}
-				}
-
-				// Calculate next scheduled date
-				const tempTask: TaskInfo = {
-					...this.task,
-					...changes,
-					// Use updated recurrence if it was changed
-					recurrence: changes.recurrence || this.task.recurrence
-				};
-				const nextDates = updateToNextScheduledOccurrence(
-					tempTask,
-					this.plugin.settings.maintainDueDateOffsetInRecurring
-				);
-				if (nextDates.scheduled) {
-					changes.scheduled = nextDates.scheduled;
-				}
-				if (nextDates.due) {
-					changes.due = nextDates.due;
-				}
-			}
-		}
-
-		// Compare user fields and add to changes if modified
-		const userFieldsChanges = this.getUserFieldChanges();
-		if (Object.keys(userFieldsChanges).length > 0) {
-			(changes as any).customFrontmatter = userFieldsChanges;
-		}
-
-		// Compare time entries
 		if (JSON.stringify(this.timeEntries) !== JSON.stringify(this.task.timeEntries || [])) {
-			changes.timeEntries = this.timeEntries;
+			result.changes.timeEntries = this.timeEntries;
 		}
 
-		// Always update modified timestamp if there are changes
-		if (Object.keys(changes).length > 0) {
-			changes.dateModified = getCurrentTimestamp();
+		this.pendingBlockingUpdates = result.blockingUpdates;
+		this.unresolvedBlockingEntries = result.unresolvedBlockingEntries;
+
+		if (
+			options.includeConversionWrite &&
+			this.isConvertingNoteToTask &&
+			Object.keys(result.changes).length === 0
+		) {
+			result.changes.dateModified = getCurrentTimestamp();
 		}
 
-		return changes;
-	}
-
-	private getUserFieldChanges(): Record<string, any> {
-		const userFieldsChanges: Record<string, any> = {};
-
-		try {
-			// Get current frontmatter values
-			const file = this.app.vault.getAbstractFileByPath(this.task.path);
-			if (!file || !(file instanceof TFile)) {
-				return userFieldsChanges;
-			}
-
-			const metadata = this.app.metadataCache.getFileCache(file);
-			const frontmatter: Record<string, any> = metadata?.frontmatter || {};
-
-			// Compare current values with original frontmatter
-			const userFieldConfigs = this.plugin.settings?.userFields || [];
-			for (const field of userFieldConfigs) {
-				if (!field || !field.key) continue;
-
-				const newValue = this.userFields[field.key];
-				const oldValue = frontmatter[field.key];
-
-				// Check if values are different
-				if (this.isDifferent(newValue, oldValue)) {
-					// Set to null if empty value, otherwise use the new value
-					userFieldsChanges[field.key] =
-						newValue === null || newValue === undefined || newValue === ""
-							? null
-							: newValue;
-				}
-			}
-		} catch (error) {
-			console.error("Error comparing user fields:", error);
-		}
-
-		return userFieldsChanges;
-	}
-
-	private isDifferent(newValue: any, oldValue: any): boolean {
-		// Handle null/undefined/empty comparisons
-		const normalizeEmpty = (value: any) => {
-			if (value === null || value === undefined || value === "") {
-				return null;
-			}
-			return value;
-		};
-
-		const normalizedNew = normalizeEmpty(newValue);
-		const normalizedOld = normalizeEmpty(oldValue);
-
-		// For arrays (list fields), compare as JSON strings
-		if (Array.isArray(normalizedNew) || Array.isArray(normalizedOld)) {
-			return JSON.stringify(normalizedNew) !== JSON.stringify(normalizedOld);
-		}
-
-		// For other values, direct comparison
-		return normalizedNew !== normalizedOld;
+		return result.changes;
 	}
 
 	private async openTaskNote(): Promise<void> {
@@ -1044,24 +476,31 @@ export class TaskEditModal extends TaskModal {
 			// Get the file from the task path
 			const file = this.app.vault.getAbstractFileByPath(this.task.path);
 
-			if (!file) {
-				new Notice(this.t("modals.taskEdit.notices.fileMissing", { path: this.task.path }));
+			if (!(file instanceof TFile)) {
+				new Notice(this.t(msg({ message: "Could not find task file: {path}", context: "modals.taskEdit.notices.fileMissing" }), { path: this.task.path }));
 				return;
 			}
 
+			if (!(await this.resolveUnsavedChanges())) return;
+
 			// Open the file in a new leaf
 			const leaf = this.app.workspace.getLeaf(true);
-			await leaf.openFile(file as TFile);
+			await leaf.openFile(file);
 
-			// Close the modal
-			this.close();
+			this.forceClose();
 		} catch (error) {
-			console.error("Failed to open task note:", error);
-			new Notice(this.t("modals.taskEdit.notices.openNoteFailure"));
+			tasknotesLogger.error("Failed to open task note:", {
+				category: "persistence",
+				operation: "open-task-note",
+				error: error,
+			});
+			new Notice(this.t(msg({ message: "Failed to open task note", context: "modals.taskEdit.notices.openNoteFailure" })));
 		}
 	}
 
 	private async archiveTask(): Promise<void> {
+		if (!(await this.resolveUnsavedChanges())) return;
+
 		try {
 			const updatedTask = await this.plugin.taskService.toggleArchive(this.task);
 
@@ -1075,68 +514,84 @@ export class TaskEditModal extends TaskModal {
 
 			// Show success message
 			const actionKey = updatedTask.archived
-				? "modals.taskEdit.archiveAction.archived"
-				: "modals.taskEdit.archiveAction.unarchived";
+				? msg({ message: "archived", context: "modals.taskEdit.archiveAction.archived" })
+				: msg({ message: "unarchived", context: "modals.taskEdit.archiveAction.unarchived" });
 			const actionText = this.t(actionKey);
-			new Notice(this.t("modals.taskEdit.notices.archiveSuccess", { action: actionText }));
+			new Notice(this.t(msg({ message: "Task {action} successfully", context: "modals.taskEdit.notices.archiveSuccess" }), { action: actionText }));
 
-			// Close the modal
-			this.close();
+			this.forceClose();
 		} catch (error) {
-			console.error("Failed to archive task:", error);
-			new Notice(this.t("modals.taskEdit.notices.archiveFailure"));
+			tasknotesLogger.error("Failed to archive task:", {
+				category: "persistence",
+				operation: "archive-task",
+				error: error,
+			});
+			new Notice(this.t(msg({ message: "Failed to archive task", context: "modals.taskEdit.notices.archiveFailure" })));
 		}
 	}
 
-	protected createActionButtons(container: HTMLElement): void {
-		const buttonContainer = container.createDiv("modal-button-container");
-
-		// Add "Open note" button
-		const openNoteButton = buttonContainer.createEl("button", {
-			cls: "open-note-button",
-			text: this.t("modals.task.buttons.openNote"),
+	private async deleteTask(): Promise<void> {
+		const confirmed = await showConfirmationModal(this.app, {
+			title: this.t(msg({ message: "Delete task", context: "modals.taskEdit.deleteConfirmation.title" })),
+			message: this.t(msg({ message: "Are you sure you want to delete \"{title}\"? This moves the task note to Obsidian trash.", context: "modals.taskEdit.deleteConfirmation.message" }), {
+				title: this.task.title,
+			}),
+			confirmText: this.t(msg({ message: "Delete task", context: "modals.taskEdit.deleteConfirmation.confirm" })),
+			cancelText: this.t(msg({ message: "Cancel", context: "common.cancel" })),
+			isDestructive: true,
 		});
 
-		openNoteButton.addEventListener("click", async () => {
-			await this.openTaskNote();
-		});
+		if (!confirmed) {
+			return;
+		}
 
-		// Add "Archive" button
-		const archiveButton = buttonContainer.createEl("button", {
-			cls: "mod-warning archive-button",
-			text: this.task.archived
-				? this.t("modals.taskEdit.buttons.unarchive")
-				: this.t("modals.taskEdit.buttons.archive"),
-		});
+		try {
+			await this.plugin.taskService.deleteTask(this.task);
+			new Notice(this.t(msg({ message: "Task \"{title}\" deleted successfully", context: "modals.taskEdit.notices.deleteSuccess" }), { title: this.task.title }));
+			this.forceClose();
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			tasknotesLogger.error("Failed to delete task:", {
+				category: "persistence",
+				operation: "delete-task",
+				error: error,
+			});
+			new Notice(this.t(msg({ message: "Failed to delete task: {message}", context: "modals.taskEdit.notices.deleteFailure" }), { message: displayError(message) }));
+		}
+	}
 
-		archiveButton.addEventListener("click", async () => {
-			await this.archiveTask();
-		});
+	protected getLeadingButtons(): TaskModalLeadingButton[] {
+		return [
+			{
+				className: "tn-task-modal__open-note-button",
+				text: this.t(msg({ message: "Open note", context: "modals.task.buttons.openNote" })),
+				onClick: () => {
+					void this.openTaskNote();
+				},
+			},
+		];
+	}
 
-		// Save button (primary action)
-		const saveButton = buttonContainer.createEl("button", {
-			cls: "mod-cta",
-			text: this.t("modals.task.buttons.save"),
-		});
-
-		saveButton.addEventListener("click", async () => {
-			saveButton.disabled = true;
-			try {
-				await this.handleSave();
-				this.forceClose();
-			} finally {
-				saveButton.disabled = false;
-			}
-		});
-
-		// Cancel button
-		const cancelButton = buttonContainer.createEl("button", {
-			text: this.t("common.cancel"),
-		});
-
-		cancelButton.addEventListener("click", () => {
-			this.close();
-		});
+	protected getOverflowActions(): TaskModalOverflowAction[] {
+		return [
+			{
+				title: this.task.archived
+					? this.t(msg({ message: "Unarchive", context: "modals.taskEdit.buttons.unarchive" }))
+					: this.t(msg({ message: "Archive", context: "modals.taskEdit.buttons.archive" })),
+				icon: "archive",
+				onClick: () => {
+					void this.archiveTask();
+				},
+			},
+			{
+				title: this.t(msg({ message: "Delete", context: "contextMenus.task.delete" })),
+				icon: "trash",
+				warning: true,
+				onClick: () => {
+					void this.deleteTask();
+				},
+			},
+		];
 	}
 
 	protected async initializeSubtasks(): Promise<void> {
@@ -1144,11 +599,13 @@ export class TaskEditModal extends TaskModal {
 			const taskFile = this.app.vault.getAbstractFileByPath(this.task.path);
 			if (!(taskFile instanceof TFile)) return;
 
-			const subtasks = await this.plugin.projectSubtasksService.getTasksLinkedToProject(taskFile);
+			const subtasks =
+				await this.plugin.projectSubtasksService.getTasksLinkedToProject(taskFile);
+			const sortedSubtasks = this.plugin.projectSubtasksService.sortTasks([...subtasks]);
 			this.selectedSubtaskFiles = [];
 			this.initialSubtaskFiles = [];
 
-			for (const subtask of subtasks) {
+			for (const subtask of sortedSubtasks) {
 				const subtaskFile = this.app.vault.getAbstractFileByPath(subtask.path);
 				if (subtaskFile) {
 					this.selectedSubtaskFiles.push(subtaskFile);
@@ -1156,84 +613,49 @@ export class TaskEditModal extends TaskModal {
 				}
 			}
 		} catch (error) {
-			console.error("Error initializing subtasks:", error);
+			tasknotesLogger.error("Error initializing subtasks:", {
+				category: "persistence",
+				operation: "initializing-subtasks",
+				error: error,
+			});
 		}
 	}
 
 	protected hasSubtaskChanges(): boolean {
-		// Check if subtasks have changed
-		const current = this.selectedSubtaskFiles.map(f => f.path).sort();
-		const initial = this.initialSubtaskFiles.map(f => f.path).sort();
-
-		return current.length !== initial.length ||
-			   current.some((path, index) => path !== initial[index]);
+		return hasTaskEditSubtaskChanges(this.initialSubtaskFiles, this.selectedSubtaskFiles);
 	}
 
 	protected async applySubtaskChanges(task: TaskInfo): Promise<void> {
 		const currentTaskFile = this.app.vault.getAbstractFileByPath(task.path);
 		if (!(currentTaskFile instanceof TFile)) return;
 
-		const currentPaths = new Set(this.selectedSubtaskFiles.map(f => f.path));
-		const initialPaths = new Set(this.initialSubtaskFiles.map(f => f.path));
+		const result = await applyTaskEditSubtaskChanges({
+			parentTaskFile: currentTaskFile,
+			selectedSubtaskFiles: this.selectedSubtaskFiles,
+			initialSubtaskFiles: this.initialSubtaskFiles,
+			getTaskInfo: (path) => this.plugin.cacheManager.getTaskInfo(path),
+			buildProjectReference: (parentTaskFile, subtaskPath) =>
+				this.buildProjectReference(parentTaskFile, subtaskPath),
+			updateTaskProjects: (subtaskInfo, updatedProjects) =>
+				this.plugin.updateTaskProperty(subtaskInfo, "projects", updatedProjects),
+			onAddError: (error) => {
+				tasknotesLogger.error("Failed to add subtask relation:", {
+					category: "persistence",
+					operation: "add-subtask-relation",
+					error: error,
+				});
+			},
+			onRemoveError: (error) => {
+				tasknotesLogger.error("Failed to remove subtask relation:", {
+					category: "persistence",
+					operation: "remove-subtask-relation",
+					error: error,
+				});
+			},
+		});
 
-		// Remove current task from tasks that should no longer be subtasks
-		const toRemove = this.initialSubtaskFiles.filter(f => !currentPaths.has(f.path));
-		for (const file of toRemove) {
-			await this.removeSubtaskRelation(file, currentTaskFile);
-		}
-
-		// Add current task to tasks that should become subtasks
-		const toAdd = this.selectedSubtaskFiles.filter(f => !initialPaths.has(f.path));
-		for (const file of toAdd) {
-			await this.addSubtaskRelation(file, currentTaskFile);
-		}
-
-		// Update the initial state to reflect changes
-		this.initialSubtaskFiles = [...this.selectedSubtaskFiles];
+		this.initialSubtaskFiles = result.nextInitialSubtaskFiles;
 	}
-
-	protected async addSubtaskRelation(subtaskFile: TAbstractFile, parentTaskFile: TFile): Promise<void> {
-		try {
-			const subtaskInfo = await this.plugin.cacheManager.getTaskInfo(subtaskFile.path);
-			if (!subtaskInfo) return;
-
-			const projectReference = this.buildProjectReference(parentTaskFile, subtaskFile.path);
-			const legacyReference = `[[${parentTaskFile.basename}]]`;
-			const currentProjects = Array.isArray(subtaskInfo.projects) ? subtaskInfo.projects : [];
-
-			if (
-				currentProjects.includes(projectReference) ||
-				currentProjects.includes(legacyReference)
-			) {
-				return;
-			}
-
-			const sanitizedProjects = currentProjects.filter((entry) => entry !== legacyReference);
-			const updatedProjects = [...sanitizedProjects, projectReference];
-			await this.plugin.updateTaskProperty(subtaskInfo, "projects", updatedProjects);
-		} catch (error) {
-			console.error("Failed to add subtask relation:", error);
-		}
-	}
-
-	protected async removeSubtaskRelation(subtaskFile: TAbstractFile, parentTaskFile: TFile): Promise<void> {
-		try {
-			const subtaskInfo = await this.plugin.cacheManager.getTaskInfo(subtaskFile.path);
-			if (!subtaskInfo) return;
-
-			const projectReference = this.buildProjectReference(parentTaskFile, subtaskFile.path);
-			const legacyReference = `[[${parentTaskFile.basename}]]`;
-			const currentProjects = Array.isArray(subtaskInfo.projects) ? subtaskInfo.projects : [];
-
-			const updatedProjects = currentProjects.filter(
-				(project) => project !== projectReference && project !== legacyReference
-			);
-			await this.plugin.updateTaskProperty(subtaskInfo, "projects", updatedProjects);
-		} catch (error) {
-			console.error("Failed to remove subtask relation:", error);
-		}
-	}
-
-	// Start expanded for edit modal - override parent property
-	protected isExpanded = true;
 }
+
+/* eslint-enable @typescript-eslint/no-non-null-assertion -- Re-enable after the modal implementation. */

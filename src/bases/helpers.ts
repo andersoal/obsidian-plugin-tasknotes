@@ -1,21 +1,120 @@
-/* eslint-disable no-console */
+import { uiText } from "../i18n/runtime";
+import { msg } from "@lingui/core/macro";
 import TaskNotesPlugin from "../main";
-import { TaskInfo } from "../types";
-import { setIcon } from "obsidian";
+import { Reminder, TaskDependency, TaskInfo, TimeEntry } from "../types";
+import type { OccurrenceMaterializationMode, OccurrenceNextTrigger } from "@tasknotes/model";
 import { calculateTotalTimeSpent } from "../utils/helpers";
-import { format } from "date-fns";
+import { normalizeRecurrenceOriginalDate } from "../core/fieldMapping";
 import { convertInternalToUserProperties } from "../utils/propertyMapping";
 import { DEFAULT_INTERNAL_VISIBLE_PROPERTIES } from "../settings/defaults";
+import type { TaskCardOptions } from "../ui/TaskCard";
+import { PropertyMappingService } from "./PropertyMappingService";
+import { normalizeDependencyList } from "../utils/dependencyUtils";
+import { stringifyUnknown, stringifyUnknownArray } from "../utils/stringUtils";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+import { createElementInDocument } from "../utils/documentDom";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Bases/Helpers" });
+
+type Optional<T> = T | undefined;
 
 export interface BasesDataItem {
 	key?: string;
-	data?: any;
-	file?: { path?: string } | any;
+	data?: unknown;
+	file?: unknown;
 	path?: string;
-	properties?: Record<string, any>;
-	frontmatter?: Record<string, any>;
+	properties?: Record<string, unknown>;
+	frontmatter?: Record<string, unknown>;
 	name?: string;
-	basesData?: any; // Raw Bases data for formula computation
+	basesData?: unknown; // Raw Bases data for formula computation
+}
+
+type BasesDisplayProperty = {
+	getDisplayName?: () => string;
+};
+
+type BasesQueryLike = {
+	properties?: Record<string, BasesDisplayProperty>;
+	getViewConfig?: (key: string) => string[] | undefined;
+};
+
+type BasesConfigLike = {
+	getOrder?: () => string[];
+};
+
+type BasesControllerLike = {
+	query?: BasesQueryLike;
+	config?: BasesConfigLike;
+	getViewConfig?: () => {
+		order?: string[];
+		columns?: { order?: string[] };
+	};
+};
+
+type BasesContainerLike = {
+	controller?: BasesControllerLike;
+	query?: BasesQueryLike;
+	config?: BasesConfigLike;
+	data?: {
+		groupedData?: BasesGroupData[];
+	};
+};
+
+type BasesGroupData = {
+	key?: {
+		date?: Date;
+		data?: unknown;
+	};
+	entries?: Array<{
+		file?: {
+			path?: string;
+		};
+	}>;
+};
+
+function toStringArray(value: unknown): string[] | undefined {
+	if (value === undefined || value === null) return undefined;
+	return stringifyUnknownArray(value);
+}
+
+function toOptionalString(value: unknown): string | undefined {
+	if (value === undefined || value === null) return undefined;
+	return stringifyUnknown(value);
+}
+
+function toOptionalNumber(value: unknown): number | undefined {
+	if (typeof value === "number") return value;
+	if (typeof value === "string" && value.trim() !== "") {
+		const parsed = Number(value);
+		return Number.isNaN(parsed) ? undefined : parsed;
+	}
+	return undefined;
+}
+
+function toOccurrenceMaterializationMode(
+	value: unknown
+): Optional<OccurrenceMaterializationMode> {
+	const mode = toOptionalString(value);
+	return mode === "manual" || mode === "on_completion" || mode === "rolling"
+		? mode
+		: undefined;
+}
+
+function toOccurrenceNextTrigger(value: unknown): Optional<OccurrenceNextTrigger> {
+	const trigger = toOptionalString(value);
+	return trigger === "completion" || trigger === "completion_or_skip" ? trigger : undefined;
+}
+
+function toTimeEntries(value: unknown): TimeEntry[] | undefined {
+	return Array.isArray(value) ? (value as TimeEntry[]) : undefined;
+}
+
+function toReminders(value: unknown): Reminder[] | undefined {
+	return Array.isArray(value) ? (value as Reminder[]) : undefined;
+}
+
+function toDependencies(value: unknown): TaskDependency[] | undefined {
+	return value === undefined ? undefined : normalizeDependencyList(value);
 }
 
 /**
@@ -40,8 +139,6 @@ export function mapBasesPropertyToTaskCardProperty(
 ): string {
 	// Delegate to PropertyMappingService if available (preferred path)
 	if (plugin) {
-		// Import PropertyMappingService inline to avoid circular dependencies
-		const { PropertyMappingService } = require("./PropertyMappingService");
 		const mapper = new PropertyMappingService(plugin, plugin.fieldMapper);
 		return mapper.basesToTaskCardProperty(propId);
 	}
@@ -71,7 +168,7 @@ function applySpecialTransformations(propId: string): string {
  * Create TaskInfo object from a single Bases data item
  */
 function createTaskInfoFromProperties(
-	props: Record<string, any>,
+	props: Record<string, unknown>,
 	basesItem: BasesDataItem,
 	plugin?: TaskNotesPlugin
 ): TaskInfo {
@@ -88,6 +185,14 @@ function createTaskInfoFromProperties(
 		"timeEstimate",
 		"completedDate",
 		"recurrence",
+		"recurrence_parent",
+		"occurrence_date",
+		"recurrence_original_date",
+		"occurrence_materialization",
+		"occurrence_next_trigger",
+		"occurrence_template",
+		"occurrence_past_horizon",
+		"occurrence_future_horizon",
 		"dateCreated",
 		"dateModified",
 		"timeEntries",
@@ -95,21 +200,28 @@ function createTaskInfoFromProperties(
 		"icsEventId",
 		"complete_instances",
 		"skipped_instances",
+		"googleCalendarEventId",
+		"googleCalendarExceptionEventId",
+		"googleCalendarExceptionOriginalScheduled",
+		"googleCalendarMovedOriginalDates",
 		"blockedBy",
 		"blocking",
+		"sortOrder",
+		// Prevent double-nesting: when this function is called with a Partial<TaskInfo>
+		// that already has customProperties populated (e.g. from mapFromFrontmatter),
+		// we must not re-classify it as an unknown property.
+		"customProperties",
 	]);
 
-	const customProperties: Record<string, any> = {};
+	const customProperties: Record<string, unknown> = {};
 	Object.keys(props).forEach((key) => {
 		if (!knownProperties.has(key)) {
 			customProperties[key] = props[key];
 		}
 	});
 
-	// Calculate total tracked time from time entries
-	const totalTrackedTime = props.timeEntries
-		? calculateTotalTimeSpent(props.timeEntries)
-		: 0;
+	const timeEntries = toTimeEntries(props.timeEntries);
+	const totalTrackedTime = timeEntries ? calculateTotalTimeSpent(timeEntries) : 0;
 
 	// Get dependency information from DependencyCache if plugin is available
 	let isBlocked = false;
@@ -127,44 +239,81 @@ function createTaskInfoFromProperties(
 
 	return {
 		title:
-			props.title ||
+			toOptionalString(props.title) ||
 			basesItem.name ||
 			basesItem.path?.split("/").pop()?.replace(".md", "") ||
-			"Untitled",
-		status: props.status || plugin?.settings?.defaultTaskStatus || "open",
-		priority: props.priority || "normal",
+			uiText(msg({ message: "Untitled", context: "bases/helpers: createTaskInfoFromProperties title" })),
+		status: toOptionalString(props.status) || plugin?.settings?.defaultTaskStatus || "open",
+		priority: toOptionalString(props.priority) || "normal",
 		path: basesItem.path || "",
-		archived: props.archived || false,
-		due: props.due,
-		scheduled: props.scheduled,
-		contexts: Array.isArray(props.contexts)
-			? props.contexts
-			: props.contexts
-				? [props.contexts]
-				: undefined,
-		projects: Array.isArray(props.projects)
-			? props.projects
-			: props.projects
-				? [props.projects]
-				: undefined,
-		tags: Array.isArray(props.tags) ? props.tags : props.tags ? [props.tags] : undefined,
-		timeEstimate: props.timeEstimate,
-		completedDate: props.completedDate,
-		recurrence: props.recurrence,
-		dateCreated: props.dateCreated,
-		dateModified: props.dateModified,
-		timeEntries: props.timeEntries,
+		archived: props.archived === true,
+		due: toOptionalString(props.due),
+		scheduled: toOptionalString(props.scheduled),
+		contexts: toStringArray(props.contexts),
+		projects: toStringArray(props.projects),
+		attachments: toStringArray(props.attachments),
+		tags: toStringArray(props.tags),
+		timeEstimate: toOptionalNumber(props.timeEstimate),
+		completedDate: toOptionalString(props.completedDate),
+		recurrence: toOptionalString(props.recurrence),
+		recurrence_parent: toOptionalString(props.recurrence_parent),
+		occurrence_date: toOptionalString(props.occurrence_date),
+		recurrence_original_date: normalizeRecurrenceOriginalDate(props.recurrence_original_date),
+		occurrence_materialization: toOccurrenceMaterializationMode(
+			props.occurrence_materialization
+		),
+		occurrence_next_trigger: toOccurrenceNextTrigger(props.occurrence_next_trigger),
+		occurrence_template: toOptionalString(props.occurrence_template),
+		occurrence_past_horizon: toOptionalString(props.occurrence_past_horizon),
+		occurrence_future_horizon: toOptionalString(props.occurrence_future_horizon),
+		dateCreated: toOptionalString(props.dateCreated),
+		dateModified: toOptionalString(props.dateModified),
+		timeEntries,
 		totalTrackedTime: totalTrackedTime,
-		reminders: props.reminders,
-		icsEventId: props.icsEventId,
-		complete_instances: props.complete_instances,
-		skipped_instances: props.skipped_instances,
-		blockedBy: props.blockedBy,
+		reminders: toReminders(props.reminders),
+		icsEventId: toStringArray(props.icsEventId),
+		complete_instances: toStringArray(props.complete_instances),
+		skipped_instances: toStringArray(props.skipped_instances),
+		googleCalendarEventId: toOptionalString(props.googleCalendarEventId),
+		googleCalendarExceptionEventId: toOptionalString(props.googleCalendarExceptionEventId),
+		googleCalendarExceptionOriginalScheduled: toOptionalString(
+			props.googleCalendarExceptionOriginalScheduled
+		),
+		googleCalendarMovedOriginalDates: toStringArray(props.googleCalendarMovedOriginalDates),
+		blockedBy: toDependencies(props.blockedBy),
 		blocking: blockingTasks.length > 0 ? blockingTasks : undefined,
 		isBlocked: isBlocked,
 		isBlocking: isBlocking,
+		sortOrder: toOptionalString(props.sortOrder),
 		customProperties: Object.keys(customProperties).length > 0 ? customProperties : undefined,
 		basesData: basesItem.basesData,
+	};
+}
+
+function mergeCustomProperties(
+	first: Record<string, unknown> | undefined,
+	second: Record<string, unknown> | undefined
+): Record<string, unknown> | undefined {
+	const merged = {
+		...(first ?? {}),
+		...(second ?? {}),
+	};
+	return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
+function enrichTaskInfoFromCache(taskInfo: TaskInfo, plugin?: TaskNotesPlugin): TaskInfo {
+	const cachedTask = plugin?.cacheManager?.getCachedTaskInfoSync?.(taskInfo.path);
+	if (!cachedTask) {
+		return taskInfo;
+	}
+
+	return {
+		...cachedTask,
+		basesData: taskInfo.basesData,
+		customProperties: mergeCustomProperties(
+			cachedTask.customProperties,
+			taskInfo.customProperties
+		),
 	};
 }
 
@@ -185,24 +334,27 @@ export function createTaskInfoFromBasesData(
 		const taskInfo = createTaskInfoFromProperties(mappedTaskInfo, basesItem, plugin);
 
 		// Preserve file.* properties from original props (they won't be in mappedTaskInfo)
-		const fileProperties: Record<string, any> = {};
-		Object.keys(props).forEach(key => {
-			if (key.startsWith('file.')) {
+		const fileProperties: Record<string, unknown> = {};
+		Object.keys(props).forEach((key) => {
+			if (key.startsWith("file.")) {
 				fileProperties[key] = props[key];
 			}
 		});
 
 		// Merge file properties with existing custom properties
-		return {
-			...taskInfo,
-			customProperties: {
-				...mappedTaskInfo.customProperties,
-				...taskInfo.customProperties,
-				...fileProperties,
+		return enrichTaskInfoFromCache(
+			{
+				...taskInfo,
+				customProperties: {
+					...mappedTaskInfo.customProperties,
+					...taskInfo.customProperties,
+					...fileProperties,
+				},
 			},
-		};
+			plugin
+		);
 	} else {
-		return createTaskInfoFromProperties(props, basesItem, plugin);
+		return enrichTaskInfoFromCache(createTaskInfoFromProperties(props, basesItem, plugin), plugin);
 	}
 }
 
@@ -222,7 +374,11 @@ export async function identifyTaskNotesFromBasesData(
 			const taskInfo = taskInfoConverter(item, plugin);
 			if (taskInfo) taskNotes.push(taskInfo);
 		} catch (error) {
-			console.warn("[TaskNotes][BasesPOC] Error converting Bases item to TaskInfo:", error);
+			tasknotesLogger.warn("[TaskNotes][BasesPOC] Error converting Bases item to TaskInfo:", {
+				category: "validation",
+				operation: "converting-bases-item-taskinfo",
+				error: error,
+			});
 		}
 	}
 	return taskNotes;
@@ -237,19 +393,39 @@ interface BasesSelectedProperty {
 	visible: boolean;
 }
 
-export function getBasesVisibleProperties(basesContainer: any): BasesSelectedProperty[] {
+function buildTaskCardPropertyLabels(
+	basesVisibleProperties: BasesSelectedProperty[],
+	plugin: TaskNotesPlugin
+): NonNullable<TaskCardOptions["propertyLabels"]> {
+	const labels: NonNullable<TaskCardOptions["propertyLabels"]> = {};
+
+	for (const property of basesVisibleProperties) {
+		const displayName = property.displayName?.trim();
+		if (!displayName) {
+			continue;
+		}
+
+		const taskCardPropertyId = mapBasesPropertyToTaskCardProperty(property.id, plugin);
+		if (taskCardPropertyId) {
+			labels[taskCardPropertyId] = displayName;
+		}
+	}
+
+	return labels;
+}
+
+export function getBasesVisibleProperties(basesContainer: unknown): BasesSelectedProperty[] {
 	try {
-		const controller = (basesContainer?.controller ?? basesContainer) as any;
-		const query = (basesContainer?.query ?? controller?.query) as any;
-		console.log("[TaskNotes][Bases] getBasesVisibleProperties - controller:", !!controller, "query:", !!query);
+		const viewContext = basesContainer as BasesContainerLike | undefined;
+		const controller = viewContext?.controller ?? (basesContainer as BasesControllerLike);
+		const query = viewContext?.query ?? controller?.query;
 
 		if (!controller) {
-			console.log("[TaskNotes][Bases] getBasesVisibleProperties - no controller, returning empty");
 			return [];
 		}
 
 		// Build index from available properties
-		const propsMap: Record<string, any> | undefined = query?.properties;
+		const propsMap = query?.properties;
 		const idIndex = new Map<string, string>();
 
 		if (propsMap && typeof propsMap === "object") {
@@ -272,13 +448,12 @@ export function getBasesVisibleProperties(basesContainer: any): BasesSelectedPro
 		let order: string[] | undefined;
 
 		// Try public API first (viewContext.config.getOrder())
-		const config = basesContainer?.config ?? controller?.config;
+		const config = viewContext?.config ?? controller?.config;
 		if (config && typeof config.getOrder === "function") {
 			try {
 				order = config.getOrder();
-				console.log("[TaskNotes][Bases] getBasesVisibleProperties - got order from config.getOrder():", order);
-			} catch (e) {
-				console.log("[TaskNotes][Bases] getBasesVisibleProperties - config.getOrder() failed:", e);
+			} catch {
+				// Fall back to internal config below.
 			}
 		}
 
@@ -286,20 +461,13 @@ export function getBasesVisibleProperties(basesContainer: any): BasesSelectedPro
 		if (!order || !Array.isArray(order) || order.length === 0) {
 			const fullCfg = controller?.getViewConfig?.() ?? {};
 			try {
-				order =
-					(query?.getViewConfig?.("order") as string[] | undefined) ??
-					(fullCfg as any)?.order ??
-					(fullCfg as any)?.columns?.order;
-				if (order && Array.isArray(order) && order.length > 0) {
-					console.log("[TaskNotes][Bases] getBasesVisibleProperties - got order from internal API:", order);
-				}
-			} catch (_) {
-				order = (fullCfg as any)?.order ?? (fullCfg as any)?.columns?.order;
+				order = query?.getViewConfig?.("order") ?? fullCfg.order ?? fullCfg.columns?.order;
+			} catch {
+				order = fullCfg.order ?? fullCfg.columns?.order;
 			}
 		}
 
 		if (!order || !Array.isArray(order) || order.length === 0) {
-			console.log("[TaskNotes][Bases] getBasesVisibleProperties - no order found, returning empty. order:", order);
 			return [];
 		}
 
@@ -315,8 +483,7 @@ export function getBasesVisibleProperties(basesContainer: any): BasesSelectedPro
 				visible: true,
 			};
 		});
-	} catch (e) {
-		console.log("[TaskNotes][Bases] getBasesVisibleProperties failed:", e);
+	} catch {
 		return [];
 	}
 }
@@ -325,59 +492,72 @@ export async function renderTaskNotesInBasesView(
 	container: HTMLElement,
 	taskNotes: TaskInfo[],
 	plugin: TaskNotesPlugin,
-	basesContainer?: any,
+	basesContainer?: unknown,
 	taskElementsMap?: Map<string, HTMLElement>,
-	precomputedVisibleProperties?: string[]
+	precomputedVisibleProperties?: string[],
+	precomputedCardOptions?: Partial<TaskCardOptions>
 ): Promise<void> {
-	console.log("[TaskNotes][Bases] renderTaskNotesInBasesView ENTRY - tasks:", taskNotes.length, "basesContainer:", !!basesContainer, "precomputed props:", precomputedVisibleProperties?.length);
 	const { createTaskCard } = await import("../ui/TaskCard");
 
 	// Use container's document for pop-out window support
 	const doc = container.ownerDocument;
-	const taskListEl = doc.createElement("div");
+	const taskListEl = createElementInDocument(doc, "div");
 	taskListEl.className = "tn-bases-tasknotes-list";
-	taskListEl.style.cssText = "display: flex; flex-direction: column; gap: 1px;";
+	taskListEl.classList.remove(
+		"tn-static-display-block-2a1b75c9",
+		"tn-static-display-flex-4d51fc62",
+		"tn-static-display-flex-75816cae",
+		"tn-static-display-inline-block-60e32dcb",
+		"tn-static-display-inline-cccfa456",
+		"tn-static-display-inline-flex-f984c520",
+		"tn-static-display-none-6b99de8b",
+		"tn-static-flex-direction-column-06c8b5ed",
+		"tn-static-gap-0-5rem-ce2fca4d",
+		"tn-static-gap-10px-f3d7ce77",
+		"tn-static-gap-12px-ed7b3d87",
+		"tn-static-gap-6px-f0abc1db",
+		"tn-static-gap-8px-33fcd4c3",
+		"tn-static-min-height-800px-997b4c8c"
+	);
+	taskListEl.classList.add("tn-static-display-flex-8bb39979");
 	container.appendChild(taskListEl);
 
 	// Get visible properties from Bases
 	let visibleProperties: string[] | undefined = precomputedVisibleProperties;
-	let cardOptions = {};
+	let cardOptions: Partial<TaskCardOptions> = precomputedCardOptions || {};
 
 	// Only extract properties if not precomputed
 	if (!visibleProperties && basesContainer) {
-		console.log("[TaskNotes][Bases] basesContainer type:", typeof basesContainer, "keys:", basesContainer ? Object.keys(basesContainer).slice(0, 10) : []);
 		const basesVisibleProperties = getBasesVisibleProperties(basesContainer);
-		console.log("[TaskNotes][Bases] getBasesVisibleProperties returned:", basesVisibleProperties.length, "properties");
 
 		if (basesVisibleProperties.length > 0) {
+			cardOptions = {
+				...cardOptions,
+				propertyLabels: buildTaskCardPropertyLabels(basesVisibleProperties, plugin),
+			};
+
 			// Extract just the property IDs for TaskCard
 			visibleProperties = basesVisibleProperties.map((p) => p.id);
-			console.log("[TaskNotes][Bases] Raw property IDs from Bases:", visibleProperties);
 
 			// Map Bases property IDs to TaskCard-compatible property names
-			const hasBlockedByRequested = basesVisibleProperties.some(p =>
-				p.id === "blockedBy" || p.id === "note.blockedBy" || p.id === "task.blockedBy"
+			const hasBlockedByRequested = basesVisibleProperties.some(
+				(p) =>
+					p.id === "blockedBy" || p.id === "note.blockedBy" || p.id === "task.blockedBy"
 			);
-			console.log("[TaskNotes][Bases] hasBlockedByRequested:", hasBlockedByRequested);
 
 			visibleProperties = visibleProperties
 				.map((propId) => {
 					const mapped = mapBasesPropertyToTaskCardProperty(propId, plugin);
-					if (propId !== mapped) {
-						console.log(`[TaskNotes][Bases] Mapped ${propId} → ${mapped}`);
-					}
 					return mapped;
 				})
 				// Filter out computed dependency properties unless explicitly requested via blockedBy
 				.filter((propId) => {
 					if (propId === "blocked" || propId === "blocking") {
 						const keep = hasBlockedByRequested;
-						console.log(`[TaskNotes][Bases] Filtering ${propId}: ${keep ? "KEEP" : "REMOVE"}`);
 						return keep;
 					}
 					return true;
 				});
-			console.log("[TaskNotes][Bases] Final visible properties:", visibleProperties);
 		}
 	}
 
@@ -393,7 +573,6 @@ export async function renderTaskNotesInBasesView(
 		// Filter out blocked/blocking from defaults since they're computed properties
 		// that should only show when explicitly requested via blockedBy
 		visibleProperties = visibleProperties.filter((p) => p !== "blocked" && p !== "blocking");
-		console.log("[TaskNotes][Bases] Using default properties (filtered):", visibleProperties);
 	}
 
 	for (const taskInfo of taskNotes) {
@@ -416,248 +595,11 @@ export async function renderTaskNotesInBasesView(
 				taskElementsMap.set(taskInfo.path, taskCard);
 			}
 		} catch (error) {
-			console.warn("[TaskNotes][BasesPOC] Error creating task card:", error);
-		}
-	}
-}
-
-/**
- * Render grouped TaskNotes in Bases list view
- * Uses grouped data from Bases API (public API 1.10.0+)
- */
-export async function renderGroupedTasksInBasesView(
-	container: HTMLElement,
-	taskNotes: TaskInfo[],
-	plugin: TaskNotesPlugin,
-	viewContext: any,
-	pathToProps: Map<string, Record<string, any>>,
-	taskElementsMap?: Map<string, HTMLElement>
-): Promise<void> {
-	const { createTaskCard } = await import("../ui/TaskCard");
-
-	// Clear container and tracking map
-	container.innerHTML = "";
-	if (taskElementsMap) {
-		taskElementsMap.clear();
-	}
-
-	// Get visible properties from Bases FIRST (needed for both grouped and ungrouped rendering)
-	const basesVisibleProperties = getBasesVisibleProperties(viewContext);
-	let visibleProperties: string[] | undefined;
-
-	if (basesVisibleProperties.length > 0) {
-		visibleProperties = basesVisibleProperties.map((p) => p.id);
-		console.log("[TaskNotes][Bases][Grouped] Raw property IDs from Bases:", visibleProperties);
-
-		// Map Bases property IDs to TaskCard-compatible property names
-		const hasBlockedByRequested = basesVisibleProperties.some(p =>
-			p.id === "blockedBy" || p.id === "note.blockedBy" || p.id === "task.blockedBy"
-		);
-		console.log("[TaskNotes][Bases][Grouped] hasBlockedByRequested:", hasBlockedByRequested);
-
-		visibleProperties = visibleProperties
-			.map((propId) => {
-				const mapped = mapBasesPropertyToTaskCardProperty(propId, plugin);
-				if (propId !== mapped) {
-					console.log(`[TaskNotes][Bases][Grouped] Mapped ${propId} → ${mapped}`);
-				}
-				return mapped;
-			})
-			// Filter out computed dependency properties unless explicitly requested via blockedBy
-			.filter((propId) => {
-				if (propId === "blocked" || propId === "blocking") {
-					const keep = hasBlockedByRequested;
-					console.log(`[TaskNotes][Bases][Grouped] Filtering ${propId}: ${keep ? "KEEP" : "REMOVE"}`);
-					return keep;
-				}
-				return true;
+			tasknotesLogger.warn("[TaskNotes][BasesPOC] Error creating task card:", {
+				category: "persistence",
+				operation: "creating-task-card",
+				error: error,
 			});
-		console.log("[TaskNotes][Bases][Grouped] Final visible properties:", visibleProperties);
-	}
-
-	// Use plugin default properties if no Bases properties available
-	if (!visibleProperties || visibleProperties.length === 0) {
-		const internalDefaults = plugin.settings.defaultVisibleProperties || [
-			...DEFAULT_INTERNAL_VISIBLE_PROPERTIES,
-			"tags",
-		];
-		// Convert internal field names to user-configured property names
-		visibleProperties = convertInternalToUserProperties(internalDefaults, plugin);
-
-		// Filter out blocked/blocking from defaults since they're computed properties
-		// that should only show when explicitly requested via blockedBy
-		visibleProperties = visibleProperties.filter((p) => p !== "blocked" && p !== "blocking");
-		console.log("[TaskNotes][Bases] Using default properties (filtered):", visibleProperties);
-	}
-
-	// Get groupedData from public API
-	const groupedData = viewContext?.data?.groupedData;
-	if (!Array.isArray(groupedData) || groupedData.length === 0) {
-		// No groups, fall back to flat rendering (pass precomputed properties)
-		await renderTaskNotesInBasesView(container, taskNotes, plugin, viewContext, taskElementsMap, visibleProperties);
-		return;
-	}
-
-	// Check if this is actually ungrouped (single group with null/undefined/empty key)
-	if (groupedData.length === 1) {
-		const singleGroup = groupedData[0];
-		const groupKey = singleGroup.key?.data;
-		const groupKeyStr = String(groupKey);
-		// If the key is null, undefined, empty string, or "Unknown", treat as ungrouped
-		if (groupKey === null || groupKey === undefined || groupKey === "" || groupKeyStr === "null" || groupKeyStr === "undefined" || groupKeyStr === "Unknown") {
-			// Render as flat list without group headers (pass precomputed properties)
-			await renderTaskNotesInBasesView(container, taskNotes, plugin, viewContext, taskElementsMap, visibleProperties);
-			return;
-		}
-	}
-
-	// Use container's document for pop-out window support
-	const doc = container.ownerDocument;
-
-	// Create wrapper with proper class for CSS styling
-	const listWrapper = doc.createElement("div");
-	listWrapper.className = "tn-bases-tasknotes-list";
-	container.appendChild(listWrapper);
-
-	const cardOptions = {
-		targetDate: new Date(),
-	};
-
-	// Create a map from file path to TaskInfo for quick lookup
-	const tasksByPath = new Map<string, TaskInfo>();
-	taskNotes.forEach((task) => {
-		if (task.path) {
-			tasksByPath.set(task.path, task);
-		}
-	});
-
-	// Render each group
-	for (const group of groupedData) {
-		// Extract value from Bases Value object
-		// Bases returns different structures: { date: Date } for date properties, { data: value } for others
-		const keyObj = group.key;
-		let groupKey: any;
-
-		// Try to extract the actual value from the Bases Value object
-		if (keyObj?.date instanceof Date) {
-			// Date property - use the date field
-			groupKey = keyObj.date;
-		} else if (keyObj?.data !== undefined) {
-			// Other properties - use the data field
-			groupKey = keyObj.data;
-		} else {
-			// Fallback for unknown structures
-			groupKey = keyObj || "Unknown";
-		}
-
-		// Format group name properly - handle Date objects for date-based grouping
-		let groupName: string;
-		if (groupKey instanceof Date) {
-			// Format dates as YYYY-MM-DD for consistency with TaskNotes date handling
-			// Note: Bases returns local Date objects, but we format to YYYY-MM-DD which represents
-			// the calendar date the user sees. This is intentional - group headers should show
-			// the date as the user perceives it (e.g., "2025-06-10" for June 10th in their timezone)
-			groupName = format(groupKey, "yyyy-MM-dd");
-		} else if (groupKey === null || groupKey === undefined || groupKey === "") {
-			groupName = "None";
-		} else {
-			groupName = String(groupKey);
-		}
-		const groupEntries = group.entries || [];
-
-		if (groupEntries.length === 0) continue;
-
-		// Create group section
-		const groupSection = doc.createElement("div");
-		groupSection.className = "task-section task-group";
-		groupSection.setAttribute("data-group", groupName);
-		listWrapper.appendChild(groupSection);
-
-		// Create group header
-		const headerElement = doc.createElement("h3");
-		headerElement.className = "task-group-header task-list-view__group-header";
-		groupSection.appendChild(headerElement);
-
-		// Add toggle button (chevron)
-		const toggleBtn = doc.createElement("button");
-		toggleBtn.className = "task-group-toggle";
-		toggleBtn.setAttribute("aria-label", "Toggle group");
-		toggleBtn.setAttribute("aria-expanded", "true");
-		headerElement.appendChild(toggleBtn);
-
-		// Add chevron icon
-		setIcon(toggleBtn, "chevron-right");
-
-		const svg = toggleBtn.querySelector("svg");
-		if (svg) {
-			svg.classList.add("chevron");
-			svg.setAttribute("width", "16");
-			svg.setAttribute("height", "16");
-		}
-
-		// Format group name and add count
-		const displayName = groupName === "null" || groupName === "undefined" ? "None" : groupName;
-		headerElement.createSpan({ text: displayName });
-
-		// Add count
-		headerElement.createSpan({
-			text: ` (${groupEntries.length})`,
-			cls: "agenda-view__item-count",
-		});
-
-		// Create task cards container BEFORE adding click handler
-		const taskCardsContainer = doc.createElement("div");
-		taskCardsContainer.className = "tasks-container task-cards";
-		groupSection.appendChild(taskCardsContainer);
-
-		// Add click handler for toggle
-		headerElement.addEventListener("click", (e: MouseEvent) => {
-			const target = e.target as HTMLElement;
-			// Don't toggle if clicking on a link
-			if (target.closest("a")) return;
-
-			e.preventDefault();
-			e.stopPropagation();
-
-			const isCollapsed = groupSection.classList.toggle("is-collapsed");
-			toggleBtn.setAttribute("aria-expanded", String(!isCollapsed));
-
-			// Toggle task cards visibility
-			if (isCollapsed) {
-				taskCardsContainer.style.display = "none";
-			} else {
-				taskCardsContainer.style.display = "";
-			}
-		});
-
-		// Collect TaskInfo for this group
-		const groupTasks: TaskInfo[] = [];
-		for (const entry of groupEntries) {
-			const filePath = entry.file?.path;
-			if (filePath) {
-				const task = tasksByPath.get(filePath);
-				if (task) {
-					groupTasks.push(task);
-				}
-			}
-		}
-
-		// Note: groupTasks preserve order from Bases grouped data
-		// No manual sorting needed - Bases provides pre-sorted data within groups
-
-		// Render tasks in this group
-		for (const task of groupTasks) {
-			try {
-				const taskCard = createTaskCard(task, plugin, visibleProperties, cardOptions);
-				taskCardsContainer.appendChild(taskCard);
-
-				// Track task elements for selective updates
-				if (taskElementsMap && task.path) {
-					taskElementsMap.set(task.path, taskCard);
-				}
-			} catch (error) {
-				console.warn("[TaskNotes][Bases] Error creating task card:", error);
-			}
 		}
 	}
 }
@@ -672,40 +614,173 @@ export function renderBasesDataItem(
 ): void {
 	// Use container's document for pop-out window support
 	const doc = container.ownerDocument;
-	const itemEl = doc.createElement("div");
+	const itemEl = createElementInDocument(doc, "div");
 	itemEl.className = "tn-bases-data-item";
-	itemEl.style.cssText =
-		"padding: 12px; margin: 8px 0; background: #fff; border: 1px solid #ddd; border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,0.1);";
+	itemEl.classList.remove(
+		"tn-static-border-1px-solid-var-background-mo-b65b5121",
+		"tn-static-border-none-2eda1daa",
+		"tn-static-border-radius-4px-c290c56e",
+		"tn-static-border-radius-6px-0dc8408c",
+		"tn-static-margin-0-11696618",
+		"tn-static-margin-0-auto-266e9b04",
+		"tn-static-margin-0-db0d5f36",
+		"tn-static-margin-0-var-size-4-2-77f7dc08",
+		"tn-static-margin-2px-0-edce9b14",
+		"tn-static-margin-8px-0-0-0-a2eb8382",
+		"tn-static-padding-0-16px-16px-16px-f1aa998c",
+		"tn-static-padding-0-41d7d7e2",
+		"tn-static-padding-16px-287f770e",
+		"tn-static-padding-20px-769fed37",
+		"tn-static-padding-20px-7a035d95",
+		"tn-static-padding-20px-ebe8e48c",
+		"tn-static-padding-2px-8px-c8eea84a",
+		"tn-static-padding-2rem-42aa6d9c"
+	);
+	itemEl.classList.add("tn-static-padding-12px-43bef435");
 
-	const header = doc.createElement("div");
-	header.style.cssText = "font-weight: bold; margin-bottom: 8px; color: #333;";
-	header.textContent = `Item ${index + 1}`;
+	const header = createElementInDocument(doc, "div");
+	header.classList.remove(
+		"tn-static-color-var-color-accent-d2cad743",
+		"tn-static-color-var-text-accent-65b47ee3",
+		"tn-static-color-var-text-muted-5872de20",
+		"tn-static-color-var-text-on-accent-f3e1679d",
+		"tn-static-color-var-text-warning-783d5f03",
+		"tn-static-color-var-tn-text-muted-a90fb6f3",
+		"tn-static-color-white-0a43e56a",
+		"tn-static-cursor-pointer-2723efcc",
+		"tn-static-font-size-12px-65574819",
+		"tn-static-font-weight-500-02a2d333",
+		"tn-static-font-weight-600-eed0f8fb",
+		"tn-static-font-weight-bold-0fe8c30d",
+		"tn-static-margin-2px-0-edce9b14",
+		"tn-static-margin-bottom-0-75rem-c05a3c6e",
+		"tn-static-margin-bottom-20px-49f14f8f",
+		"tn-static-margin-bottom-8px-fdf33f23",
+		"tn-static-padding-20px-7a035d95",
+		"tn-static-padding-20px-ebe8e48c"
+	);
+	header.classList.add("tn-static-font-weight-bold-e0b452bd");
+	header.textContent = uiText(msg({ message: "Item {value1, number}", context: "Bases data inspector" }), { value1: index + 1 });
 	itemEl.appendChild(header);
 
-	if ((item as any).path) {
-		const pathEl = doc.createElement("div");
-		pathEl.style.cssText =
-			"font-size: 12px; color: #666; margin-bottom: 6px; font-family: monospace;";
-		pathEl.textContent = `Path: ${(item as any).path}`;
+	if (item.path) {
+		const pathEl = createElementInDocument(doc, "div");
+		pathEl.classList.remove(
+			"tn-static-color-var-color-accent-d2cad743",
+			"tn-static-color-var-text-accent-65b47ee3",
+			"tn-static-color-var-text-muted-5872de20",
+			"tn-static-color-var-text-on-accent-f3e1679d",
+			"tn-static-color-var-text-warning-783d5f03",
+			"tn-static-color-var-tn-text-muted-a90fb6f3",
+			"tn-static-color-white-0a43e56a",
+			"tn-static-cursor-pointer-2723efcc",
+			"tn-static-font-size-0-75em-948e16e5",
+			"tn-static-font-size-0-8em-19dc7c13",
+			"tn-static-font-size-0-9em-65025e95",
+			"tn-static-font-size-1-2em-3a352995",
+			"tn-static-font-size-12px-b0cc7e05",
+			"tn-static-font-size-var-tn-font-size-sm-0274a31d",
+			"tn-static-font-weight-bold-0fe8c30d",
+			"tn-static-font-weight-bold-e0b452bd",
+			"tn-static-margin-2px-0-edce9b14",
+			"tn-static-margin-8px-0-0-0-a2eb8382",
+			"tn-static-margin-bottom-0-75rem-c05a3c6e",
+			"tn-static-margin-bottom-20px-49f14f8f",
+			"tn-static-margin-bottom-8px-fdf33f23",
+			"tn-static-margin-top-8px-f4f01e68",
+			"tn-static-padding-20px-7a035d95",
+			"tn-static-padding-20px-ebe8e48c"
+		);
+		pathEl.classList.add("tn-static-font-size-12px-65574819");
+		pathEl.textContent = uiText(msg({ message: "Path: {path}", context: "Bases data inspector" }), { path: item.path });
 		itemEl.appendChild(pathEl);
 	}
 
-	const props = (item as any).properties;
+	const props = item.properties;
 	if (props && typeof props === "object") {
-		const propsEl = doc.createElement("div");
-		propsEl.style.cssText = "font-size: 12px; margin-top: 8px;";
+		const propsEl = createElementInDocument(doc, "div");
+		propsEl.classList.remove(
+			"tn-static-font-size-0-75em-948e16e5",
+			"tn-static-font-size-0-8em-19dc7c13",
+			"tn-static-font-size-0-9em-65025e95",
+			"tn-static-font-size-1-2em-3a352995",
+			"tn-static-font-size-12px-65574819",
+			"tn-static-font-size-var-tn-font-size-sm-0274a31d",
+			"tn-static-margin-8px-0-0-0-a2eb8382",
+			"tn-static-margin-top-0-5rem-3dc98b5e",
+			"tn-static-margin-top-0-d462248a",
+			"tn-static-margin-top-12px-91e0f558",
+			"tn-static-margin-top-16px-1b0f4999",
+			"tn-static-margin-top-1rem-2239d6d5",
+			"tn-static-margin-top-20px-a26bda7d",
+			"tn-static-margin-top-30px-2fbbbcd4",
+			"tn-static-margin-top-4px-96ad6099",
+			"tn-static-margin-top-8px-8a77e5a3",
+			"tn-static-margin-top-8px-f4f01e68"
+		);
+		propsEl.classList.add("tn-static-font-size-12px-b0cc7e05");
 
-		const propsHeader = doc.createElement("div");
-		propsHeader.style.cssText = "font-weight: bold; margin-bottom: 4px; color: #555;";
-		propsHeader.textContent = "Properties:";
+		const propsHeader = createElementInDocument(doc, "div");
+		propsHeader.classList.remove(
+			"tn-static-color-var-color-accent-d2cad743",
+			"tn-static-color-var-text-accent-65b47ee3",
+			"tn-static-color-var-text-muted-5872de20",
+			"tn-static-color-var-text-on-accent-f3e1679d",
+			"tn-static-color-var-text-warning-783d5f03",
+			"tn-static-color-var-tn-text-muted-a90fb6f3",
+			"tn-static-color-white-0a43e56a",
+			"tn-static-cursor-pointer-2723efcc",
+			"tn-static-font-size-12px-65574819",
+			"tn-static-font-weight-500-02a2d333",
+			"tn-static-font-weight-600-eed0f8fb",
+			"tn-static-font-weight-bold-e0b452bd",
+			"tn-static-margin-2px-0-edce9b14",
+			"tn-static-margin-bottom-0-75rem-c05a3c6e",
+			"tn-static-margin-bottom-20px-49f14f8f",
+			"tn-static-margin-bottom-8px-fdf33f23",
+			"tn-static-padding-20px-7a035d95",
+			"tn-static-padding-20px-ebe8e48c"
+		);
+		propsHeader.classList.add("tn-static-font-weight-bold-0fe8c30d");
+		propsHeader.textContent = uiText(msg({ message: "Properties:", context: "Bases data inspector" }));
 		propsEl.appendChild(propsHeader);
 
-		const propsList = doc.createElement("ul");
-		propsList.style.cssText = "margin: 0; padding-left: 16px; list-style-type: disc;";
+		const propsList = createElementInDocument(doc, "ul");
+		propsList.classList.remove(
+			"tn-static-margin-0-11696618",
+			"tn-static-margin-0-auto-266e9b04",
+			"tn-static-margin-0-var-size-4-2-77f7dc08",
+			"tn-static-margin-2px-0-edce9b14",
+			"tn-static-margin-8px-0-0-0-a2eb8382",
+			"tn-static-padding-12px-43bef435",
+			"tn-static-padding-20px-ebe8e48c"
+		);
+		propsList.classList.add("tn-static-margin-0-db0d5f36");
 
 		Object.entries(props).forEach(([key, value]) => {
-			const li = doc.createElement("li");
-			li.style.cssText = "margin: 2px 0; color: #444;";
+			const li = createElementInDocument(doc, "li");
+			li.classList.remove(
+				"tn-static-color-var-color-accent-d2cad743",
+				"tn-static-color-var-text-accent-65b47ee3",
+				"tn-static-color-var-text-muted-5872de20",
+				"tn-static-color-var-text-on-accent-f3e1679d",
+				"tn-static-color-var-text-warning-783d5f03",
+				"tn-static-color-var-tn-text-muted-a90fb6f3",
+				"tn-static-color-white-0a43e56a",
+				"tn-static-cursor-pointer-2723efcc",
+				"tn-static-font-size-12px-65574819",
+				"tn-static-font-weight-bold-0fe8c30d",
+				"tn-static-font-weight-bold-e0b452bd",
+				"tn-static-margin-0-11696618",
+				"tn-static-margin-0-auto-266e9b04",
+				"tn-static-margin-0-db0d5f36",
+				"tn-static-margin-0-var-size-4-2-77f7dc08",
+				"tn-static-margin-8px-0-0-0-a2eb8382",
+				"tn-static-padding-12px-43bef435",
+				"tn-static-padding-20px-7a035d95",
+				"tn-static-padding-20px-ebe8e48c"
+			);
+			li.classList.add("tn-static-margin-2px-0-edce9b14");
 			li.textContent = `${key}: ${JSON.stringify(value)}`;
 			propsList.appendChild(li);
 		});
@@ -714,17 +789,80 @@ export function renderBasesDataItem(
 		itemEl.appendChild(propsEl);
 	}
 
-	const rawDataEl = doc.createElement("details");
-	rawDataEl.style.cssText = "margin-top: 8px; font-size: 11px;";
+	const rawDataEl = createElementInDocument(doc, "details");
+	rawDataEl.classList.remove(
+		"tn-static-font-size-0-75em-948e16e5",
+		"tn-static-font-size-0-8em-19dc7c13",
+		"tn-static-font-size-0-9em-65025e95",
+		"tn-static-font-size-1-2em-3a352995",
+		"tn-static-font-size-12px-65574819",
+		"tn-static-font-size-12px-b0cc7e05",
+		"tn-static-font-size-var-tn-font-size-sm-0274a31d",
+		"tn-static-margin-8px-0-0-0-a2eb8382",
+		"tn-static-margin-top-0-5rem-3dc98b5e",
+		"tn-static-margin-top-0-d462248a",
+		"tn-static-margin-top-12px-91e0f558",
+		"tn-static-margin-top-16px-1b0f4999",
+		"tn-static-margin-top-1rem-2239d6d5",
+		"tn-static-margin-top-20px-a26bda7d",
+		"tn-static-margin-top-30px-2fbbbcd4",
+		"tn-static-margin-top-4px-96ad6099",
+		"tn-static-margin-top-8px-8a77e5a3"
+	);
+	rawDataEl.classList.add("tn-static-margin-top-8px-f4f01e68");
 
-	const summary = doc.createElement("summary");
-	summary.style.cssText = "cursor: pointer; color: #666; font-weight: bold;";
-	summary.textContent = "Raw Data Structure";
+	const summary = createElementInDocument(doc, "summary");
+	summary.classList.remove(
+		"tn-static-color-var-color-accent-d2cad743",
+		"tn-static-color-var-text-accent-65b47ee3",
+		"tn-static-color-var-text-muted-5872de20",
+		"tn-static-color-var-text-on-accent-f3e1679d",
+		"tn-static-color-var-text-warning-783d5f03",
+		"tn-static-color-var-tn-text-muted-a90fb6f3",
+		"tn-static-color-white-0a43e56a",
+		"tn-static-cursor-grab-dad79857",
+		"tn-static-cursor-pointer-3b6a3a65",
+		"tn-static-font-size-12px-65574819",
+		"tn-static-font-weight-500-02a2d333",
+		"tn-static-font-weight-600-eed0f8fb",
+		"tn-static-font-weight-bold-0fe8c30d",
+		"tn-static-font-weight-bold-e0b452bd",
+		"tn-static-margin-2px-0-edce9b14",
+		"tn-static-padding-20px-7a035d95",
+		"tn-static-padding-20px-ebe8e48c"
+	);
+	summary.classList.add("tn-static-cursor-pointer-2723efcc");
+	summary.textContent = uiText(msg({ message: "Raw data structure", context: "Bases data inspector" }));
 	rawDataEl.appendChild(summary);
 
-	const pre = doc.createElement("pre");
-	pre.style.cssText =
-		"margin: 8px 0 0 0; padding: 8px; background: #f8f8f8; border-radius: 4px; overflow-x: auto; font-size: 10px;";
+	const pre = createElementInDocument(doc, "pre");
+	pre.classList.remove(
+		"tn-static-border-radius-4px-c290c56e",
+		"tn-static-border-radius-6px-0dc8408c",
+		"tn-static-font-size-0-75em-948e16e5",
+		"tn-static-font-size-0-8em-19dc7c13",
+		"tn-static-font-size-0-9em-65025e95",
+		"tn-static-font-size-1-2em-3a352995",
+		"tn-static-font-size-12px-65574819",
+		"tn-static-font-size-12px-b0cc7e05",
+		"tn-static-font-size-var-tn-font-size-sm-0274a31d",
+		"tn-static-margin-0-11696618",
+		"tn-static-margin-0-auto-266e9b04",
+		"tn-static-margin-0-db0d5f36",
+		"tn-static-margin-0-var-size-4-2-77f7dc08",
+		"tn-static-margin-2px-0-edce9b14",
+		"tn-static-margin-top-8px-f4f01e68",
+		"tn-static-padding-0-16px-16px-16px-f1aa998c",
+		"tn-static-padding-0-41d7d7e2",
+		"tn-static-padding-12px-43bef435",
+		"tn-static-padding-16px-287f770e",
+		"tn-static-padding-20px-769fed37",
+		"tn-static-padding-20px-7a035d95",
+		"tn-static-padding-20px-ebe8e48c",
+		"tn-static-padding-2px-8px-c8eea84a",
+		"tn-static-padding-2rem-42aa6d9c"
+	);
+	pre.classList.add("tn-static-margin-8px-0-0-0-a2eb8382");
 	pre.textContent = JSON.stringify(item, null, 2);
 	rawDataEl.appendChild(pre);
 

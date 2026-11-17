@@ -1,27 +1,41 @@
-import type { Server, IncomingMessage, ServerResponse } from "http";
-import { Notice, requestUrl, Platform } from "obsidian";
-import { randomBytes, createHash } from "crypto";
+import { requestUrl, Platform } from "obsidian";
+import { msg } from "@lingui/core/macro";
+import { oauthCallbackHtml } from "../i18n/oauthCallbackHtml";
 import TaskNotesPlugin from "../main";
 import { OAuthProvider, OAuthTokens, OAuthConnection, OAuthConfig } from "../types";
 import { OAUTH_CONSTANTS } from "./constants";
 import { OAuthNotConfiguredError, TokenExpiredError, TokenRefreshError } from "./errors";
+import type { HTTPRequestLike, HTTPResponseLike, HTTPServerLike } from "../api/httpTypes";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+import { publishUserNotice } from "../core/userNotices";
+import { OAuthSecretStore, type OAuthCredentials } from "./OAuthSecretStore";
 
-let cachedHttpModule: typeof import("http") | null = null;
+const tasknotesLogger = createTaskNotesLogger({ tag: "Services/OAuthService" });
 
-function ensureHttpModule(): typeof import("http") {
-	if (!Platform.isDesktopApp) {
-		throw new Error("OAuth redirect handling is only available on desktop.");
+type HttpModuleLike = {
+	createServer(handler?: (req: HTTPRequestLike, res: HTTPResponseLike) => void): HTTPServerLike;
+};
+
+type ElectronModuleLike = {
+	shell?: {
+		openExternal?: (url: string) => Promise<void> | void;
+	};
+};
+
+let cachedHttpModule: HttpModuleLike | null = null;
+
+function ensureHttpModule(): HttpModuleLike {
+	if (Platform.isDesktop && Platform.isDesktopApp) {
+		if (!cachedHttpModule) {
+			// Lazy-load the Node http module so mobile builds don't crash at load time.
+			// eslint-disable-next-line @typescript-eslint/no-require-imports -- The guarded desktop path needs Node's HTTP server.
+			cachedHttpModule = require("http") as HttpModuleLike;
+		}
+
+		return cachedHttpModule;
 	}
 
-	if (!cachedHttpModule) {
-		// Lazy-load the Node http module so mobile builds don't crash at load time
-		// eslint-disable-next-line @typescript-eslint/no-require-imports
-		cachedHttpModule = require("http");
-	}
-
-	// TypeScript doesn't know we always set cachedHttpModule in the if block above
-	// eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-	return cachedHttpModule!;
+	throw new Error("OAuth redirect handling is only available on desktop.");
 }
 
 /**
@@ -38,17 +52,22 @@ function ensureHttpModule(): typeof import("http") {
  */
 export class OAuthService {
 	private plugin: TaskNotesPlugin;
-	private callbackServer: Server | null = null;
-	private pendingOAuthState: Map<string, {
-		provider: OAuthProvider;
-		codeVerifier: string;
-		resolve: (code: string) => void;
-		reject: (error: Error) => void;
-	}> = new Map();
+	private readonly secretStore: OAuthSecretStore;
+	private callbackServer: HTTPServerLike | null = null;
+	private pendingOAuthState: Map<
+		string,
+		{
+			provider: OAuthProvider;
+			codeVerifier: string;
+			resolve: (code: string) => void;
+			reject: (error: Error) => void;
+		}
+	> = new Map();
 
 	// Token refresh mutex to prevent race conditions
 	// Maps provider to pending refresh promise
 	private tokenRefreshPromises: Map<OAuthProvider, Promise<OAuthTokens>> = new Map();
+	private connectionGenerations: Map<OAuthProvider, number> = new Map();
 
 	// OAuth configurations for different providers
 	private configs: Record<OAuthProvider, OAuthConfig> = {
@@ -58,46 +77,49 @@ export class OAuthService {
 			redirectUri: "http://127.0.0.1:8080",
 			scope: [
 				"https://www.googleapis.com/auth/calendar.readonly",
-				"https://www.googleapis.com/auth/calendar.events"
+				"https://www.googleapis.com/auth/calendar.events",
 			],
 			authorizationEndpoint: "https://accounts.google.com/o/oauth2/v2/auth",
 			tokenEndpoint: "https://oauth2.googleapis.com/token",
 			deviceCodeEndpoint: "https://oauth2.googleapis.com/device/code",
-			revocationEndpoint: "https://oauth2.googleapis.com/revoke"
+			revocationEndpoint: "https://oauth2.googleapis.com/revoke",
 		},
 		microsoft: {
 			provider: "microsoft",
 			clientId: "", // Will be set from built-in or plugin settings
 			redirectUri: "http://localhost:8080",
-			scope: [
-				"Calendars.Read",
-				"Calendars.ReadWrite",
-				"offline_access"
-			],
+			scope: ["Calendars.Read", "Calendars.ReadWrite", "offline_access"],
 			authorizationEndpoint: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
 			tokenEndpoint: "https://login.microsoftonline.com/common/oauth2/v2.0/token",
 			deviceCodeEndpoint: "https://login.microsoftonline.com/common/oauth2/v2.0/devicecode",
-			revocationEndpoint: "https://login.microsoftonline.com/common/oauth2/v2.0/logout"
-		}
+			revocationEndpoint: "https://login.microsoftonline.com/common/oauth2/v2.0/logout",
+		},
 	};
 
-	constructor(plugin: TaskNotesPlugin) {
+	constructor(plugin: TaskNotesPlugin, secretStore: OAuthSecretStore) {
 		this.plugin = plugin;
-		this.loadClientIds();
+		this.secretStore = secretStore;
 	}
 
-	/**
-	 * Loads OAuth client IDs and secrets
-	 * from user settings.
-	 */
-	async loadClientIds(): Promise<void> {
-		// Google Calendar
-		this.configs.google.clientId = this.plugin.settings.googleOAuthClientId || "";
-		this.configs.google.clientSecret = this.plugin.settings.googleOAuthClientSecret || "";
+	getCredentials(provider: OAuthProvider): OAuthCredentials | null {
+		return this.secretStore.getCredentials(provider);
+	}
 
-		// Microsoft Calendar
-		this.configs.microsoft.clientId = this.plugin.settings.microsoftOAuthClientId || "";
-		this.configs.microsoft.clientSecret = this.plugin.settings.microsoftOAuthClientSecret || "";
+	setCredentials(provider: OAuthProvider, credentials: OAuthCredentials): void {
+		this.secretStore.setCredentials(provider, credentials);
+	}
+
+	clearCredentials(provider: OAuthProvider): void {
+		this.secretStore.clearCredentials(provider);
+	}
+
+	private getConfig(provider: OAuthProvider): OAuthConfig {
+		const credentials = this.secretStore.getCredentials(provider);
+		return {
+			...this.configs[provider],
+			clientId: credentials?.clientId ?? "",
+			clientSecret: credentials?.clientSecret,
+		};
 	}
 
 	/**
@@ -105,17 +127,8 @@ export class OAuthService {
 	 * Uses standard loopback redirect flow with user-provided credentials.
 	 */
 	async authenticate(provider: OAuthProvider): Promise<void> {
-		const config = this.configs[provider];
-
+		const config = this.getConfig(provider);
 		if (!config.clientId) {
-			throw new OAuthNotConfiguredError(provider);
-		}
-
-		const hasCredentials =
-			(provider === "google" && this.plugin.settings.googleOAuthClientId) ||
-			(provider === "microsoft" && this.plugin.settings.microsoftOAuthClientId);
-
-		if (!hasCredentials) {
 			throw new OAuthNotConfiguredError(provider);
 		}
 
@@ -126,12 +139,22 @@ export class OAuthService {
 	 * Standard OAuth flow with loopback redirect (client_id required, client_secret optional)
 	 * Used for desktop applications with PKCE for security
 	 */
+	private authenticationInProgress = false;
+
 	private async authenticateStandard(provider: OAuthProvider): Promise<void> {
+		// A second attempt must not close the first attempt's listener in finally.
+		if (this.authenticationInProgress) {
+			throw new Error("An OAuth authorization is already in progress");
+		}
+		this.authenticationInProgress = true;
 		try {
-			const config = this.configs[provider];
+			const config = this.getConfig(provider);
 
 			if (!Platform.isDesktopApp) {
-				new Notice("OAuth authentication requires the desktop app.");
+				publishUserNotice(
+					this.plugin.emitter,
+					"OAUTH authentication requires the desktop app."
+				);
 				throw new Error("OAuth authentication requires the desktop app.");
 			}
 
@@ -143,12 +166,7 @@ export class OAuthService {
 			const codeChallenge = await this.generateCodeChallenge(codeVerifier);
 			const state = this.generateState();
 
-			// Find available port
-			const port = await this.findAvailablePort(
-				OAUTH_CONSTANTS.CALLBACK_PORT_START,
-				OAUTH_CONSTANTS.CALLBACK_PORT_END
-			);
-			await this.startCallbackServer(port);
+			const port = await this.startCallbackServer(0);
 
 			// Update redirect URI for this session
 			const originalRedirectUri = config.redirectUri;
@@ -163,16 +181,24 @@ export class OAuthService {
 					provider,
 					codeVerifier,
 					resolve: () => {}, // Will be set by promise
-					reject: () => {}
+					reject: () => {},
 				});
 
-				new Notice(`Opening browser for ${provider} authorization...`);
+				publishUserNotice(
+					this.plugin.emitter,
+					`Opening browser for ${provider} authorization...`
+				);
 
-				// Open browser to authorization URL
-				window.open(authUrl, "_blank");
-
-				// Wait for callback with timeout
-				const code = await this.waitForCallback(state, 300000); // 5 minute timeout
+				// Register the resolver before the browser can return a fast callback.
+				const callback = this.waitForCallback(state, 300000);
+				// Electron can open the browser without ever settling openExternal.
+				// Let the callback/timeout drive the flow independently (#2279).
+				void this.openAuthorizationUrl(authUrl).catch((error: unknown) => {
+					this.pendingOAuthState.get(state)?.reject(
+						error instanceof Error ? error : new Error("Could not open OAuth browser")
+					);
+				});
+				const code = await callback;
 
 				// Exchange code for tokens
 				const tokens = await this.exchangeCodeForTokens(config, code, codeVerifier);
@@ -180,82 +206,102 @@ export class OAuthService {
 				// Store connection
 				await this.storeConnection(provider, tokens);
 
-				new Notice(`Successfully connected to ${provider} Calendar!`);
+				publishUserNotice(
+					this.plugin.emitter,
+					`Successfully connected to ${provider} Calendar!`
+				);
 			} finally {
+				// Clear a pending resolver even if opening the browser failed.
+				const pending = this.pendingOAuthState.get(state);
+				this.pendingOAuthState.delete(state);
+				pending?.reject(new Error("OAuth flow ended before authorization"));
 				// Restore original redirect URI
 				config.redirectUri = originalRedirectUri;
 			}
-
 		} catch (error) {
-			console.error(`OAuth authentication failed for ${provider}:`, error);
-			new Notice(`Failed to connect to ${provider}: ${error.message}`);
+			tasknotesLogger.error(`OAuth authentication failed for ${provider}:`, {
+				category: "provider",
+				operation: "oauth-authentication",
+				error: error,
+			});
+			publishUserNotice(
+				this.plugin.emitter,
+				`Failed to connect to ${provider}: ${error.message}`
+			);
 			throw error;
 		} finally {
-			await this.stopCallbackServer();
+			try {
+				await this.stopCallbackServer();
+			} finally {
+				this.authenticationInProgress = false;
+			}
 		}
 	}
 
-	/**
-	 * Finds an available port in the given range
-	 */
-	private async findAvailablePort(startPort: number, endPort: number): Promise<number> {
-		const http = ensureHttpModule();
-
-		for (let port = startPort; port <= endPort; port++) {
-			try {
-				await new Promise<void>((resolve, reject) => {
-					const server = http.createServer();
-					server.once("error", reject);
-					server.once("listening", () => {
-						server.close();
-						resolve();
-					});
-					server.listen(port, "127.0.0.1");
-				});
-				return port;
-			} catch (error) {
-				// Port in use, try next one
-				continue;
+	private async openAuthorizationUrl(authUrl: string): Promise<void> {
+		try {
+			// eslint-disable-next-line @typescript-eslint/no-require-imports -- OAuth must bypass Obsidian's in-app Web Viewer and use the system browser on desktop.
+			const electron = require("electron") as ElectronModuleLike;
+			const shell = electron.shell;
+			if (shell?.openExternal) {
+				await shell.openExternal(authUrl);
+				return;
 			}
+		} catch (error) {
+			tasknotesLogger.warn(
+				"Failed to open OAuth URL in system browser; falling back to window.open.",
+				{
+					category: "provider",
+					operation: "oauth-open-external",
+					error,
+				}
+			);
 		}
 
-		throw new Error(`No available ports found between ${startPort} and ${endPort}`);
+		window.open(authUrl, "_blank");
 	}
 
 	/**
 	 * Generates a random code verifier for PKCE
 	 */
 	private generateCodeVerifier(): string {
-		return randomBytes(32)
-			.toString("base64url")
-			.replace(/=/g, "")
-			.replace(/\+/g, "-")
-			.replace(/\//g, "_");
+		return this.base64UrlEncode(crypto.getRandomValues(new Uint8Array(32)));
 	}
 
 	/**
 	 * Generates code challenge from verifier (SHA256)
 	 */
 	private async generateCodeChallenge(verifier: string): Promise<string> {
-		const hash = createHash("sha256").update(verifier).digest();
-		return Buffer.from(hash)
-			.toString("base64url")
-			.replace(/=/g, "")
-			.replace(/\+/g, "-")
-			.replace(/\//g, "_");
+		const data = new TextEncoder().encode(verifier);
+		const hash = await crypto.subtle.digest("SHA-256", data);
+		return this.base64UrlEncode(new Uint8Array(hash));
 	}
 
 	/**
 	 * Generates a random state parameter for CSRF protection
 	 */
 	private generateState(): string {
-		return randomBytes(16).toString("hex");
+		return Array.from(crypto.getRandomValues(new Uint8Array(16)))
+			.map((byte) => byte.toString(16).padStart(2, "0"))
+			.join("");
+	}
+
+	private base64UrlEncode(bytes: Uint8Array): string {
+		let binary = "";
+		bytes.forEach((byte) => {
+			binary += String.fromCharCode(byte);
+		});
+		return btoa(binary).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
 	}
 
 	/**
 	 * Builds the authorization URL with all required parameters
 	 */
-	private buildAuthorizationUrl(config: OAuthConfig, codeChallenge: string, state: string): string {
+	private buildAuthorizationUrl(
+		config: OAuthConfig,
+		codeChallenge: string,
+		state: string
+	): string {
 		const params = new URLSearchParams({
 			client_id: config.clientId,
 			redirect_uri: config.redirectUri,
@@ -264,9 +310,12 @@ export class OAuthService {
 			state: state,
 			code_challenge: codeChallenge,
 			code_challenge_method: "S256",
-			access_type: "offline", // Request refresh token
-			prompt: "consent" // Force consent screen to get refresh token
 		});
+
+		if (config.provider === "google") {
+			params.set("access_type", "offline"); // Request refresh token
+			params.set("prompt", "consent"); // Force consent screen to get refresh token
+		}
 
 		return `${config.authorizationEndpoint}?${params.toString()}`;
 	}
@@ -274,10 +323,10 @@ export class OAuthService {
 	/**
 	 * Starts a temporary HTTP server to receive the OAuth callback
 	 */
-	private async startCallbackServer(port: number): Promise<void> {
+	private async startCallbackServer(port: number): Promise<number> {
 		return new Promise((resolve, reject) => {
 			if (this.callbackServer) {
-				resolve(); // Already running
+				reject(new Error("An OAuth callback is already pending"));
 				return;
 			}
 
@@ -285,23 +334,34 @@ export class OAuthService {
 			try {
 				httpModule = ensureHttpModule();
 			} catch (error) {
-				reject(error);
+				reject(error instanceof Error ? error : new Error(String(error)));
 				return;
 			}
 
-			this.callbackServer = httpModule.createServer((req: IncomingMessage, res: ServerResponse) => {
-				this.handleCallback(req, res);
-			});
+			this.callbackServer = httpModule.createServer(
+				(req: HTTPRequestLike, res: HTTPResponseLike) => {
+					this.handleCallback(req, res);
+				}
+			);
 
 			// Use .once() instead of .on() since we only need to handle the first error
 			// This prevents memory leaks from accumulating error listeners
 			this.callbackServer.once("error", (error: Error) => {
-				console.error("OAuth callback server error:", error);
+				tasknotesLogger.error("OAuth callback server error:", {
+					category: "provider",
+					operation: "oauth-callback-server",
+					error: error,
+				});
 				reject(error);
 			});
 
 			this.callbackServer.listen(port, "127.0.0.1", () => {
-				resolve();
+				const address = this.callbackServer?.address?.();
+				if (!address || typeof address === "string") {
+					reject(new Error("OAuth listener did not expose its bound port"));
+					return;
+				}
+				resolve(address.port);
 			});
 		});
 	}
@@ -316,79 +376,64 @@ export class OAuthService {
 				return;
 			}
 
-			this.callbackServer.close(() => {
-				this.callbackServer = null;
-				resolve();
-			});
+			const server = this.callbackServer;
+			this.callbackServer = null;
+			server.close(() => resolve());
 		});
 	}
 
 	/**
 	 * Handles incoming HTTP requests to the callback server
 	 */
-	private handleCallback(req: IncomingMessage, res: ServerResponse): void {
-		const url = new URL(req.url || "", `http://${req.headers.host}`);
-		const code = url.searchParams.get("code");
+	private handleCallback(req: HTTPRequestLike, res: HTTPResponseLike): void {
+		const headers = {
+			"Content-Type": "text/html; charset=utf-8",
+			"Content-Security-Policy":
+				"default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
+			"X-Content-Type-Options": "nosniff",
+			"Cache-Control": "no-store",
+		};
+		let url: URL;
+		try {
+			url = new URL(req.url || "/", "http://127.0.0.1");
+		} catch {
+			res.writeHead(400, headers);
+			res.end(oauthCallbackHtml(this.plugin.i18n.translate(msg({ message: "Invalid callback", context: "OAuth callback title" })), "", this.plugin.i18n.getCurrentLocale()));
+			return;
+		}
 		const state = url.searchParams.get("state");
+		const pending = state ? this.pendingOAuthState.get(state) : undefined;
+		const code = url.searchParams.get("code");
 		const error = url.searchParams.get("error");
-
-		// Send response to browser
-		res.writeHead(200, { "Content-Type": "text/html" });
-
-		if (error) {
-			res.end(`
-				<!DOCTYPE html>
-				<html>
-					<head><title>OAuth Error</title></head>
-					<body>
-						<h1>Authorization Failed</h1>
-						<p>Error: ${error}</p>
-						<p>You can close this window.</p>
-					</body>
-				</html>
-			`);
-
-			const pending = state ? this.pendingOAuthState.get(state) : null;
-			if (pending && state) {
-				pending.reject(new Error(`OAuth error: ${error}`));
-				this.pendingOAuthState.delete(state);
-			}
+		if (
+			req.method !== "GET" ||
+			url.pathname !== "/" ||
+			!state ||
+			!pending ||
+			(!code && !error)
+		) {
+			res.writeHead(400, headers);
+			res.end(oauthCallbackHtml(
+				this.plugin.i18n.translate(msg({ message: "Invalid callback", context: "OAuth callback title" })),
+				this.plugin.i18n.translate(msg({ message: "No pending authorization matches this callback.", context: "OAuth callback description" })),
+				this.plugin.i18n.getCurrentLocale()
+			));
 			return;
 		}
-
-		if (!code || !state) {
-			res.end(`
-				<!DOCTYPE html>
-				<html>
-					<head><title>OAuth Error</title></head>
-					<body>
-						<h1>Invalid Callback</h1>
-						<p>Missing required parameters.</p>
-						<p>You can close this window.</p>
-					</body>
-				</html>
-			`);
-			return;
-		}
-
-		res.end(`
-			<!DOCTYPE html>
-			<html>
-				<head><title>OAuth Success</title></head>
-				<body>
-					<h1>Authorization Successful!</h1>
-					<p>You can close this window and return to Obsidian.</p>
-					<script>window.close();</script>
-				</body>
-			</html>
-		`);
-
-		// Resolve the pending promise
-		const pending = this.pendingOAuthState.get(state);
-		if (pending) {
-			pending.resolve(code);
-			this.pendingOAuthState.delete(state);
-		}
+		// Consume before responding: a replay cannot resolve the pending flow.
+		this.pendingOAuthState.delete(state);
+		res.writeHead(error ? 400 : 200, headers);
+		res.end(oauthCallbackHtml(
+			this.plugin.i18n.translate(error
+				? msg({ message: "Authorization failed", context: "OAuth callback title" })
+				: msg({ message: "Authorization complete", context: "OAuth callback title" })),
+			this.plugin.i18n.translate(error
+				? msg({ message: "Authorization was not completed. Return to Obsidian.", context: "OAuth callback description" })
+				: msg({ message: "You can close this window and return to Obsidian.", context: "OAuth callback description" })),
+			this.plugin.i18n.getCurrentLocale()
+		));
+		if (error) pending.reject(new Error("OAuth authorization failed"));
+		else pending.resolve(code as string);
 	}
 
 	/**
@@ -402,12 +447,17 @@ export class OAuthService {
 				return;
 			}
 
-			// Update the pending state with resolve/reject functions
-			pending.resolve = resolve;
-			pending.reject = reject;
+			// Release the timer on success, provider rejection, or browser failure.
+			pending.resolve = (code) => {
+				window.clearTimeout(timer);
+				resolve(code);
+			};
+			pending.reject = (error) => {
+				window.clearTimeout(timer);
+				reject(error);
+			};
 
-			// Set timeout
-			setTimeout(() => {
+			const timer = window.setTimeout(() => {
 				if (this.pendingOAuthState.has(state)) {
 					this.pendingOAuthState.delete(state);
 					reject(new Error("OAuth timeout - authorization took too long"));
@@ -429,7 +479,7 @@ export class OAuthService {
 			code: code,
 			code_verifier: codeVerifier,
 			redirect_uri: config.redirectUri,
-			grant_type: "authorization_code"
+			grant_type: "authorization_code",
 		};
 
 		// Only include client_secret if it exists (optional for public clients)
@@ -445,19 +495,37 @@ export class OAuthService {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/x-www-form-urlencoded",
-					"Accept": "application/json"
+					Accept: "application/json",
 				},
 				body: urlParams.toString(),
-				throw: false  // Don't throw on error status, let us handle it
+				throw: false, // Don't throw on error status, let us handle it
 			});
 
 			// Check if request failed
 			if (response.status !== 200) {
-				console.error("Token exchange failed with status:", response.status);
-				console.error("Response headers:", response.headers);
-				console.error("Response body:", response.text);
-				console.error("Response JSON:", response.json);
-				throw new Error(`Token exchange failed with status ${response.status}: ${response.text || JSON.stringify(response.json)}`);
+				tasknotesLogger.error("Token exchange failed with status:", {
+					category: "provider",
+					operation: "token-exchange-status",
+					details: { value: response.status },
+				});
+				tasknotesLogger.error("Response headers:", {
+					category: "provider",
+					operation: "response-headers",
+					details: { value: response.headers },
+				});
+				tasknotesLogger.error("Response body:", {
+					category: "provider",
+					operation: "response-body",
+					details: { value: response.text },
+				});
+				tasknotesLogger.error("Response JSON:", {
+					category: "provider",
+					operation: "response-json",
+					details: { value: response.json },
+				});
+				throw new Error(
+					`Token exchange failed with status ${response.status}: ${response.text || JSON.stringify(response.json)}`
+				);
 			}
 
 			const data = response.json;
@@ -467,17 +535,21 @@ export class OAuthService {
 			}
 
 			const expiresIn = data.expires_in || 3600; // Default to 1 hour
-			const expiresAt = Date.now() + (expiresIn * 1000);
+			const expiresAt = Date.now() + expiresIn * 1000;
 
 			return {
 				accessToken: data.access_token,
 				refreshToken: data.refresh_token,
 				expiresAt: expiresAt,
 				scope: data.scope || config.scope.join(" "),
-				tokenType: data.token_type || "Bearer"
+				tokenType: data.token_type || "Bearer",
 			};
 		} catch (error) {
-			console.error("Token exchange error:", error);
+			tasknotesLogger.error("Token exchange error:", {
+				category: "provider",
+				operation: "token-exchange",
+				error: error,
+			});
 			throw new Error(`Failed to exchange code for tokens: ${error.message}`);
 		}
 	}
@@ -499,11 +571,12 @@ export class OAuthService {
 			throw new Error(`No refresh token available for ${provider}`);
 		}
 
-		const config = this.configs[provider];
+		const connectionGeneration = this.connectionGenerations.get(provider) ?? 0;
+		const config = this.getConfig(provider);
 		const params: Record<string, string> = {
 			client_id: config.clientId,
 			refresh_token: connection.tokens.refreshToken,
-			grant_type: "refresh_token"
+			grant_type: "refresh_token",
 		};
 
 		// Only include client_secret if it exists (optional for public clients)
@@ -519,10 +592,10 @@ export class OAuthService {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/x-www-form-urlencoded",
-					"Accept": "application/json"
+					Accept: "application/json",
 				},
 				body: urlParams.toString(),
-				throw: false // Don't throw on error status so we can inspect the response
+				throw: false, // Don't throw on error status so we can inspect the response
 			});
 
 			// Check for error responses (400, 401, etc.)
@@ -539,10 +612,11 @@ export class OAuthService {
 					// Response body might not be JSON
 				}
 
-				console.error("[OAuth] Token refresh failed:", {
-					status: response.status,
+				tasknotesLogger.error("[OAuth] Token refresh failed:", {
+					category: "provider",
+					operation: "token-refresh",
+					details: { status: response.status, description: oauthErrorDescription },
 					error: oauthError,
-					description: oauthErrorDescription
 				});
 
 				// Check if this is an irrecoverable token error
@@ -551,23 +625,30 @@ export class OAuthService {
 				// HTTP 401: unauthorized (token invalid)
 				const isIrrecoverableError =
 					response.status === 401 ||
-					(response.status === 400 && (
-						oauthError === "invalid_grant" ||
-						oauthError === "invalid_client"
-					));
+					(response.status === 400 &&
+						(oauthError === "invalid_grant" || oauthError === "invalid_client"));
 
 				if (isIrrecoverableError) {
-					// Auto-disconnect to prevent repeated failures
-					// This clears local tokens but doesn't revoke on provider (token is already invalid)
-					await this.clearConnection(provider);
+					// Clear only if this response still belongs to the active connection.
+					// The user may have reconnected while the request was in flight.
+					if (!this.clearConnection(provider, connectionGeneration)) {
+						throw new Error(
+							`${provider} OAuth connection changed during token refresh`
+						);
+					}
 
-					new Notice(`${provider} connection expired. Please reconnect in Settings > Integrations.`);
+					publishUserNotice(
+						this.plugin.emitter,
+						`${provider} connection expired. Please reconnect in Settings > Integrations.`
+					);
 					throw new TokenRefreshError(provider, oauthError, oauthErrorDescription);
 				}
 
 				// For other errors (5xx server errors, network issues), throw generic error
 				// These may be transient and worth retrying
-				throw new Error(`Token refresh failed with status ${response.status}: ${oauthError || response.text || "Unknown error"}`);
+				throw new Error(
+					`Token refresh failed with status ${response.status}: ${oauthError || response.text || "Unknown error"}`
+				);
 			}
 
 			const data = response.json;
@@ -577,18 +658,23 @@ export class OAuthService {
 			}
 
 			const expiresIn = data.expires_in || 3600;
-			const expiresAt = Date.now() + (expiresIn * 1000);
+			const expiresAt = Date.now() + expiresIn * 1000;
 
 			const newTokens: OAuthTokens = {
 				accessToken: data.access_token,
 				refreshToken: data.refresh_token || connection.tokens.refreshToken, // Keep old refresh token if not provided
 				expiresAt: expiresAt,
 				scope: data.scope || connection.tokens.scope,
-				tokenType: data.token_type || "Bearer"
+				tokenType: data.token_type || "Bearer",
 			};
 
-			// Update stored connection
-			await this.storeConnection(provider, newTokens, connection.userEmail);
+			// Update stored connection unless it was disconnected while refresh was in flight.
+			await this.storeConnection(
+				provider,
+				newTokens,
+				connection.userEmail,
+				connectionGeneration
+			);
 
 			return newTokens;
 		} catch (error) {
@@ -597,7 +683,11 @@ export class OAuthService {
 				throw error;
 			}
 
-			console.error("Token refresh failed:", error);
+			tasknotesLogger.error("Token refresh failed:", {
+				category: "provider",
+				operation: "token-refresh",
+				error: error,
+			});
 			throw new Error(`Failed to refresh ${provider} token: ${error.message}`);
 		}
 	}
@@ -606,12 +696,15 @@ export class OAuthService {
 	 * Clears a stored OAuth connection without revoking tokens on the provider.
 	 * Used when tokens are already invalid (e.g., after refresh failure with invalid_grant).
 	 */
-	private async clearConnection(provider: OAuthProvider): Promise<void> {
-		const data = await this.plugin.loadData() || {};
-		if (data.oauthConnections) {
-			delete data.oauthConnections[provider];
-			await this.plugin.saveData(data);
+	private clearConnection(provider: OAuthProvider, expectedGeneration?: number): boolean {
+		const currentGeneration = this.connectionGenerations.get(provider) ?? 0;
+		if (expectedGeneration !== undefined && expectedGeneration !== currentGeneration) {
+			return false;
 		}
+
+		this.secretStore.clearConnection(provider);
+		this.connectionGenerations.set(provider, currentGeneration + 1);
+		return true;
 	}
 
 	/**
@@ -619,8 +712,13 @@ export class OAuthService {
 	 * Uses mutex pattern to prevent race conditions when multiple API calls
 	 * happen simultaneously with an expired token.
 	 */
-	async getValidToken(provider: OAuthProvider): Promise<string> {
+	async getValidToken(
+		provider: OAuthProvider,
+		expectedGeneration?: number
+	): Promise<string> {
+		this.assertExpectedConnectionGeneration(provider, expectedGeneration);
 		const connection = await this.getConnection(provider);
+		this.assertExpectedConnectionGeneration(provider, expectedGeneration);
 		if (!connection) {
 			throw new TokenExpiredError(provider);
 		}
@@ -634,56 +732,74 @@ export class OAuthService {
 			const pendingRefresh = this.tokenRefreshPromises.get(provider);
 			if (pendingRefresh) {
 				const newTokens = await pendingRefresh;
+				this.assertExpectedConnectionGeneration(provider, expectedGeneration);
 				return newTokens.accessToken;
 			}
 
 			// Start new refresh and store the promise
-			const refreshPromise = this.refreshToken(provider)
-				.finally(() => {
-					// Clean up the pending promise when done (success or failure)
-					this.tokenRefreshPromises.delete(provider);
-				});
+			const refreshPromise = this.refreshToken(provider).finally(() => {
+				// Clean up the pending promise when done (success or failure)
+				this.tokenRefreshPromises.delete(provider);
+			});
 
 			this.tokenRefreshPromises.set(provider, refreshPromise);
 
 			const newTokens = await refreshPromise;
+			this.assertExpectedConnectionGeneration(provider, expectedGeneration);
 			return newTokens.accessToken;
 		}
 
+		this.assertExpectedConnectionGeneration(provider, expectedGeneration);
 		return connection.tokens.accessToken;
 	}
 
+	private assertExpectedConnectionGeneration(
+		provider: OAuthProvider,
+		expectedGeneration: number | undefined
+	): void {
+		if (
+			expectedGeneration !== undefined &&
+			this.getConnectionGeneration(provider) !== expectedGeneration
+		) {
+			throw new Error(`${provider} OAuth connection changed during calendar operation`);
+		}
+	}
+
 	/**
-	 * Stores OAuth connection (encrypted)
+	 * Stores an OAuth connection in Obsidian SecretStorage.
 	 */
 	private async storeConnection(
 		provider: OAuthProvider,
 		tokens: OAuthTokens,
-		userEmail?: string
+		userEmail?: string,
+		expectedGeneration?: number
 	): Promise<void> {
+		if (
+			expectedGeneration !== undefined &&
+			expectedGeneration !== (this.connectionGenerations.get(provider) ?? 0)
+		) {
+			throw new Error(`${provider} OAuth connection changed during token refresh`);
+		}
+
 		const connection: OAuthConnection = {
 			provider,
 			tokens,
 			userEmail,
 			connectedAt: new Date().toISOString(),
-			lastRefreshed: new Date().toISOString()
+			lastRefreshed: new Date().toISOString(),
 		};
-
-		// Store in plugin data (Obsidian handles encryption)
-		const data = await this.plugin.loadData() || {};
-		if (!data.oauthConnections) {
-			data.oauthConnections = {};
+		this.secretStore.setConnection(provider, connection);
+		if (expectedGeneration === undefined) {
+			const currentGeneration = this.connectionGenerations.get(provider) ?? 0;
+			this.connectionGenerations.set(provider, currentGeneration + 1);
 		}
-		data.oauthConnections[provider] = connection;
-		await this.plugin.saveData(data);
 	}
 
 	/**
-	 * Retrieves stored OAuth connection
+	 * Retrieves a connection from Obsidian SecretStorage.
 	 */
 	async getConnection(provider: OAuthProvider): Promise<OAuthConnection | null> {
-		const data = await this.plugin.loadData();
-		return data?.oauthConnections?.[provider] || null;
+		return this.secretStore.getConnection(provider);
 	}
 
 	/**
@@ -694,31 +810,45 @@ export class OAuthService {
 		return connection !== null;
 	}
 
+	getConnectionGeneration(provider: OAuthProvider): number {
+		return this.connectionGenerations.get(provider) ?? 0;
+	}
+
+	async isConnectionGenerationCurrent(
+		provider: OAuthProvider,
+		expectedGeneration: number
+	): Promise<boolean> {
+		return (
+			this.getConnectionGeneration(provider) === expectedGeneration &&
+			(await this.isConnected(provider))
+		);
+	}
+
 	/**
 	 * Disconnects from a provider (revokes tokens and removes stored data)
 	 */
 	async disconnect(provider: OAuthProvider): Promise<void> {
+		const connectionGeneration = this.getConnectionGeneration(provider);
 		const connection = await this.getConnection(provider);
 		if (!connection) {
 			return;
 		}
 
-		// Revoke tokens on the OAuth provider's server
+		// Clear local tokens first so an interrupted or concurrent refresh cannot reconnect.
+		// If the connection changed while it was being read, leave the newer connection alone.
+		if (!this.clearConnection(provider, connectionGeneration)) {
+			return;
+		}
+
+		// Revoke tokens on the OAuth provider's server.
 		await this.revokeToken(provider, connection.tokens.accessToken);
 
-		// Also revoke refresh token if present (best practice)
+		// Also revoke refresh token if present (best practice).
 		if (connection.tokens.refreshToken) {
 			await this.revokeToken(provider, connection.tokens.refreshToken);
 		}
 
-		// Remove from local storage
-		const data = await this.plugin.loadData() || {};
-		if (data.oauthConnections) {
-			delete data.oauthConnections[provider];
-			await this.plugin.saveData(data);
-		}
-
-		new Notice(`Disconnected from ${provider} Calendar`);
+		publishUserNotice(this.plugin.emitter, `Disconnected from ${provider} Calendar`);
 	}
 
 	/**
@@ -726,31 +856,38 @@ export class OAuthService {
 	 * Note: Revocation failures are logged but don't prevent local disconnection
 	 */
 	private async revokeToken(provider: OAuthProvider, token: string): Promise<void> {
-		const config = this.configs[provider];
+		const config = this.getConfig(provider);
 
 		if (!config.revocationEndpoint) {
-			console.warn(`No revocation endpoint configured for ${provider}`);
+			tasknotesLogger.warn(`No revocation endpoint configured for ${provider}`, {
+				category: "provider",
+				operation: "no-revocation-endpoint-configured",
+			});
 			return;
 		}
 
 		try {
-			const response = await requestUrl({
+			await requestUrl({
 				url: config.revocationEndpoint,
 				method: "POST",
 				headers: {
-					"Content-Type": "application/x-www-form-urlencoded"
+					"Content-Type": "application/x-www-form-urlencoded",
 				},
 				body: new URLSearchParams({
 					token: token,
-					...(config.clientId && { client_id: config.clientId })
+					...(config.clientId && { client_id: config.clientId }),
 				}).toString(),
-				throw: false
+				throw: false,
 			});
 
 			// Token revocation completed (status 200 or token already invalid)
 		} catch (error) {
 			// Don't throw - revocation failure shouldn't prevent disconnection
-			console.error(`[OAuth] Failed to revoke token for ${provider}:`, error);
+			tasknotesLogger.error(`[OAuth] Failed to revoke token for ${provider}:`, {
+				category: "provider",
+				operation: "revoke-token",
+				error: error,
+			});
 		}
 	}
 
@@ -759,13 +896,16 @@ export class OAuthService {
 	 * Ensures all resources are properly released to prevent memory leaks
 	 */
 	async destroy(): Promise<void> {
-		// Stop HTTP callback server
+		// Reject pending flows as well as clearing state, so callbacks and their
+		// timeout handles cannot remain orphaned when the plugin unloads.
+		for (const pending of this.pendingOAuthState.values()) {
+			pending.reject(new Error("OAuth authorization cancelled"));
+		}
+		this.pendingOAuthState.clear();
 		await this.stopCallbackServer();
 
-		// Clear pending OAuth state
-		this.pendingOAuthState.clear();
-
-		// Clear token refresh mutex to prevent orphaned promises
+		// Clear token refresh state to prevent orphaned promises.
 		this.tokenRefreshPromises.clear();
+		this.connectionGenerations.clear();
 	}
 }

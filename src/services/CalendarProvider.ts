@@ -7,6 +7,9 @@
 
 import { ICSEvent } from "../types";
 import { EventEmitter } from "../utils/EventEmitter";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Services/CalendarProvider" });
 
 /**
  * Represents a calendar from any provider
@@ -17,6 +20,31 @@ export interface ProviderCalendar {
 	description?: string;
 	backgroundColor?: string;
 	primary?: boolean;
+	/** False when the account can only read this calendar (e.g. shared or holiday calendars). */
+	canEdit?: boolean;
+}
+
+/**
+ * Google accepts `primary` as an alias for the signed-in account's own calendar.
+ * A calendar configured that way is fetched under the alias, so its events carry
+ * `primary` as their calendar id while the provider's calendar list reports the
+ * account's real calendar id.
+ */
+export const PRIMARY_CALENDAR_ALIAS = "primary";
+
+/**
+ * Finds a provider calendar by id, resolving the primary alias to the account's
+ * own calendar so alias-configured events still match their calendar metadata.
+ */
+export function findProviderCalendar<T extends Pick<ProviderCalendar, "id" | "primary">>(
+	calendars: readonly T[],
+	calendarId: string
+): T | undefined {
+	return calendars.find(
+		(candidate) =>
+			candidate.id === calendarId ||
+			(calendarId === PRIMARY_CALENDAR_ALIAS && candidate.primary === true)
+	);
 }
 
 /**
@@ -103,10 +131,7 @@ export abstract class CalendarProvider extends EventEmitter {
 	 * @param event The event data
 	 * @returns The created event in ICSEvent format
 	 */
-	abstract createEvent(
-		calendarId: string,
-		event: CalendarEventData
-	): Promise<ICSEvent>;
+	abstract createEvent(calendarId: string, event: CalendarEventData): Promise<ICSEvent>;
 
 	/**
 	 * Deletes a calendar event
@@ -154,6 +179,16 @@ export abstract class CalendarProvider extends EventEmitter {
 		const calendarId = icsEvent.subscriptionId.replace(`${this.providerId}-`, "");
 		const eventId = icsEvent.id.replace(`${this.providerId}-${calendarId}-`, "");
 		return { calendarId, eventId };
+	}
+
+	/**
+	 * Whether the user may delete this event from TaskNotes: the provider owns it and
+	 * its calendar is not known to be read-only.
+	 */
+	canDeleteEvent(icsEvent: ICSEvent): boolean {
+		if (!this.ownsEvent(icsEvent)) return false;
+		const { calendarId } = this.extractEventIds(icsEvent);
+		return findProviderCalendar(this.getAvailableCalendars(), calendarId)?.canEdit !== false;
 	}
 }
 
@@ -225,9 +260,13 @@ export class CalendarProviderRegistry {
 	 * Refreshes all registered providers
 	 */
 	async refreshAll(): Promise<void> {
-		const refreshPromises = Array.from(this.providers.values()).map(provider =>
-			provider.refresh().catch(error => {
-				console.error(`Failed to refresh ${provider.providerName}:`, error);
+		const refreshPromises = Array.from(this.providers.values()).map((provider) =>
+			provider.refresh().catch((error) => {
+				tasknotesLogger.error(`Failed to refresh ${provider.providerName}:`, {
+					category: "provider",
+					operation: "refresh",
+					error: error,
+				});
 			})
 		);
 		await Promise.all(refreshPromises);

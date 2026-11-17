@@ -1,19 +1,89 @@
-import { TFile } from "obsidian";
+import { TFile, getFrontMatterInfo, parseYaml, stringifyYaml, type Vault } from "obsidian";
 import { AutoArchiveService } from "../AutoArchiveService";
-import type TaskNotesPlugin from "../../main";
-import { EVENT_TASK_UPDATED, IWebhookNotifier, TaskInfo } from "../../types";
+import { EVENT_TASK_UPDATED, IWebhookNotifier, StatusConfig, TaskInfo } from "../../types";
+import type { TaskNotesSettings } from "../../types/settings";
 import {
-	addDTSTARTToRecurrenceRule,
-	updateToNextScheduledOccurrence,
-} from "../../core/recurrence";
-import {
-	splitFrontmatterAndBody,
-} from "../../utils/helpers";
-import { generateUniqueFilename } from "../../utils/filenameGenerator";
+	generateUniqueFilename,
+	isTitleRepresentedByFilename,
+	sanitizeForFilename,
+} from "../../utils/filenameGenerator";
 import { getCurrentDateString, getCurrentTimestamp } from "../../utils/dateUtils";
+import {
+	applyTaskUpdateFrontmatterChange,
+	buildTaskUpdateRecurrenceUpdates,
+	buildUpdatedTaskFromPlan,
+	normalizeTaskUpdateDetails,
+	normalizeTaskUpdateInput,
+	type TaskUpdateFieldMapper,
+} from "./taskUpdatePlanning";
+import { createTaskNotesLogger } from "../../utils/tasknotesLogger";
+import { processVaultFile, processVaultFrontMatter } from "../VaultMutationService";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Services/TaskService/TaskUpdateService" });
+
+interface TaskUpdateFileManager {
+	processFrontMatter(
+		file: TFile,
+		fn: (frontmatter: Record<string, unknown>) => void
+	): Promise<void>;
+	renameFile(file: TFile, newPath: string): Promise<void>;
+}
+
+interface TaskUpdateStatusManager {
+	isCompletedStatus(status: string): boolean;
+	getStatusConfig(status: string): StatusConfig | undefined;
+}
+
+interface TaskUpdateCacheManager {
+	waitForFreshTaskData?: (file: TFile) => Promise<void>;
+	updateTaskInfoInCache(path: string, task: TaskInfo): void;
+	clearCacheEntry(path: string): void;
+}
+
+interface TaskUpdateEmitter {
+	trigger(event: typeof EVENT_TASK_UPDATED, payload: unknown): void;
+}
+
+interface TaskUpdateCalendarSyncService {
+	isEnabled(): boolean;
+	completeTaskInCalendar(task: TaskInfo): Promise<void>;
+	updateTaskInCalendar(updatedTask: TaskInfo, originalTask: TaskInfo): Promise<void>;
+}
+
+interface TaskUpdateRenameIndexes {
+	expandedProjectsService: {
+		renamePath(oldPath: string, newPath: string): void;
+	};
+	projectSubtasksService: {
+		invalidateIndex(): void;
+	};
+}
+
+type TaskUpdateSettings = Pick<
+	TaskNotesSettings,
+	| "storeTitleInFilename"
+	| "maintainDueDateOffsetInRecurring"
+	| "taskIdentificationMethod"
+	| "taskTag"
+	| "taskPropertyName"
+	| "taskPropertyValue"
+>;
+
+export interface TaskUpdateRuntime extends TaskUpdateRenameIndexes {
+	app: {
+		vault: Vault;
+		fileManager: TaskUpdateFileManager;
+	};
+	settings: TaskUpdateSettings;
+	fieldMapper: TaskUpdateFieldMapper;
+	statusManager: TaskUpdateStatusManager;
+	cacheManager: TaskUpdateCacheManager;
+	emitter: TaskUpdateEmitter;
+	taskCalendarSyncService?: TaskUpdateCalendarSyncService;
+}
 
 export interface TaskUpdateServiceDependencies {
-	plugin: TaskNotesPlugin;
+	runtime: TaskUpdateRuntime;
 	webhookNotifier?: IWebhookNotifier;
 	autoArchiveService?: AutoArchiveService;
 	updateCompletedDateInFrontmatter(
@@ -38,192 +108,184 @@ export class TaskUpdateService {
 		originalTask: TaskInfo,
 		updates: Partial<TaskInfo> & { details?: string }
 	): Promise<TaskInfo> {
-		const { plugin } = this.deps;
+		const { runtime } = this.deps;
 
 		try {
-			const file = plugin.app.vault.getAbstractFileByPath(originalTask.path);
+			const taskUpdates = normalizeTaskUpdateInput(updates);
+			const file = runtime.app.vault.getAbstractFileByPath(originalTask.path);
 			if (!(file instanceof TFile)) {
 				throw new Error(`Cannot find task file: ${originalTask.path}`);
 			}
 
-			if (Array.isArray(updates.timeEntries)) {
-				updates.timeEntries = updates.timeEntries.map((entry) => {
-					const sanitizedEntry = { ...entry };
-					delete sanitizedEntry.duration;
-					return sanitizedEntry;
-				});
-			}
-
 			const isRenameNeeded =
-				plugin.settings.storeTitleInFilename &&
-				updates.title &&
-				updates.title !== originalTask.title;
+				runtime.settings.storeTitleInFilename &&
+				taskUpdates.title &&
+				taskUpdates.title !== originalTask.title;
 			let newPath = originalTask.path;
 
-			if (isRenameNeeded) {
+			if (isRenameNeeded && taskUpdates.title) {
 				const parentPath = file.parent ? file.parent.path : "";
 				const newFilename = await generateUniqueFilename(
-					updates.title!,
+					taskUpdates.title,
 					parentPath,
-					plugin.app.vault
+					runtime.app.vault
 				);
 				newPath = parentPath ? `${parentPath}/${newFilename}.md` : `${newFilename}.md`;
 			}
 
-			const recurrenceUpdates = this.getRecurrenceUpdates(originalTask, updates);
-			let normalizedDetails: string | null = null;
-			if (Object.prototype.hasOwnProperty.call(updates, "details")) {
-				normalizedDetails =
-					typeof updates.details === "string" ? updates.details.replace(/\r\n/g, "\n") : "";
-			}
-
-			await plugin.app.fileManager.processFrontMatter(file, (frontmatter) => {
-				const completeTaskData: Partial<TaskInfo> = {
-					...originalTask,
-					...updates,
-					...recurrenceUpdates,
-					dateModified: getCurrentTimestamp(),
-				};
-
-				const mappedFrontmatter = plugin.fieldMapper.mapToFrontmatter(
-					completeTaskData,
-					plugin.settings.taskIdentificationMethod === "tag"
-						? plugin.settings.taskTag
-						: undefined,
-					plugin.settings.storeTitleInFilename
-				);
-
-				Object.entries(mappedFrontmatter).forEach(([key, value]) => {
-					if (value !== undefined) {
-						frontmatter[key] = value;
-					}
-				});
-
-				if (updates.status !== undefined) {
-					this.deps.updateCompletedDateInFrontmatter(
-						frontmatter,
-						updates.status,
-						!!originalTask.recurrence
-					);
-				}
-
-				if (plugin.settings.taskIdentificationMethod === "property") {
-					const propName = plugin.settings.taskPropertyName;
-					const propValue = plugin.settings.taskPropertyValue;
-					if (propName && propValue) {
-						const lower = propValue.toLowerCase();
-						const coercedValue =
-							lower === "true" || lower === "false" ? lower === "true" : propValue;
-						frontmatter[propName] = coercedValue;
-					}
-				}
-
-				const customFrontmatter = (updates as { customFrontmatter?: Record<string, unknown> })
-					.customFrontmatter;
-				if (customFrontmatter) {
-					Object.entries(customFrontmatter).forEach(([key, value]) => {
-						if (value === null) {
-							delete frontmatter[key];
-						} else {
-							frontmatter[key] = value;
-						}
-					});
-				}
-
-				this.removeUnsetMappedFields(frontmatter, updates);
-
-				if (isRenameNeeded) {
-					delete frontmatter[plugin.fieldMapper.toUserField("title")];
-				}
-
-				if (Object.prototype.hasOwnProperty.call(updates, "tags")) {
-					const tagsToSet = Array.isArray(updates.tags) ? [...updates.tags] : [];
-					if (tagsToSet.length > 0) {
-						frontmatter.tags = tagsToSet;
-					} else {
-						delete frontmatter.tags;
-					}
-				}
-			});
-
+			// Rename before changing frontmatter so a failed rename leaves the old
+			// title (and all other fields) untouched.
 			if (isRenameNeeded) {
-				await plugin.app.fileManager.renameFile(file, newPath);
+				await runtime.app.fileManager.renameFile(file, newPath);
 			}
 
-			if (normalizedDetails !== null) {
-				const targetFile = plugin.app.vault.getAbstractFileByPath(newPath);
-				if (targetFile instanceof TFile) {
-					const currentContent = await plugin.app.vault.read(targetFile);
-					const { frontmatter: frontmatterText } = splitFrontmatterAndBody(currentContent);
-					const frontmatterBlock =
-						frontmatterText !== null ? `---\n${frontmatterText}\n---\n\n` : "";
-					const bodyContent = normalizedDetails.trimEnd();
-					const finalBody = bodyContent.length > 0 ? `${bodyContent}\n` : "";
-					await plugin.app.vault.modify(targetFile, `${frontmatterBlock}${finalBody}`);
-				}
-			}
+			let recurrenceUpdates: Partial<TaskInfo> = {};
+			const normalizedDetails = normalizeTaskUpdateDetails(taskUpdates);
+			let finalTags: string[] | undefined;
+			const dateModified = getCurrentTimestamp();
+			const currentDateString =
+				taskUpdates.status !== undefined ? getCurrentDateString() : "";
 
-			const updatedTask: TaskInfo = {
-				...originalTask,
-				...updates,
-				...recurrenceUpdates,
-				path: newPath,
-				dateModified: getCurrentTimestamp(),
+			const updateFrontmatter = (frontmatter: Record<string, unknown>) => {
+				// Rebase the caller's named changes on the bytes Obsidian is about
+				// to modify. A modal's TaskInfo can predate an external completion.
+				const current = runtime.fieldMapper.mapFromFrontmatter(
+					frontmatter,
+					originalTask.path,
+					runtime.settings.storeTitleInFilename
+				);
+				originalTask = {
+					// Retain derived view/body context; persisted fields come from the fresh mapping.
+					id: originalTask.id,
+					basesData: originalTask.basesData,
+					details: originalTask.details,
+					blocking: originalTask.blocking,
+					isBlocked: originalTask.isBlocked,
+					isBlocking: originalTask.isBlocking,
+					hasSubtasks: originalTask.hasSubtasks,
+					path: originalTask.path,
+					title: originalTask.title,
+					status: originalTask.status,
+					priority: originalTask.priority,
+					archived: false,
+					...current,
+				};
+				recurrenceUpdates = buildTaskUpdateRecurrenceUpdates({
+					originalTask,
+					updates: taskUpdates,
+					maintainDueDateOffsetInRecurring:
+						runtime.settings.maintainDueDateOffsetInRecurring,
+				});
+				const frontmatterResult = applyTaskUpdateFrontmatterChange({
+					frontmatter,
+					originalTask,
+					updates: taskUpdates,
+					recurrenceUpdates,
+					dateModified,
+					fieldMapper: runtime.fieldMapper,
+					taskIdentification: {
+						method: runtime.settings.taskIdentificationMethod,
+						tag: runtime.settings.taskTag,
+						propertyName: runtime.settings.taskPropertyName,
+						propertyValue: runtime.settings.taskPropertyValue,
+					},
+					storeTitleInFilename: runtime.settings.storeTitleInFilename,
+					titleIsRepresentedByFilename:
+						taskUpdates.title !== undefined &&
+						isTitleRepresentedByFilename(
+							taskUpdates.title,
+							sanitizeForFilename(taskUpdates.title),
+							file.basename
+						),
+					updateCompletedDateInFrontmatter: (targetFrontmatter, newStatus, isRecurring) =>
+						this.deps.updateCompletedDateInFrontmatter(
+							targetFrontmatter,
+							newStatus,
+							isRecurring
+						),
+				});
+				finalTags = frontmatterResult.finalTags;
 			};
 
 			if (normalizedDetails !== null) {
-				updatedTask.details = normalizedDetails;
+				// Commit fields and body together. A failed body write must not leave
+				// attachment links behind when the modal rolls back imported files.
+				await processVaultFile(runtime.app, file, (currentContent) => {
+					const info = getFrontMatterInfo(currentContent);
+					const parsed: unknown = info.exists ? parseYaml(info.frontmatter) : {};
+					const frontmatter = parsed ?? {};
+					if (typeof frontmatter !== "object" || Array.isArray(frontmatter)) {
+						throw new Error("Task frontmatter must be a mapping");
+					}
+					updateFrontmatter(frontmatter as Record<string, unknown>);
+					const bodyContent = normalizedDetails.trimEnd();
+					const finalBody = bodyContent.length > 0 ? `${bodyContent}\n` : "";
+					return `---\n${stringifyYaml(frontmatter)}---\n\n${finalBody}`;
+				});
+			} else {
+				await processVaultFrontMatter(runtime.app, file, updateFrontmatter);
 			}
 
-			if (updates.status !== undefined && !originalTask.recurrence) {
-				if (plugin.statusManager.isCompletedStatus(updates.status)) {
-					if (!originalTask.completedDate) {
-						updatedTask.completedDate = getCurrentDateString();
-					}
-				} else {
-					updatedTask.completedDate = undefined;
-				}
-			}
+			const updatedTask = buildUpdatedTaskFromPlan({
+				originalTask,
+				updates: taskUpdates,
+				recurrenceUpdates,
+				newPath,
+				dateModified,
+				currentDateString,
+				normalizedDetails,
+				finalTags,
+				isCompletedStatus: (status) => runtime.statusManager.isCompletedStatus(status),
+			});
 
 			if (isRenameNeeded) {
-				plugin.cacheManager.clearCacheEntry(originalTask.path);
+				runtime.cacheManager.clearCacheEntry(originalTask.path);
+				runtime.expandedProjectsService.renamePath(originalTask.path, newPath);
+				runtime.projectSubtasksService.invalidateIndex();
 			}
 			try {
-				const finalFile = plugin.app.vault.getAbstractFileByPath(newPath);
-				if (finalFile instanceof TFile && plugin.cacheManager.waitForFreshTaskData) {
+				const finalFile = runtime.app.vault.getAbstractFileByPath(newPath);
+				if (finalFile instanceof TFile && runtime.cacheManager.waitForFreshTaskData) {
 					const keyChanges: Partial<TaskInfo> = {};
-					if (updates.title !== undefined) keyChanges.title = updates.title;
-					if (updates.status !== undefined) keyChanges.status = updates.status;
-					if (updates.priority !== undefined) keyChanges.priority = updates.priority;
+					if (taskUpdates.title !== undefined) keyChanges.title = taskUpdates.title;
+					if (taskUpdates.status !== undefined) keyChanges.status = taskUpdates.status;
+					if (taskUpdates.priority !== undefined)
+						keyChanges.priority = taskUpdates.priority;
 					if (Object.keys(keyChanges).length > 0) {
-						await plugin.cacheManager.waitForFreshTaskData(finalFile);
+						await runtime.cacheManager.waitForFreshTaskData(finalFile);
 					}
 				}
-				plugin.cacheManager.updateTaskInfoInCache(newPath, updatedTask);
+				runtime.cacheManager.updateTaskInfoInCache(newPath, updatedTask);
 			} catch (cacheError) {
-				console.error("Error updating task cache:", {
+				tasknotesLogger.error("Error updating task cache:", {
+					category: "stale-data",
+					operation: "updating-task-cache",
+					details: { taskPath: newPath },
 					error: cacheError instanceof Error ? cacheError.message : String(cacheError),
-					taskPath: newPath,
 				});
 			}
 
 			try {
-				plugin.emitter.trigger(EVENT_TASK_UPDATED, {
+				runtime.emitter.trigger(EVENT_TASK_UPDATED, {
 					path: newPath,
 					originalTask,
 					updatedTask,
 				});
 			} catch (eventError) {
-				console.error("Error emitting task update event:", {
+				tasknotesLogger.error("Error emitting task update event:", {
+					category: "validation",
+					operation: "emitting-task-update-event",
+					details: { taskPath: newPath },
 					error: eventError instanceof Error ? eventError.message : String(eventError),
-					taskPath: newPath,
 				});
 			}
 
 			if (this.deps.webhookNotifier) {
 				try {
-					const wasCompleted = plugin.statusManager.isCompletedStatus(originalTask.status);
-					const isCompleted = plugin.statusManager.isCompletedStatus(updatedTask.status);
+					const wasCompleted = runtime.statusManager.isCompletedStatus(
+						originalTask.status
+					);
+					const isCompleted = runtime.statusManager.isCompletedStatus(updatedTask.status);
 
 					if (!wasCompleted && isCompleted) {
 						await this.deps.webhookNotifier.triggerWebhook("task.completed", {
@@ -236,154 +298,50 @@ export class TaskUpdateService {
 						});
 					}
 				} catch (error) {
-					console.warn("Failed to trigger webhook for task update:", error);
+					tasknotesLogger.warn("Failed to trigger webhook for task update:", {
+						category: "provider",
+						operation: "trigger-webhook-task-update",
+						error: error,
+					});
 				}
 			}
 
-			if (plugin.taskCalendarSyncService?.isEnabled()) {
-				const wasCompleted = plugin.statusManager.isCompletedStatus(originalTask.status);
-				const isCompleted = plugin.statusManager.isCompletedStatus(updatedTask.status);
+			if (runtime.taskCalendarSyncService?.isEnabled()) {
+				const wasCompleted = runtime.statusManager.isCompletedStatus(originalTask.status);
+				const isCompleted = runtime.statusManager.isCompletedStatus(updatedTask.status);
 
 				const syncPromise =
 					!wasCompleted && isCompleted
-						? plugin.taskCalendarSyncService.completeTaskInCalendar(updatedTask)
-						: plugin.taskCalendarSyncService.updateTaskInCalendar(updatedTask, originalTask);
+						? runtime.taskCalendarSyncService.completeTaskInCalendar(updatedTask)
+						: runtime.taskCalendarSyncService.updateTaskInCalendar(
+								updatedTask,
+								originalTask
+							);
 
 				syncPromise.catch((error) => {
-					console.warn("Failed to sync task update to Google Calendar:", error);
+					tasknotesLogger.warn("Failed to sync task update to Google Calendar:", {
+						category: "provider",
+						operation: "sync-task-update-google-calendar",
+						error: error,
+					});
 				});
 			}
 
-			await this.handleAutoArchive(originalTask, updatedTask, updates.status);
+			await this.handleAutoArchive(originalTask, updatedTask, taskUpdates.status);
 			return updatedTask;
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : String(error);
-			console.error("Error updating task:", {
+			tasknotesLogger.error("Error updating task:", {
+				category: "validation",
+				operation: "updating-task",
+				details: {
+					stack: error instanceof Error ? error.stack : undefined,
+					taskPath: originalTask.path,
+					updates,
+				},
 				error: errorMessage,
-				stack: error instanceof Error ? error.stack : undefined,
-				taskPath: originalTask.path,
-				updates,
 			});
 			throw new Error(`Failed to update task: ${errorMessage}`);
-		}
-	}
-
-	private getRecurrenceUpdates(
-		originalTask: TaskInfo,
-		updates: Partial<TaskInfo>
-	): Partial<TaskInfo> {
-		const { plugin } = this.deps;
-		const recurrenceUpdates: Partial<TaskInfo> = {};
-
-		if (updates.recurrence !== undefined && updates.recurrence !== originalTask.recurrence) {
-			const tempTask: TaskInfo = { ...originalTask, ...updates };
-			const nextDates = updateToNextScheduledOccurrence(
-				tempTask,
-				plugin.settings.maintainDueDateOffsetInRecurring
-			);
-			if (nextDates.scheduled) {
-				recurrenceUpdates.scheduled = nextDates.scheduled;
-			}
-			if (nextDates.due) {
-				recurrenceUpdates.due = nextDates.due;
-			}
-			if (
-				typeof updates.recurrence === "string" &&
-				updates.recurrence &&
-				!updates.recurrence.includes("DTSTART:")
-			) {
-				const tempTaskWithRecurrence: TaskInfo = {
-					...originalTask,
-					...updates,
-					...recurrenceUpdates,
-				};
-				const updatedRecurrence = addDTSTARTToRecurrenceRule(tempTaskWithRecurrence);
-				if (updatedRecurrence) {
-					recurrenceUpdates.recurrence = updatedRecurrence;
-				}
-			}
-		} else if (updates.recurrence !== undefined && !originalTask.recurrence && updates.recurrence) {
-			if (
-				typeof updates.recurrence === "string" &&
-				!updates.recurrence.includes("DTSTART:")
-			) {
-				const tempTask: TaskInfo = { ...originalTask, ...updates };
-				const updatedRecurrence = addDTSTARTToRecurrenceRule(tempTask);
-				if (updatedRecurrence) {
-					recurrenceUpdates.recurrence = updatedRecurrence;
-				}
-			}
-		}
-
-		if (
-			updates.scheduled !== undefined &&
-			updates.scheduled !== originalTask.scheduled &&
-			originalTask.recurrence &&
-			typeof originalTask.recurrence === "string" &&
-			!originalTask.recurrence.includes("DTSTART:")
-		) {
-			const tempTask: TaskInfo = { ...originalTask, ...updates };
-			const updatedRecurrence = addDTSTARTToRecurrenceRule(tempTask);
-			if (updatedRecurrence) {
-				recurrenceUpdates.recurrence = updatedRecurrence;
-			}
-		}
-
-		return recurrenceUpdates;
-	}
-
-	private removeUnsetMappedFields(
-		frontmatter: Record<string, unknown>,
-		updates: Partial<TaskInfo>
-	): void {
-		const { plugin } = this.deps;
-		if (Object.prototype.hasOwnProperty.call(updates, "due") && updates.due === undefined) {
-			delete frontmatter[plugin.fieldMapper.toUserField("due")];
-		}
-		if (
-			Object.prototype.hasOwnProperty.call(updates, "scheduled") &&
-			updates.scheduled === undefined
-		) {
-			delete frontmatter[plugin.fieldMapper.toUserField("scheduled")];
-		}
-		if (
-			Object.prototype.hasOwnProperty.call(updates, "contexts") &&
-			updates.contexts === undefined
-		) {
-			delete frontmatter[plugin.fieldMapper.toUserField("contexts")];
-		}
-		if (Object.prototype.hasOwnProperty.call(updates, "projects")) {
-			const projectsField = plugin.fieldMapper.toUserField("projects");
-			const projectsToSet = Array.isArray(updates.projects) ? updates.projects : [];
-			if (projectsToSet.length > 0) {
-				frontmatter[projectsField] = projectsToSet;
-			} else {
-				delete frontmatter[projectsField];
-			}
-		}
-		if (
-			Object.prototype.hasOwnProperty.call(updates, "timeEstimate") &&
-			updates.timeEstimate === undefined
-		) {
-			delete frontmatter[plugin.fieldMapper.toUserField("timeEstimate")];
-		}
-		if (
-			Object.prototype.hasOwnProperty.call(updates, "completedDate") &&
-			updates.completedDate === undefined
-		) {
-			delete frontmatter[plugin.fieldMapper.toUserField("completedDate")];
-		}
-		if (
-			Object.prototype.hasOwnProperty.call(updates, "recurrence") &&
-			updates.recurrence === undefined
-		) {
-			delete frontmatter[plugin.fieldMapper.toUserField("recurrence")];
-		}
-		if (
-			Object.prototype.hasOwnProperty.call(updates, "blockedBy") &&
-			updates.blockedBy === undefined
-		) {
-			delete frontmatter[plugin.fieldMapper.toUserField("blockedBy")];
 		}
 	}
 
@@ -392,12 +350,18 @@ export class TaskUpdateService {
 		updatedTask: TaskInfo,
 		newStatus: string | undefined
 	): Promise<void> {
-		if (!this.deps.autoArchiveService || newStatus === undefined || newStatus === originalTask.status) {
+		if (
+			!this.deps.autoArchiveService ||
+			newStatus === undefined ||
+			newStatus === originalTask.status
+		) {
 			return;
 		}
 
 		try {
-			const statusConfig = this.deps.plugin.statusManager.getStatusConfig(updatedTask.status);
+			const statusConfig = this.deps.runtime.statusManager.getStatusConfig(
+				updatedTask.status
+			);
 			if (!statusConfig) {
 				return;
 			}
@@ -408,7 +372,11 @@ export class TaskUpdateService {
 				await this.deps.autoArchiveService.cancelAutoArchive(updatedTask.path);
 			}
 		} catch (error) {
-			console.warn("Failed to handle auto-archive for status change:", error);
+			tasknotesLogger.warn("Failed to handle auto-archive for status change:", {
+				category: "validation",
+				operation: "handle-auto-archive-status-change",
+				error: error,
+			});
 		}
 	}
 }

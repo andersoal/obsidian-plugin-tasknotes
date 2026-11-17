@@ -1,3 +1,8 @@
+import { stringifyUnknown } from "./stringUtils";
+import { createTaskNotesLogger } from "./tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Utils/ProjectMetadataResolver" });
+
 export interface ProjectEntry {
 	basename: string;
 	name: string; // with extension
@@ -5,11 +10,11 @@ export interface ProjectEntry {
 	parent: string;
 	title?: string;
 	aliases?: string[];
-	frontmatter?: Record<string, any>;
+	frontmatter?: Record<string, unknown>;
 }
 
 export interface ResolverDeps {
-	getFrontmatter: (entry: ProjectEntry) => Record<string, any> | undefined;
+	getFrontmatter: (entry: ProjectEntry) => Record<string, unknown> | undefined;
 }
 
 export class ProjectMetadataResolver {
@@ -61,7 +66,12 @@ export class ProjectMetadataResolver {
 				}
 			} catch (e) {
 				if (process.env.NODE_ENV === "development") {
-					console.debug("ProjectMetadataResolver: failed to parse row config:", row, e);
+					tasknotesLogger.debug("ProjectMetadataResolver: failed to parse row config:", {
+						category: "configuration",
+						operation: "projectmetadataresolver-parse-row-config",
+						details: { value: row },
+						error: e,
+					});
 				}
 			}
 		}
@@ -69,7 +79,7 @@ export class ProjectMetadataResolver {
 		return metadataRows;
 	}
 
-	private stringifyFmValue(value: any): string {
+	private stringifyFmValue(value: unknown): string {
 		if (value == null) return "";
 		if (Array.isArray(value)) {
 			const parts = value.map((v) => this.stringifyFmValue(v)).filter(Boolean);
@@ -100,12 +110,12 @@ export class ProjectMetadataResolver {
 			}
 			return trimmed; // plain string
 		}
-		if (t === "number" || t === "boolean") return String(value);
+		if (t === "number" || t === "boolean") return stringifyUnknown(value);
 		// Obsidian frontmatter links are objects with a path field
 		if (t === "object") {
-			const anyVal = value as any;
+			const anyVal = value as { path?: unknown };
 			if (typeof anyVal.path === "string") {
-				const p = anyVal.path as string;
+				const p = anyVal.path;
 				const base = p.split("/").pop() || p;
 				return base.replace(/\.md$/i, "");
 			}

@@ -1,5 +1,8 @@
-/* eslint-disable no-console, @typescript-eslint/no-non-null-assertion */
-import { Notice } from "obsidian";
+import { withPluginDataWriteLock } from "../utils/pluginDataWriteLock";
+import { uiText } from "../i18n/runtime";
+import { msg } from "@lingui/core/macro";
+/* eslint-disable @typescript-eslint/no-non-null-assertion -- Pomodoro state transitions guard active sessions before dereferencing. */
+import { TFile, moment as obsidianMoment } from "obsidian";
 import TaskNotesPlugin from "../main";
 import {
 	createDailyNote,
@@ -19,7 +22,9 @@ import {
 	TaskInfo,
 	IWebhookNotifier,
 } from "../types";
-import { TranslationKey } from "../i18n";
+import type { InterpolationValues, MessageDescriptor } from "../i18n";
+import { publishUserNotice } from "../core/userNotices";
+import { processVaultFrontMatter } from "./VaultMutationService";
 import {
 	getCurrentTimestamp,
 	formatDateForStorage,
@@ -27,11 +32,45 @@ import {
 	parseDateToLocal,
 	createUTCDateFromLocalCalendarDate,
 } from "../utils/dateUtils";
-import { getSessionDuration, timerWorker } from "../utils/pomodoroUtils";
+import {
+	calculatePomodoroStats,
+	filterPomodoroSessionsByDateKey,
+	filterPomodoroSessionsByDateRange,
+	getPomodoroDateKeysInRange,
+	getPomodoroSessionDateKey,
+	sortPomodoroSessions,
+} from "../utils/pomodoroStats";
+import { shouldPersistLastSelectedTask, shouldPersistPomodoroState } from "./pomodoroPersistence";
+import { PomodoroTicker } from "./PomodoroTicker";
+import {
+	clampPomodoroDurationSeconds,
+	formatLocalTimestamp,
+	getActiveElapsedSeconds,
+	getSessionCompletionTimeMs,
+	getSessionRemainingSeconds,
+} from "../utils/pomodoroTime";
+import { isTaskInstanceCompleted } from "../utils/taskInstanceStatus";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Services/PomodoroService" });
+
+type DailyNoteMoment = Parameters<typeof getDailyNote>[0];
+
+function getDailyNoteMoment(date: Date): DailyNoteMoment {
+	return (obsidianMoment as unknown as (input: Date) => DailyNoteMoment)(date);
+}
+
+function isPomodoroSessionHistory(value: unknown): value is PomodoroSessionHistory {
+	return (
+		value !== null &&
+		typeof value === "object" &&
+		typeof (value as { id?: unknown }).id === "string"
+	);
+}
 
 export class PomodoroService {
 	private plugin: TaskNotesPlugin;
-	private timerWorker: Worker | null = null;
+	private ticker: PomodoroTicker | null = null;
 	private state: PomodoroState;
 	private activeAudioContexts: Set<AudioContext> = new Set();
 	private cleanupTimeouts: Set<number> = new Set();
@@ -39,8 +78,10 @@ export class PomodoroService {
 	private lastSelectedTaskPath?: string;
 	private lastSelectedTaskPathLoaded = false;
 	private lastWorkSessionTaskPath?: string;
+	private completionInProgress = false;
+	private taskFileRenameUnsubscribe?: () => void;
 
-	private translate(key: TranslationKey, variables?: Record<string, any>): string {
+	private translate(key: MessageDescriptor, variables?: InterpolationValues): string {
 		return this.plugin.i18n.translate(key, variables);
 	}
 
@@ -54,10 +95,90 @@ export class PomodoroService {
 
 	async initialize() {
 		await this.loadState();
-		this.setupWorker();
+		this.setupTicker();
+		this.subscribeToTaskFileRenames();
 
 		if (this.state.isRunning && this.state.currentSession) {
 			this.resumeTimer();
+		}
+	}
+
+	private subscribeToTaskFileRenames(): void {
+		if (this.taskFileRenameUnsubscribe) return;
+
+		this.taskFileRenameUnsubscribe = this.plugin.cacheManager.subscribe(
+			"file-renamed",
+			(event: unknown) => {
+				if (!event || typeof event !== "object") return;
+				const { oldPath, newPath } = event as {
+					oldPath?: unknown;
+					newPath?: unknown;
+				};
+				if (typeof oldPath !== "string" || typeof newPath !== "string") return;
+				void this.handleTaskFileRenamed(oldPath, newPath);
+			}
+		);
+	}
+
+	private async handleTaskFileRenamed(oldPath: string, newPath: string): Promise<void> {
+		if (!oldPath || !newPath || oldPath === newPath) return;
+
+		let stateChanged = false;
+		let lastSelectedChanged = false;
+
+		if (this.state.currentSession?.taskPath === oldPath) {
+			this.state.currentSession.taskPath = newPath;
+			stateChanged = true;
+		}
+
+		if (this.lastWorkSessionTaskPath === oldPath) {
+			this.lastWorkSessionTaskPath = newPath;
+		}
+
+		if (this.lastSelectedTaskPath === oldPath) {
+			this.lastSelectedTaskPath = newPath;
+			this.lastSelectedTaskPathLoaded = true;
+			lastSelectedChanged = true;
+		}
+
+		try {
+			await withPluginDataWriteLock(this.plugin, async () => {
+				const data = await this.plugin.loadPluginDataForSafeWrite(
+					"persist-pomodoro-task-path-file-rename"
+				);
+				if (!data) return;
+				let shouldSaveData = false;
+
+				if (stateChanged) {
+					data.pomodoroState = this.state;
+					data.lastPomodoroDate = formatDateForStorage(getTodayLocal());
+					shouldSaveData = true;
+				}
+
+				if (lastSelectedChanged || data.lastSelectedTaskPath === oldPath) {
+					this.lastSelectedTaskPath = newPath;
+					this.lastSelectedTaskPathLoaded = true;
+					data.lastSelectedTaskPath = newPath;
+					shouldSaveData = true;
+				}
+
+				if (shouldSaveData) {
+					await this.plugin.saveData(data);
+				}
+			});
+		} catch (error) {
+			tasknotesLogger.error("Failed to persist Pomodoro task path after file rename:", {
+				category: "persistence",
+				operation: "persist-pomodoro-task-path-file-rename",
+				error: error,
+			});
+		}
+
+		if (stateChanged) {
+			this.plugin.emitter.trigger(EVENT_POMODORO_TICK, {
+				timeRemaining: this.state.timeRemaining,
+				session: this.state.currentSession,
+			});
 		}
 	}
 
@@ -68,30 +189,31 @@ export class PomodoroService {
 		this.webhookNotifier = notifier;
 	}
 
-	private setupWorker() {
-		const blob = new Blob([timerWorker], { type: "application/javascript" });
-		const workerUrl = URL.createObjectURL(blob);
-		this.timerWorker = new Worker(workerUrl);
+	private setupTicker() {
+		this.ticker?.destroy();
+		this.ticker = new PomodoroTicker(() => this.handleTimerTick());
+	}
 
-		this.timerWorker.onmessage = (e) => {
-			if (e.data.type === "done") {
-				this.completePomodoro();
-			}
+	private handleTimerTick(): void {
+		if (!this.state.isRunning || !this.state.currentSession) {
+			return;
+		}
 
-			if (e.data.type === "tick") {
-				this.state.timeRemaining = e.data.timeRemaining;
-
-				this.plugin.emitter.trigger(EVENT_POMODORO_TICK, {
-					timeRemaining: this.state.timeRemaining,
-					session: this.state.currentSession,
-				});
-			}
-		};
+		const timeRemaining = this.syncRunningTimeRemaining();
+		if (timeRemaining <= 0 && !this.completionInProgress) {
+			this.completionInProgress = true;
+			void this.completePomodoro().finally(() => {
+				this.completionInProgress = false;
+			});
+		}
 	}
 
 	async loadState() {
 		try {
-			const data = await this.plugin.loadData();
+			const data = (await this.plugin.loadData()) as {
+				pomodoroState?: PomodoroState;
+				lastPomodoroDate?: string;
+			} | null;
 
 			if (data?.pomodoroState) {
 				this.state = data.pomodoroState;
@@ -133,7 +255,11 @@ export class PomodoroService {
 				}
 			}
 		} catch (error) {
-			console.error("Failed to load pomodoro state:", error);
+			tasknotesLogger.error("Failed to load pomodoro state:", {
+				category: "persistence",
+				operation: "load-pomodoro-state",
+				error: error,
+			});
 			// Reset to clean state on error
 			this.state = {
 				isRunning: false,
@@ -144,12 +270,23 @@ export class PomodoroService {
 
 	async saveState() {
 		try {
-			const data = (await this.plugin.loadData()) || {};
-			data.pomodoroState = this.state;
-			data.lastPomodoroDate = formatDateForStorage(getTodayLocal());
-			await this.plugin.saveData(data);
+			await withPluginDataWriteLock(this.plugin, async () => {
+				const data = await this.plugin.loadPluginDataForSafeWrite("save-pomodoro-state");
+				if (!data) return;
+				const today = formatDateForStorage(getTodayLocal());
+				if (!shouldPersistPomodoroState(data, this.state, today)) {
+					return;
+				}
+				data.pomodoroState = this.state;
+				data.lastPomodoroDate = today;
+				await this.plugin.saveData(data);
+			});
 		} catch (error) {
-			console.error("Failed to save pomodoro state:", error);
+			tasknotesLogger.error("Failed to save pomodoro state:", {
+				category: "persistence",
+				operation: "save-pomodoro-state",
+				error: error,
+			});
 		}
 	}
 
@@ -157,11 +294,26 @@ export class PomodoroService {
 		this.lastSelectedTaskPath = taskPath;
 		this.lastSelectedTaskPathLoaded = true;
 		try {
-			const data = (await this.plugin.loadData()) || {};
-			data.lastSelectedTaskPath = taskPath;
-			await this.plugin.saveData(data);
+			await withPluginDataWriteLock(this.plugin, async () => {
+				const data =
+					await this.plugin.loadPluginDataForSafeWrite("save-last-selected-task");
+				if (!data) return;
+				if (!shouldPersistLastSelectedTask(data, taskPath)) {
+					return;
+				}
+				if (taskPath === undefined) {
+					delete data.lastSelectedTaskPath;
+				} else {
+					data.lastSelectedTaskPath = taskPath;
+				}
+				await this.plugin.saveData(data);
+			});
 		} catch (error) {
-			console.error("Failed to save last selected task:", error);
+			tasknotesLogger.error("Failed to save last selected task:", {
+				category: "persistence",
+				operation: "save-last-selected-task",
+				error: error,
+			});
 		}
 	}
 
@@ -170,7 +322,9 @@ export class PomodoroService {
 			return this.lastSelectedTaskPath;
 		}
 		try {
-			const data = await this.plugin.loadData();
+			const data = (await this.plugin.loadData()) as {
+				lastSelectedTaskPath?: unknown;
+			} | null;
 			const path = data?.lastSelectedTaskPath;
 			if (typeof path === "string" && path.trim().length > 0) {
 				this.lastSelectedTaskPath = path;
@@ -180,34 +334,42 @@ export class PomodoroService {
 			this.lastSelectedTaskPathLoaded = true;
 			return this.lastSelectedTaskPath;
 		} catch (error) {
-			console.error("Failed to load last selected task:", error);
+			tasknotesLogger.error("Failed to load last selected task:", {
+				category: "persistence",
+				operation: "load-last-selected-task",
+				error: error,
+			});
 			return undefined;
 		}
 	}
 
 	async startPomodoro(task?: TaskInfo, durationMinutes?: number) {
 		if (this.state.isRunning) {
-			new Notice(this.translate("services.pomodoro.notices.alreadyRunning"));
+			publishUserNotice(this.plugin.emitter, this.translate(msg({ message: "A Pomodoro is already running", context: "services.pomodoro.notices.alreadyRunning" })));
 			return;
 		}
 
 		// Check if there's a paused session that should be resumed instead
 		if (this.state.currentSession && !this.state.isRunning) {
-			new Notice(this.translate("services.pomodoro.notices.resumeCurrentSession"));
+			publishUserNotice(this.plugin.emitter, this.translate(msg({ message: "Resume the current session instead of starting a new one", context: "services.pomodoro.notices.resumeCurrentSession" })));
 			return;
 		}
 
-		// Use custom duration if provided, otherwise use default from settings/state
-		const customDurationSeconds = durationMinutes
-			? Math.max(1, Math.min(120, durationMinutes)) * 60
-			: null;
-		const durationSeconds =
-			customDurationSeconds || Math.max(1, Math.min(120 * 60, this.state.timeRemaining));
+		// Use custom duration if provided, otherwise use the prepared work timer.
+		// If a break is prepared and the user skips it, start a normal work session.
+		const preparedWorkDurationSeconds =
+			this.state.nextSessionType === "short-break" ||
+			this.state.nextSessionType === "long-break"
+				? this.plugin.settings.pomodoroWorkDuration * 60
+				: this.state.timeRemaining;
+		const customDurationSeconds =
+			durationMinutes !== undefined ? durationMinutes * 60 : undefined;
+		const durationSeconds = clampPomodoroDurationSeconds(
+			customDurationSeconds ?? preparedWorkDurationSeconds
+		);
 
 		// Convert to minutes for planned duration
 		const plannedDurationMinutes = durationSeconds / 60;
-
-		console.log("Starting pomodoro with planned duration:", plannedDurationMinutes, "minutes");
 
 		const sessionStartTime = getCurrentTimestamp();
 
@@ -247,11 +409,15 @@ export class PomodoroService {
 		// Start time tracking on the task if applicable
 		if (task) {
 			try {
-				await this.plugin.taskService.startTimeTracking(task);
+				await this.startOwnedTimeTracking(session, task);
 			} catch (error) {
 				// If time tracking is already active, that's fine for Pomodoro
 				if (!error.message?.includes("Time tracking is already active")) {
-					console.error("Failed to start time tracking for Pomodoro:", error);
+					tasknotesLogger.error("Failed to start time tracking for Pomodoro:", {
+						category: "internal",
+						operation: "start-time-tracking-pomodoro",
+						error: error,
+					});
 				}
 			}
 		}
@@ -264,22 +430,33 @@ export class PomodoroService {
 			try {
 				await this.webhookNotifier.triggerWebhook("pomodoro.started", { session, task });
 			} catch (error) {
-				console.warn("Failed to trigger webhook for pomodoro start:", error);
+				tasknotesLogger.warn("Failed to trigger webhook for pomodoro start:", {
+					category: "provider",
+					operation: "trigger-webhook-pomodoro-start",
+					error: error,
+				});
 			}
 		}
 
-		new Notification(`Pomodoro started${task ? ` for: ${task.title}` : ""}`);
+		this.showPomodoroNotification(task
+			? uiText(msg({ message: "Pomodoro started for {title}", context: "pomodoro start notification" }), { title: task.title })
+			: uiText(msg({ message: "Pomodoro started", context: "pomodoro start notification" })));
+	}
+
+	async startPomodoroWithLastSelectedTask(durationMinutes?: number): Promise<void> {
+		const task = await this.getAutoStartTask();
+		await this.startPomodoro(task, durationMinutes);
 	}
 
 	async startBreak(isLongBreak = false) {
 		if (this.state.isRunning) {
-			new Notice(this.translate("services.pomodoro.notices.timerAlreadyRunning"));
+			publishUserNotice(this.plugin.emitter, this.translate(msg({ message: "A timer is already running", context: "services.pomodoro.notices.timerAlreadyRunning" })));
 			return;
 		}
 
 		// Check if there's a paused session
 		if (this.state.currentSession && !this.state.isRunning) {
-			new Notice(this.translate("services.pomodoro.notices.resumeSessionInstead"));
+			publishUserNotice(this.plugin.emitter, this.translate(msg({ message: "Resume the current session instead of starting a new one", context: "services.pomodoro.notices.resumeSessionInstead" })));
 			return;
 		}
 
@@ -311,11 +488,11 @@ export class PomodoroService {
 		await this.saveState();
 		this.startTimer();
 
-		new Notice(
+		publishUserNotice(this.plugin.emitter,
 			this.translate(
 				isLongBreak
-					? "services.pomodoro.notices.longBreakStarted"
-					: "services.pomodoro.notices.shortBreakStarted"
+					? msg({ message: "Long break started", context: "services.pomodoro.notices.longBreakStarted" })
+					: msg({ message: "Short break started", context: "services.pomodoro.notices.shortBreakStarted" })
 			)
 		);
 	}
@@ -325,8 +502,10 @@ export class PomodoroService {
 			return;
 		}
 
+		this.syncRunningTimeRemaining();
 		this.stopTimer();
 		this.state.isRunning = false;
+		const pausedAt = getCurrentTimestamp();
 
 		// End the current active period
 		if (this.state.currentSession && this.state.currentSession.activePeriods.length > 0) {
@@ -335,7 +514,7 @@ export class PomodoroService {
 					this.state.currentSession.activePeriods.length - 1
 				];
 			if (!currentPeriod.endTime) {
-				currentPeriod.endTime = getCurrentTimestamp();
+				currentPeriod.endTime = pausedAt;
 			}
 		}
 
@@ -346,10 +525,14 @@ export class PomodoroService {
 					this.state.currentSession.taskPath
 				);
 				if (task) {
-					await this.plugin.taskService.stopTimeTracking(task);
+					await this.stopOwnedTimeTracking(this.state.currentSession, task);
 				}
 			} catch (error) {
-				console.error("Failed to stop time tracking for Pomodoro pause:", error);
+				tasknotesLogger.error("Failed to stop time tracking for Pomodoro pause:", {
+					category: "internal",
+					operation: "stop-time-tracking-pomodoro-pause",
+					error: error,
+				});
 			}
 		}
 
@@ -361,7 +544,7 @@ export class PomodoroService {
 			session: this.state.currentSession,
 		});
 
-		new Notice(this.translate("services.pomodoro.notices.paused"));
+		publishUserNotice(this.plugin.emitter, this.translate(msg({ message: "Pomodoro paused", context: "services.pomodoro.notices.paused" })));
 	}
 
 	async resumePomodoro() {
@@ -389,12 +572,16 @@ export class PomodoroService {
 					this.state.currentSession.taskPath
 				);
 				if (task) {
-					await this.plugin.taskService.startTimeTracking(task);
+					await this.startOwnedTimeTracking(this.state.currentSession, task);
 				}
 			} catch (error) {
 				// If time tracking is already active, that's fine for Pomodoro resume
 				if (!error.message?.includes("Time tracking is already active")) {
-					console.error("Failed to start time tracking for Pomodoro resume:", error);
+					tasknotesLogger.error("Failed to start time tracking for Pomodoro resume:", {
+						category: "internal",
+						operation: "start-time-tracking-pomodoro-resume",
+						error: error,
+					});
 				}
 			}
 		}
@@ -405,7 +592,7 @@ export class PomodoroService {
 			session: this.state.currentSession,
 		});
 
-		new Notice(this.translate("services.pomodoro.notices.resumed"));
+		publishUserNotice(this.plugin.emitter, this.translate(msg({ message: "Pomodoro resumed", context: "services.pomodoro.notices.resumed" })));
 	}
 
 	async stopPomodoro() {
@@ -414,11 +601,15 @@ export class PomodoroService {
 		}
 
 		const wasRunning = this.state.isRunning;
+		if (wasRunning) {
+			this.syncRunningTimeRemaining();
+		}
 		this.stopTimer();
+		const stoppedAt = getCurrentTimestamp();
 
 		if (this.state.currentSession) {
 			this.state.currentSession.interrupted = true;
-			this.state.currentSession.endTime = getCurrentTimestamp();
+			this.state.currentSession.endTime = stoppedAt;
 
 			// End the current active period if it's still running
 			if (this.state.currentSession.activePeriods.length > 0) {
@@ -427,7 +618,7 @@ export class PomodoroService {
 						this.state.currentSession.activePeriods.length - 1
 					];
 				if (!currentPeriod.endTime) {
-					currentPeriod.endTime = getCurrentTimestamp();
+					currentPeriod.endTime = stoppedAt;
 				}
 			}
 
@@ -450,7 +641,11 @@ export class PomodoroService {
 					task,
 				});
 			} catch (error) {
-				console.warn("Failed to trigger webhook for pomodoro interruption:", error);
+				tasknotesLogger.warn("Failed to trigger webhook for pomodoro interruption:", {
+					category: "provider",
+					operation: "trigger-webhook-pomodoro-interruption",
+					error: error,
+				});
 			}
 		}
 
@@ -461,10 +656,14 @@ export class PomodoroService {
 					this.state.currentSession.taskPath
 				);
 				if (task) {
-					await this.plugin.taskService.stopTimeTracking(task);
+					await this.stopOwnedTimeTracking(this.state.currentSession, task);
 				}
 			} catch (error) {
-				console.error("Failed to stop time tracking for Pomodoro interrupt:", error);
+				tasknotesLogger.error("Failed to stop time tracking for Pomodoro interrupt:", {
+					category: "internal",
+					operation: "stop-time-tracking-pomodoro-interrupt",
+					error: error,
+				});
 			}
 		}
 
@@ -483,23 +682,44 @@ export class PomodoroService {
 		});
 
 		if (wasRunning) {
-			new Notice(this.translate("services.pomodoro.notices.stoppedAndReset"));
+			publishUserNotice(this.plugin.emitter, this.translate(msg({ message: "Pomodoro stopped and reset", context: "services.pomodoro.notices.stoppedAndReset" })));
 		}
 	}
 
-	private startTimer() {
-		if (!this.timerWorker) return;
+	async skipBreak(): Promise<void> {
+		if (
+			this.state.currentSession ||
+			(this.state.nextSessionType !== "short-break" &&
+				this.state.nextSessionType !== "long-break")
+		) {
+			return;
+		}
 
-		this.timerWorker.postMessage({
-			command: "start",
-			duration: this.state.timeRemaining,
+		this.stopTimer();
+		this.state.isRunning = false;
+		this.state.currentSession = undefined;
+		this.state.timeRemaining = this.plugin.settings.pomodoroWorkDuration * 60;
+		this.state.nextSessionType = undefined;
+
+		await this.saveState();
+
+		this.plugin.emitter.trigger(EVENT_POMODORO_TICK, {
+			timeRemaining: this.state.timeRemaining,
+			session: this.state.currentSession,
 		});
 	}
 
-	private stopTimer() {
-		if (!this.timerWorker) return;
+	private startTimer() {
+		if (!this.ticker) {
+			this.setupTicker();
+		}
 
-		this.timerWorker.postMessage({ command: "stop" });
+		this.syncRunningTimeRemaining();
+		this.ticker?.start();
+	}
+
+	private stopTimer() {
+		this.ticker?.stop();
 	}
 
 	private resumeTimer() {
@@ -510,37 +730,47 @@ export class PomodoroService {
 			// Check for invalid start time (future dates)
 			if (startTime > now) {
 				// Reset session if start time is in the future
-				this.stopPomodoro();
+				void this.stopPomodoro();
 				return;
 			}
 
-			const totalDuration = this.state.currentSession.plannedDuration * 60;
-
 			if (!this.state.isRunning && this.state.timeRemaining > 0) {
 				// Session was paused, use stored time remaining (don't recalculate)
-				this.state.timeRemaining = Math.min(this.state.timeRemaining, totalDuration);
+				this.state.timeRemaining = Math.min(
+					this.state.timeRemaining,
+					clampPomodoroDurationSeconds(this.state.currentSession.plannedDuration * 60)
+				);
 			} else if (this.state.isRunning) {
-				// Calculate elapsed time based on active periods
-				const activePeriods = this.state.currentSession.activePeriods || [];
-				let totalActiveSeconds = 0;
-
-				for (const period of activePeriods) {
-					const start = new Date(period.startTime).getTime();
-					const end = period.endTime ? new Date(period.endTime).getTime() : now;
-					totalActiveSeconds += Math.floor((end - start) / 1000);
-				}
-
-				// Calculate time remaining based on actual active time
-				this.state.timeRemaining = Math.max(0, totalDuration - totalActiveSeconds);
+				this.state.timeRemaining = getSessionRemainingSeconds(
+					this.state.currentSession,
+					now
+				);
 			}
 
 			if (this.state.timeRemaining > 0 && this.state.isRunning) {
 				this.startTimer();
 			} else if (this.state.timeRemaining <= 0) {
 				// Timer would have completed while app was closed
-				this.completePomodoro();
+				void this.completePomodoro();
 			}
 		}
+	}
+
+	private syncRunningTimeRemaining(nowMs = Date.now()): number {
+		if (!this.state.currentSession) {
+			return this.state.timeRemaining;
+		}
+
+		if (this.state.isRunning) {
+			this.state.timeRemaining = getSessionRemainingSeconds(this.state.currentSession, nowMs);
+		}
+
+		this.plugin.emitter.trigger(EVENT_POMODORO_TICK, {
+			timeRemaining: this.state.timeRemaining,
+			session: this.state.currentSession,
+		});
+
+		return this.state.timeRemaining;
 	}
 
 	private async autoStartWorkSession(): Promise<void> {
@@ -556,7 +786,11 @@ export class PomodoroService {
 				await this.startPomodoro();
 			}
 		} catch (error) {
-			console.error("Failed to auto-start work session:", error);
+			tasknotesLogger.error("Failed to auto-start work session:", {
+				category: "internal",
+				operation: "auto-start-work-session",
+				error: error,
+			});
 		}
 	}
 
@@ -587,13 +821,23 @@ export class PomodoroService {
 					this.clearCachedTaskPath(path);
 					continue;
 				}
-				if (task.archived || this.plugin.statusManager.isCompletedStatus(task.status)) {
-					this.clearCachedTaskPath(path);
+				const completedForToday = isTaskInstanceCompleted(
+					task,
+					new Date(),
+					this.plugin.statusManager,
+					this.plugin.settings.defaultTaskStatus
+				);
+				if (task.archived || completedForToday) {
+					// Keep the selected path so reopened or unarchived tasks can be picked up later.
 					continue;
 				}
 				return task;
 			} catch (error) {
-				console.warn(`Failed to load task for auto-start (${path}):`, error);
+				tasknotesLogger.warn(`Failed to load task for auto-start (${path}):`, {
+					category: "persistence",
+					operation: "load-task-auto-start",
+					error: error,
+				});
 			}
 		}
 
@@ -611,6 +855,19 @@ export class PomodoroService {
 		}
 	}
 
+	private async startOwnedTimeTracking(session: PomodoroSession, task: TaskInfo): Promise<void> {
+		session.timeTrackingStartTime = undefined;
+		const updatedTask = await this.plugin.taskService.startTimeTracking(task);
+		session.timeTrackingStartTime = updatedTask?.timeEntries?.find((entry) => !entry.endTime)?.startTime;
+		await this.saveState();
+	}
+
+	private async stopOwnedTimeTracking(session: PomodoroSession, task: TaskInfo, stopTime?: string): Promise<void> {
+		if (!session.timeTrackingStartTime) return;
+		await this.plugin.taskService.stopTimeTracking(task, stopTime, session.timeTrackingStartTime);
+		session.timeTrackingStartTime = undefined;
+	}
+
 	private async completePomodoro() {
 		this.stopTimer();
 
@@ -619,8 +876,13 @@ export class PomodoroService {
 		}
 
 		const session = this.state.currentSession;
+		const completionTimeMs = getSessionCompletionTimeMs(session);
+		const completedAt =
+			completionTimeMs !== null
+				? formatLocalTimestamp(completionTimeMs)
+				: getCurrentTimestamp();
 		session.completed = true;
-		session.endTime = getCurrentTimestamp();
+		session.endTime = completedAt;
 
 		if (session.type === "work" && session.taskPath) {
 			this.lastWorkSessionTaskPath = session.taskPath;
@@ -630,7 +892,7 @@ export class PomodoroService {
 		if (session.activePeriods.length > 0) {
 			const currentPeriod = session.activePeriods[session.activePeriods.length - 1];
 			if (!currentPeriod.endTime) {
-				currentPeriod.endTime = getCurrentTimestamp();
+				currentPeriod.endTime = completedAt;
 			}
 		}
 
@@ -642,10 +904,14 @@ export class PomodoroService {
 				try {
 					const task = await this.plugin.cacheManager.getTaskInfo(session.taskPath);
 					if (task) {
-						await this.plugin.taskService.stopTimeTracking(task);
+						await this.stopOwnedTimeTracking(session, task, completedAt);
 					}
 				} catch (error) {
-					console.error("Failed to stop time tracking for Pomodoro completion:", error);
+					tasknotesLogger.error("Failed to stop time tracking for Pomodoro completion:", {
+						category: "internal",
+						operation: "stop-time-tracking-pomodoro-completion",
+						error: error,
+					});
 				}
 			}
 		}
@@ -662,7 +928,11 @@ export class PomodoroService {
 				shouldTakeLongBreak =
 					totalCompleted % this.plugin.settings.pomodoroLongBreakInterval === 0;
 			} catch (error) {
-				console.error("Failed to calculate break type:", error);
+				tasknotesLogger.error("Failed to calculate break type:", {
+					category: "internal",
+					operation: "calculate-break-type",
+					error: error,
+				});
 				shouldTakeLongBreak = false;
 			}
 		}
@@ -689,21 +959,20 @@ export class PomodoroService {
 					: undefined;
 				await this.webhookNotifier.triggerWebhook("pomodoro.completed", { session, task });
 			} catch (error) {
-				console.warn("Failed to trigger webhook for pomodoro completion:", error);
+				tasknotesLogger.warn("Failed to trigger webhook for pomodoro completion:", {
+					category: "provider",
+					operation: "trigger-webhook-pomodoro-completion",
+					error: error,
+				});
 			}
 		}
 
-		// Show notification
-		if (this.plugin.settings.pomodoroNotifications) {
-			const message =
-				session.type === "work" ? `🍅 Pomodoro completed!` : "☕ Break completed!";
-			const body =
-				session.type === "work"
-					? `Time for a ${shouldTakeLongBreak ? "long break 💤" : "short break ☕"}`
-					: "Ready for the next pomodoro?";
-
-			new Notification(message, { body });
-		}
+		const message = session.type === "work" ? uiText(msg({ message: "🍅 Pomodoro completed!", context: "services/PomodoroService: PomodoroService.completePomodoro display" })) : uiText(msg({ message: "☕ Break completed!", context: "services/PomodoroService: PomodoroService.completePomodoro display" }));
+		const body =
+			session.type === "work"
+				? uiText(msg({ message: "{length, select, long {Time for a long break 💤} other {Time for a short break ☕}}", context: "pomodoro break notification" }), { length: shouldTakeLongBreak ? "long" : "short" })
+				: uiText(msg({ message: "Ready for the next pomodoro?", context: "services/PomodoroService: PomodoroService.completePomodoro display" }));
+		this.showPomodoroNotification(message, { body });
 
 		// Play sound if enabled
 		if (this.plugin.settings.pomodoroSoundEnabled) {
@@ -725,10 +994,9 @@ export class PomodoroService {
 
 			// Auto-start break if configured, otherwise just prepare the timer
 			if (this.plugin.settings.pomodoroAutoStartBreaks) {
-				const timeout = setTimeout(
-					() => this.startBreak(shouldTakeLongBreak),
-					1000
-				) as unknown as number;
+				const timeout = window.setTimeout(() => {
+					void this.startBreak(shouldTakeLongBreak);
+				}, 1000);
 				this.cleanupTimeouts.add(timeout);
 			}
 		} else {
@@ -738,9 +1006,9 @@ export class PomodoroService {
 
 			// Auto-start work if configured, otherwise just prepare the timer
 			if (this.plugin.settings.pomodoroAutoStartWork) {
-				const timeout = setTimeout(() => {
-					this.autoStartWorkSession();
-				}, 1000) as unknown as number;
+				const timeout = window.setTimeout(() => {
+					void this.autoStartWorkSession();
+				}, 1000);
 				this.cleanupTimeouts.add(timeout);
 			}
 		}
@@ -779,7 +1047,7 @@ export class PomodoroService {
 			this.activeAudioContexts.add(audioContext);
 
 			// Second beep
-			const beepTimeout = setTimeout(() => {
+			const beepTimeout = window.setTimeout(() => {
 				try {
 					const osc2 = audioContext.createOscillator();
 					osc2.connect(gainNode);
@@ -788,19 +1056,47 @@ export class PomodoroService {
 					osc2.start();
 					osc2.stop(audioContext.currentTime + 0.1);
 				} catch (error) {
-					console.error("Failed to play second beep:", error);
+					tasknotesLogger.error("Failed to play second beep:", {
+						category: "provider",
+						operation: "play-second-beep",
+						error: error,
+					});
 				}
 			}, 150);
-			this.cleanupTimeouts.add(beepTimeout as unknown as number);
+			this.cleanupTimeouts.add(beepTimeout);
 
 			// Clean up audio context after sounds complete
-			const cleanupTimeout = setTimeout(() => {
+			const cleanupTimeout = window.setTimeout(() => {
 				this.activeAudioContexts.delete(audioContext);
 				audioContext.close().catch(() => {});
 			}, 300);
-			this.cleanupTimeouts.add(cleanupTimeout as unknown as number);
+			this.cleanupTimeouts.add(cleanupTimeout);
 		} catch (error) {
-			console.error("Failed to play completion sound:", error);
+			tasknotesLogger.error("Failed to play completion sound:", {
+				category: "provider",
+				operation: "play-completion-sound",
+				error: error,
+			});
+		}
+	}
+
+	private showPomodoroNotification(title: string, options?: NotificationOptions): void {
+		if (!this.plugin.settings.pomodoroNotifications) {
+			return;
+		}
+
+		if (typeof Notification === "undefined" || Notification.permission !== "granted") {
+			return;
+		}
+
+		try {
+			new Notification(title, options);
+		} catch (error) {
+			tasknotesLogger.warn("Failed to show Pomodoro notification:", {
+				category: "provider",
+				operation: "show-pomodoro-notification",
+				error: error,
+			});
 		}
 	}
 
@@ -811,42 +1107,34 @@ export class PomodoroService {
 
 	adjustSessionTime(adjustmentSeconds: number): void {
 		if (this.state.currentSession) {
-			this.stopTimer();
-
-			// Apply the adjustment directly to timeRemaining
-			this.state.timeRemaining = Math.max(1, this.state.timeRemaining + adjustmentSeconds);
-
-			// Calculate the new total duration based on how much time has actually elapsed
-			const activePeriods = this.state.currentSession.activePeriods || [];
-			let totalActiveSeconds = 0;
-
-			for (const period of activePeriods) {
-				if (period.endTime) {
-					// Completed period
-					const start = new Date(period.startTime).getTime();
-					const end = new Date(period.endTime).getTime();
-					totalActiveSeconds += Math.floor((end - start) / 1000);
-				} else if (this.state.isRunning) {
-					// Current running period
-					const start = new Date(period.startTime).getTime();
-					const now = Date.now();
-					totalActiveSeconds += Math.floor((now - start) / 1000);
-				}
-			}
-
-			// New planned duration = elapsed time + remaining time
-			const newTotalSeconds = totalActiveSeconds + this.state.timeRemaining;
-			this.state.currentSession.plannedDuration = Math.ceil(newTotalSeconds / 60);
-
-			this.saveState();
-			this.startTimer();
-
-			// Emit tick event to update UI
-			this.plugin.emitter.trigger(EVENT_POMODORO_TICK, {
-				timeRemaining: this.state.timeRemaining,
-				session: this.state.currentSession,
-			});
+			const nextRemainingSeconds = clampPomodoroDurationSeconds(
+				this.state.timeRemaining + adjustmentSeconds
+			);
+			this.setCurrentSessionRemainingTime(nextRemainingSeconds);
 		}
+	}
+
+	setCurrentSessionRemainingTime(remainingSeconds: number): void {
+		if (!this.state.currentSession) {
+			return;
+		}
+
+		const nowMs = Date.now();
+		if (this.state.isRunning) {
+			this.state.timeRemaining = getSessionRemainingSeconds(this.state.currentSession, nowMs);
+		}
+
+		const nextRemainingSeconds = clampPomodoroDurationSeconds(remainingSeconds);
+		const elapsedSeconds = getActiveElapsedSeconds(this.state.currentSession, nowMs);
+		this.state.timeRemaining = nextRemainingSeconds;
+		this.state.currentSession.plannedDuration = (elapsedSeconds + nextRemainingSeconds) / 60;
+
+		void this.saveState();
+
+		this.plugin.emitter.trigger(EVENT_POMODORO_TICK, {
+			timeRemaining: this.state.timeRemaining,
+			session: this.state.currentSession,
+		});
 	}
 
 	public adjustPreparedTimer(newTimeInSeconds: number): void {
@@ -855,11 +1143,8 @@ export class PomodoroService {
 			// Stop the timer if it's running
 			this.stopTimer();
 
-			// Ensure minimum 1 second duration
-			this.state.timeRemaining = Math.max(1, newTimeInSeconds);
-			this.saveState();
-
-			console.log("Adjusted prepared timer to:", this.state.timeRemaining, "seconds");
+			this.state.timeRemaining = clampPomodoroDurationSeconds(newTimeInSeconds);
+			void this.saveState();
 
 			// Trigger tick event to update UI
 			this.plugin.emitter.trigger(EVENT_POMODORO_TICK, {
@@ -901,12 +1186,34 @@ export class PomodoroService {
 			return;
 		}
 
-		// Update the current session's task
-		this.state.currentSession.taskPath = task?.path;
+		const session = this.state.currentSession;
+		const previousTaskPath = session.taskPath;
+		const nextTaskPath = task?.path;
+		const shouldSwitchActiveTracking =
+			this.state.isRunning && session.type === "work" && previousTaskPath !== nextTaskPath;
 
-		if (task?.path) {
-			this.lastWorkSessionTaskPath = task.path;
-			this.lastSelectedTaskPath = task.path;
+		if (shouldSwitchActiveTracking && previousTaskPath) {
+			try {
+				const previousTask = await this.plugin.cacheManager.getTaskInfo(previousTaskPath);
+				if (previousTask) {
+					await this.stopOwnedTimeTracking(session, previousTask);
+				}
+			} catch (error) {
+				tasknotesLogger.error("Failed to stop time tracking for previous Pomodoro task:", {
+					category: "persistence",
+					operation: "stop-time-tracking-previous-pomodoro-task",
+					error: error,
+				});
+			}
+		}
+
+		// Update the current session's task
+		if (previousTaskPath !== nextTaskPath) session.timeTrackingStartTime = undefined;
+		session.taskPath = nextTaskPath;
+
+		if (nextTaskPath) {
+			this.lastWorkSessionTaskPath = nextTaskPath;
+			this.lastSelectedTaskPath = nextTaskPath;
 			this.lastSelectedTaskPathLoaded = true;
 		} else {
 			this.lastWorkSessionTaskPath = undefined;
@@ -916,21 +1223,32 @@ export class PomodoroService {
 
 		await this.saveState();
 
+		if (shouldSwitchActiveTracking && task) {
+			try {
+				await this.startOwnedTimeTracking(session, task);
+			} catch (error) {
+				if (!error.message?.includes("Time tracking is already active")) {
+					tasknotesLogger.error("Failed to start time tracking for new Pomodoro task:", {
+						category: "persistence",
+						operation: "start-time-tracking-new-pomodoro-task",
+						error: error,
+					});
+				}
+			}
+		}
+
 		// Emit tick event to update UI
 		this.plugin.emitter.trigger(EVENT_POMODORO_TICK, {
 			timeRemaining: this.state.timeRemaining,
-			session: this.state.currentSession,
+			session,
 		});
 	}
 
 	// Session History Management
 	async getSessionHistory(): Promise<PomodoroSessionHistory[]> {
 		try {
-			let history: PomodoroSessionHistory[] = [];
-
-			// Load from plugin data (legacy or current storage)
-			const data = await this.plugin.loadData();
-			const pluginHistory = data?.pomodoroHistory || [];
+			const pluginHistory = await this.loadPluginHistory();
+			let history: PomodoroSessionHistory[];
 
 			if (this.plugin.settings.pomodoroStorageLocation === "daily-notes") {
 				// Load from daily notes when that's the primary storage
@@ -948,11 +1266,76 @@ export class PomodoroService {
 			}
 
 			// Sort by start time to maintain chronological order
-			return history.sort(
-				(a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime()
-			);
+			return sortPomodoroSessions(history);
 		} catch (error) {
-			console.error("Failed to load session history:", error);
+			tasknotesLogger.error("Failed to load session history:", {
+				category: "persistence",
+				operation: "load-session-history",
+				error: error,
+			});
+			return [];
+		}
+	}
+
+	async getSessionsForDate(date: Date): Promise<PomodoroSessionHistory[]> {
+		try {
+			const dateKey = formatDateForStorage(date);
+			if (!dateKey) {
+				return [];
+			}
+
+			const pluginHistory = await this.loadPluginHistoryForDateKey(dateKey);
+			let history: PomodoroSessionHistory[];
+
+			if (this.plugin.settings.pomodoroStorageLocation === "daily-notes") {
+				const dailyNotesHistory = await this.loadHistoryFromDailyNoteForDateKey(dateKey);
+				history =
+					pluginHistory.length > 0
+						? this.mergeHistories(pluginHistory, dailyNotesHistory)
+						: dailyNotesHistory;
+			} else {
+				history = pluginHistory;
+			}
+
+			return sortPomodoroSessions(history);
+		} catch (error) {
+			tasknotesLogger.error("Failed to load session history for date:", {
+				category: "validation",
+				operation: "load-session-history-date",
+				error: error,
+			});
+			return [];
+		}
+	}
+
+	async getSessionsForDateRange(
+		startDate: Date,
+		endDate: Date
+	): Promise<PomodoroSessionHistory[]> {
+		try {
+			const pluginHistory = await this.loadPluginHistoryForDateRange(startDate, endDate);
+			let history: PomodoroSessionHistory[];
+
+			if (this.plugin.settings.pomodoroStorageLocation === "daily-notes") {
+				const dailyNotesHistory = await this.loadHistoryFromDailyNotesForDateRange(
+					startDate,
+					endDate
+				);
+				history =
+					pluginHistory.length > 0
+						? this.mergeHistories(pluginHistory, dailyNotesHistory)
+						: dailyNotesHistory;
+			} else {
+				history = pluginHistory;
+			}
+
+			return sortPomodoroSessions(history);
+		} catch (error) {
+			tasknotesLogger.error("Failed to load session history for date range:", {
+				category: "validation",
+				operation: "load-session-history-date-range",
+				error: error,
+			});
 			return [];
 		}
 	}
@@ -963,18 +1346,49 @@ export class PomodoroService {
 				await this.saveHistoryToDailyNotes(history);
 			} else {
 				// Default plugin storage
-				const data = (await this.plugin.loadData()) || {};
-				data.pomodoroHistory = history;
-				await this.plugin.saveData(data);
+				await this.savePluginHistory(history);
 			}
 		} catch (error) {
-			console.error("Failed to save session history:", error);
+			tasknotesLogger.error("Failed to save session history:", {
+				category: "persistence",
+				operation: "save-session-history",
+				error: error,
+			});
 		}
+	}
+
+	async deleteSessionFromHistory(session: PomodoroSessionHistory): Promise<boolean> {
+		let deleted = false;
+
+		try {
+			const pluginHistory = await this.loadPluginHistory();
+			const filteredPluginHistory = pluginHistory.filter((entry) => entry.id !== session.id);
+
+			if (filteredPluginHistory.length !== pluginHistory.length) {
+				await this.savePluginHistory(filteredPluginHistory);
+				deleted = true;
+			}
+
+			if (this.plugin.settings.pomodoroStorageLocation === "daily-notes") {
+				deleted = (await this.deleteSessionFromDailyNote(session)) || deleted;
+			}
+		} catch (error) {
+			tasknotesLogger.error("Failed to delete pomodoro session:", {
+				category: "persistence",
+				operation: "delete-pomodoro-session",
+				error: error,
+			});
+		}
+
+		return deleted;
 	}
 
 	async addSessionToHistory(session: PomodoroSession): Promise<void> {
 		if (!session.endTime) {
-			console.warn("Cannot add session to history without end time");
+			tasknotesLogger.warn("Cannot add session to history without end time", {
+				category: "persistence",
+				operation: "add-session-history-without-end-time",
+			});
 			return;
 		}
 
@@ -1000,50 +1414,27 @@ export class PomodoroService {
 				await this.saveSessionHistory(history);
 			}
 		} catch (error) {
-			console.error("Failed to add session to history:", error);
+			tasknotesLogger.error("Failed to add session to history:", {
+				category: "persistence",
+				operation: "add-session-history",
+				error: error,
+			});
 		}
 	}
 
 	async getStatsForDate(date: Date): Promise<PomodoroHistoryStats> {
-		const dateStr = formatDateForStorage(date);
+		const dayHistory = await this.getSessionsForDate(date);
+		return calculatePomodoroStats(dayHistory);
+	}
+
+	async getStatsForDateRange(startDate: Date, endDate: Date): Promise<PomodoroHistoryStats> {
+		const rangeHistory = await this.getSessionsForDateRange(startDate, endDate);
+		return calculatePomodoroStats(rangeHistory);
+	}
+
+	async getOverallStats(): Promise<PomodoroHistoryStats> {
 		const history = await this.getSessionHistory();
-
-		// Filter sessions for the specific date
-		const dayHistory = history.filter((session) => {
-			const sessionDate = formatDateForStorage(new Date(session.startTime));
-			return sessionDate === dateStr;
-		});
-
-		// Calculate stats for work sessions only
-		const workSessions = dayHistory.filter((session) => session.type === "work");
-		const completedWork = workSessions.filter((session) => session.completed);
-
-		// Calculate current streak (consecutive completed work sessions from latest backwards)
-		let currentStreak = 0;
-		for (let i = workSessions.length - 1; i >= 0; i--) {
-			if (workSessions[i].completed) {
-				currentStreak++;
-			} else {
-				break;
-			}
-		}
-
-		const totalMinutes = completedWork.reduce(
-			(sum, session) => sum + getSessionDuration(session),
-			0
-		);
-		const averageSessionLength =
-			completedWork.length > 0 ? totalMinutes / completedWork.length : 0;
-		const completionRate =
-			workSessions.length > 0 ? (completedWork.length / workSessions.length) * 100 : 0;
-
-		return {
-			pomodorosCompleted: completedWork.length,
-			currentStreak,
-			totalMinutes,
-			averageSessionLength: Math.round(averageSessionLength),
-			completionRate: Math.round(completionRate),
-		};
+		return calculatePomodoroStats(history);
 	}
 
 	async getTodayStats(): Promise<PomodoroHistoryStats> {
@@ -1055,12 +1446,12 @@ export class PomodoroService {
 
 	cleanup() {
 		this.stopTimer();
-		if (this.timerWorker) {
-			this.timerWorker.terminate();
-			this.timerWorker = null;
-		}
+		this.ticker?.destroy();
+		this.ticker = null;
+		this.taskFileRenameUnsubscribe?.();
+		this.taskFileRenameUnsubscribe = undefined;
 		for (const timeout of this.cleanupTimeouts) {
-			clearTimeout(timeout);
+			window.clearTimeout(timeout);
 		}
 		this.cleanupTimeouts.clear();
 		for (const audioContext of this.activeAudioContexts) {
@@ -1069,7 +1460,39 @@ export class PomodoroService {
 			}
 		}
 		this.activeAudioContexts.clear();
-		this.saveState();
+		void this.saveState();
+	}
+
+	private async loadPluginHistory(): Promise<PomodoroSessionHistory[]> {
+		const data = (await this.plugin.loadData()) as {
+			pomodoroHistory?: PomodoroSessionHistory[];
+		} | null;
+		const pluginHistory = data?.pomodoroHistory;
+		return Array.isArray(pluginHistory) ? pluginHistory : [];
+	}
+
+	private async savePluginHistory(history: PomodoroSessionHistory[]): Promise<void> {
+		await withPluginDataWriteLock(this.plugin, async () => {
+			const data = await this.plugin.loadPluginDataForSafeWrite("save-pomodoro-history");
+			if (!data) return;
+			data.pomodoroHistory = history;
+			await this.plugin.saveData(data);
+		});
+	}
+
+	private async loadPluginHistoryForDateKey(dateKey: string): Promise<PomodoroSessionHistory[]> {
+		return filterPomodoroSessionsByDateKey(await this.loadPluginHistory(), dateKey);
+	}
+
+	private async loadPluginHistoryForDateRange(
+		startDate: Date,
+		endDate: Date
+	): Promise<PomodoroSessionHistory[]> {
+		return filterPomodoroSessionsByDateRange(
+			await this.loadPluginHistory(),
+			startDate,
+			endDate
+		);
 	}
 
 	/**
@@ -1077,9 +1500,11 @@ export class PomodoroService {
 	 */
 	private async saveHistoryToDailyNotes(history: PomodoroSessionHistory[]): Promise<void> {
 		try {
-			// Check if Daily Notes plugin is enabled
+			// Check if a daily notes provider is enabled.
 			if (!appHasDailyNotesPluginLoaded()) {
-				throw new Error("Daily Notes core plugin is not enabled");
+				throw new Error(
+					"Daily notes must be enabled in the core Daily Notes plugin or Periodic Notes"
+				);
 			}
 
 			// Group sessions by date
@@ -1090,8 +1515,72 @@ export class PomodoroService {
 				await this.updateDailyNotePomodoros(dateStr, sessions);
 			}
 		} catch (error) {
-			console.error("Failed to save history to daily notes:", error);
+			tasknotesLogger.error("Failed to save history to daily notes:", {
+				category: "persistence",
+				operation: "save-history-daily-notes",
+				error: error,
+			});
 			throw error;
+		}
+	}
+
+	private async loadHistoryFromDailyNotesForDateRange(
+		startDate: Date,
+		endDate: Date
+	): Promise<PomodoroSessionHistory[]> {
+		try {
+			if (!appHasDailyNotesPluginLoaded()) {
+				return [];
+			}
+
+			const allDailyNotes = getAllDailyNotes();
+			const history: PomodoroSessionHistory[] = [];
+
+			for (const dateKey of getPomodoroDateKeysInRange(startDate, endDate)) {
+				const sessions = await this.loadHistoryFromDailyNoteForDateKey(
+					dateKey,
+					allDailyNotes
+				);
+				history.push(...sessions);
+			}
+
+			return history;
+		} catch (error) {
+			tasknotesLogger.error("Failed to load history from daily notes for date range:", {
+				category: "validation",
+				operation: "load-history-daily-notes-date-range",
+				error: error,
+			});
+			return [];
+		}
+	}
+
+	private async loadHistoryFromDailyNoteForDateKey(
+		dateKey: string,
+		allDailyNotes?: Record<string, TFile>
+	): Promise<PomodoroSessionHistory[]> {
+		try {
+			if (!dateKey || !appHasDailyNotesPluginLoaded()) {
+				return [];
+			}
+
+			const dailyNotes = allDailyNotes ?? getAllDailyNotes();
+			const date = parseDateToLocal(dateKey);
+			const dailyNoteMoment = getDailyNoteMoment(date);
+			const dailyNote = getDailyNote(dailyNoteMoment, dailyNotes);
+
+			if (!dailyNote) {
+				return [];
+			}
+
+			return this.readPomodoroSessionsFromDailyNote(dailyNote);
+		} catch (error) {
+			tasknotesLogger.warn(`Failed to load pomodoro history for daily note ${dateKey}:`, {
+				category: "persistence",
+				operation: "load-pomodoro-history-daily-note",
+				error: error,
+			});
+			return [];
 		}
 	}
 
@@ -1107,33 +1596,41 @@ export class PomodoroService {
 
 			const allHistory: PomodoroSessionHistory[] = [];
 			const allDailyNotes = getAllDailyNotes();
-			const pomodoroField = this.plugin.fieldMapper.toUserField("pomodoros");
 
 			// Read from each daily note
 			for (const [, file] of Object.entries(allDailyNotes)) {
 				try {
-					const cache = this.plugin.app.metadataCache.getFileCache(file);
-					const frontmatter = cache?.frontmatter;
-
-					if (frontmatter && frontmatter[pomodoroField]) {
-						const sessions = frontmatter[pomodoroField];
-						if (Array.isArray(sessions)) {
-							allHistory.push(...sessions);
-						}
-					}
+					allHistory.push(...this.readPomodoroSessionsFromDailyNote(file));
 				} catch (error) {
-					console.warn(
+					tasknotesLogger.warn(
 						`Failed to read pomodoro data from daily note ${file.path}:`,
-						error
+						{
+							category: "persistence",
+							operation: "read-pomodoro-data-daily-note",
+							error: error,
+						}
 					);
 				}
 			}
 
 			return allHistory;
 		} catch (error) {
-			console.error("Failed to load history from daily notes:", error);
+			tasknotesLogger.error("Failed to load history from daily notes:", {
+				category: "persistence",
+				operation: "load-history-daily-notes",
+				error: error,
+			});
 			return [];
 		}
+	}
+
+	private readPomodoroSessionsFromDailyNote(file: TFile): PomodoroSessionHistory[] {
+		const cache = this.plugin.app.metadataCache.getFileCache(file);
+		const frontmatter = cache?.frontmatter;
+		const pomodoroField = this.plugin.fieldMapper.toUserField("pomodoros");
+		const sessions = frontmatter?.[pomodoroField];
+
+		return Array.isArray(sessions) ? sessions.filter(isPomodoroSessionHistory) : [];
 	}
 
 	/**
@@ -1145,8 +1642,11 @@ export class PomodoroService {
 		const grouped = new Map<string, PomodoroSessionHistory[]>();
 
 		for (const session of history) {
-			const date = new Date(session.startTime);
-			const dateStr = formatDateForStorage(date);
+			const dateStr = getPomodoroSessionDateKey(session);
+
+			if (!dateStr) {
+				continue;
+			}
 
 			if (!grouped.has(dateStr)) {
 				grouped.set(dateStr, []);
@@ -1162,15 +1662,20 @@ export class PomodoroService {
 	 */
 	private async addSingleSessionToDailyNote(session: PomodoroSessionHistory): Promise<void> {
 		try {
-			const sessionDate = new Date(session.startTime);
-			const moment = (window as any).moment(sessionDate);
+			const sessionDateKey = getPomodoroSessionDateKey(session);
+			if (!sessionDateKey) {
+				throw new Error(`Invalid Pomodoro session start time: ${session.startTime}`);
+			}
+
+			const sessionDate = parseDateToLocal(sessionDateKey);
+			const dailyNoteMoment = getDailyNoteMoment(sessionDate);
 
 			// Get or create daily note
 			const allDailyNotes = getAllDailyNotes();
-			let dailyNote = getDailyNote(moment, allDailyNotes);
+			let dailyNote = getDailyNote(dailyNoteMoment, allDailyNotes);
 
 			if (!dailyNote) {
-				dailyNote = await createDailyNote(moment);
+				dailyNote = await createDailyNote(dailyNoteMoment);
 
 				// Validate that daily note was created successfully
 				if (!dailyNote) {
@@ -1183,10 +1688,12 @@ export class PomodoroService {
 			// Update frontmatter
 			const pomodoroField = this.plugin.fieldMapper.toUserField("pomodoros");
 
-			await this.plugin.app.fileManager.processFrontMatter(dailyNote, (frontmatter) => {
+			await processVaultFrontMatter(this.plugin.app, dailyNote, (frontmatter) => {
 				// Get existing sessions
-				const existingSessions = frontmatter[pomodoroField] || [];
-				const existingIds = new Set(existingSessions.map((s: any) => s.id));
+				const existingSessions = Array.isArray(frontmatter[pomodoroField])
+					? frontmatter[pomodoroField].filter(isPomodoroSessionHistory)
+					: [];
+				const existingIds = new Set(existingSessions.map((s) => s.id));
 
 				// Only add session if it doesn't already exist
 				if (!existingIds.has(session.id)) {
@@ -1194,7 +1701,58 @@ export class PomodoroService {
 				}
 			});
 		} catch (error) {
-			console.error(`Failed to add session to daily note:`, error);
+			tasknotesLogger.error(`Failed to add session to daily note:`, {
+				category: "persistence",
+				operation: "add-session-daily-note",
+				error: error,
+			});
+		}
+	}
+
+	private async deleteSessionFromDailyNote(session: PomodoroSessionHistory): Promise<boolean> {
+		try {
+			if (!appHasDailyNotesPluginLoaded()) {
+				return false;
+			}
+
+			const sessionDateKey = getPomodoroSessionDateKey(session);
+			if (!sessionDateKey) {
+				return false;
+			}
+
+			const sessionDate = parseDateToLocal(sessionDateKey);
+			const dailyNoteMoment = getDailyNoteMoment(sessionDate);
+			const dailyNote = getDailyNote(dailyNoteMoment, getAllDailyNotes());
+
+			if (!dailyNote) {
+				return false;
+			}
+
+			const pomodoroField = this.plugin.fieldMapper.toUserField("pomodoros");
+			let deleted = false;
+
+			await processVaultFrontMatter(this.plugin.app, dailyNote, (frontmatter) => {
+				const existingSessions = Array.isArray(frontmatter[pomodoroField])
+					? frontmatter[pomodoroField].filter(isPomodoroSessionHistory)
+					: [];
+				const filteredSessions = existingSessions.filter(
+					(entry) => entry.id !== session.id
+				);
+
+				if (filteredSessions.length !== existingSessions.length) {
+					frontmatter[pomodoroField] = filteredSessions;
+					deleted = true;
+				}
+			});
+
+			return deleted;
+		} catch (error) {
+			tasknotesLogger.error(`Failed to delete pomodoro session from daily note:`, {
+				category: "persistence",
+				operation: "delete-pomodoro-session-daily-note",
+				error: error,
+			});
+			return false;
 		}
 	}
 
@@ -1207,14 +1765,14 @@ export class PomodoroService {
 	): Promise<void> {
 		try {
 			const date = parseDateToLocal(dateStr); // Use local date for daily note creation
-			const moment = (window as any).moment(date);
+			const dailyNoteMoment = getDailyNoteMoment(date);
 
 			// Get or create daily note
 			const allDailyNotes = getAllDailyNotes();
-			let dailyNote = getDailyNote(moment, allDailyNotes);
+			let dailyNote = getDailyNote(dailyNoteMoment, allDailyNotes);
 
 			if (!dailyNote) {
-				dailyNote = await createDailyNote(moment);
+				dailyNote = await createDailyNote(dailyNoteMoment);
 
 				// Validate that daily note was created successfully
 				if (!dailyNote) {
@@ -1227,10 +1785,12 @@ export class PomodoroService {
 			// Update frontmatter
 			const pomodoroField = this.plugin.fieldMapper.toUserField("pomodoros");
 
-			await this.plugin.app.fileManager.processFrontMatter(dailyNote, (frontmatter) => {
+			await processVaultFrontMatter(this.plugin.app, dailyNote, (frontmatter) => {
 				// Get existing sessions and append new ones
-				const existingSessions = frontmatter[pomodoroField] || [];
-				const existingIds = new Set(existingSessions.map((s: any) => s.id));
+				const existingSessions = Array.isArray(frontmatter[pomodoroField])
+					? frontmatter[pomodoroField].filter(isPomodoroSessionHistory)
+					: [];
+				const existingIds = new Set(existingSessions.map((s) => s.id));
 
 				// Only add sessions that don't already exist
 				const newSessions = sessions.filter((session) => !existingIds.has(session.id));
@@ -1240,7 +1800,11 @@ export class PomodoroService {
 				}
 			});
 		} catch (error) {
-			console.error(`Failed to update daily note for ${dateStr}:`, error);
+			tasknotesLogger.error(`Failed to update daily note for ${dateStr}:`, {
+				category: "validation",
+				operation: "update-daily-note",
+				error: error,
+			});
 		}
 	}
 
@@ -1269,35 +1833,65 @@ export class PomodoroService {
 	 */
 	async migrateTodailyNotes(): Promise<void> {
 		try {
-			// Check if Daily Notes plugin is enabled
+			// Check if a daily notes provider is enabled.
 			if (!appHasDailyNotesPluginLoaded()) {
-				throw new Error("Daily Notes core plugin must be enabled for migration");
+				throw new Error(
+					"Daily notes must be enabled in the core Daily Notes plugin or Periodic Notes for migration"
+				);
 			}
 
 			// Load existing plugin data
-			const data = await this.plugin.loadData();
-			const pluginHistory = data?.pomodoroHistory || [];
+			await withPluginDataWriteLock(this.plugin, async () => {
+				const data = (await this.plugin.loadData()) as {
+					pomodoroHistory?: PomodoroSessionHistory[];
+				} | null;
+				if (!data) return;
+				const pluginHistory = data.pomodoroHistory || [];
 
-			if (pluginHistory.length === 0) {
-				return; // Nothing to migrate
-			}
+				if (pluginHistory.length === 0) {
+					return; // Nothing to migrate
+				}
 
-			// Save to daily notes
-			await this.saveHistoryToDailyNotes(pluginHistory);
+				// Save to daily notes
+				await this.saveHistoryToDailyNotes(pluginHistory);
 
-			// Clear plugin data after successful migration
-			data.pomodoroHistory = [];
-			await this.plugin.saveData(data);
+				// Clear plugin data after successful migration
+				data.pomodoroHistory = [];
+				await this.plugin.saveData(data);
 
-			new Notice(
-				this.translate("services.pomodoro.notices.migrationSuccess", {
-					count: pluginHistory.length,
-				})
-			);
+				publishUserNotice(
+					this.plugin.emitter,
+					this.translate(
+						msg({
+							message:
+								"Successfully migrated {count} pomodoro sessions to daily notes.",
+							context: "services.pomodoro.notices.migrationSuccess",
+						}),
+						{
+							count: pluginHistory.length,
+						}
+					)
+				);
+			});
 		} catch (error) {
-			console.error("Failed to migrate pomodoro data to daily notes:", error);
-			new Notice(this.translate("services.pomodoro.notices.migrationFailure"));
+			tasknotesLogger.error("Failed to migrate pomodoro data to daily notes:", {
+				category: "persistence",
+				operation: "migrate-pomodoro-data-daily-notes",
+				error: error,
+			});
+			publishUserNotice(
+				this.plugin.emitter,
+				this.translate(
+					msg({
+						message:
+							"Failed to migrate Pomodoro data. Please try again or check the console for details.",
+						context: "services.pomodoro.notices.migrationFailure",
+					})
+				)
+			);
 			throw error;
 		}
 	}
 }
+
+/* eslint-enable @typescript-eslint/no-non-null-assertion -- Re-enable after the Pomodoro service implementation. */

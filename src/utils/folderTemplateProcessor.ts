@@ -1,4 +1,8 @@
+import { formatStableDate } from "../i18n/formatters";
 import { format } from "date-fns";
+import { createTaskNotesLogger } from "./tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Utils/FolderTemplateProcessor" });
 
 /**
  * Data for processing task-specific template variables
@@ -26,6 +30,9 @@ export interface ICSTemplateData {
  * Options for processing folder templates
  */
 export interface FolderTemplateOptions {
+	/** Literal current-note values, expanded after date and task variables. */
+	currentNote?: { path: string; title: string };
+
 	/**
 	 * Date to use for date-based template variables
 	 * @default new Date()
@@ -47,12 +54,143 @@ export interface FolderTemplateOptions {
 	 * Used to handle wikilink formatting and path resolution
 	 */
 	extractProjectBasename?: (project: string) => string;
+
+	/**
+	 * Optional function to extract the full file path from a project string
+	 * Used to handle wikilink formatting and path resolution
+	 */
+	extractProjectFilePath?: (project: string) => string;
+}
+
+const DAILY_NOTES_DATE_TOKEN_FORMATS: Record<string, string> = {
+	YYYY: "yyyy",
+	YY: "yy",
+	MMMM: "MMMM",
+	MMM: "MMM",
+	MM: "MM",
+	DD: "dd",
+	dddd: "EEEE",
+	ddd: "EEE",
+};
+
+const DAILY_NOTES_DATE_TOKEN_PATTERN = /YYYY|MMMM|dddd|MMM|ddd|YY|MM|DD/g;
+
+function replaceDailyNotesDateTokens(template: string, date: Date): string {
+	return template.replace(DAILY_NOTES_DATE_TOKEN_PATTERN, (token) =>
+		formatStableDate(date, DAILY_NOTES_DATE_TOKEN_FORMATS[token])
+	);
+}
+
+function hasRelativePathSegments(folderPath: string): boolean {
+	return folderPath
+		.replace(/\\/g, "/")
+		.split("/")
+		.some((segment) => segment === "." || segment === "..");
+}
+
+function normalizeRelativeFolderPath(folderPath: string): string {
+	const slashNormalizedPath = folderPath.replace(/\\/g, "/");
+	const preserveTrailingSlash = slashNormalizedPath.endsWith("/");
+	const normalizedSegments: string[] = [];
+
+	for (const segment of slashNormalizedPath.split("/")) {
+		if (!segment || segment === ".") {
+			continue;
+		}
+
+		if (segment === "..") {
+			normalizedSegments.pop();
+			continue;
+		}
+
+		normalizedSegments.push(segment);
+	}
+
+	const normalizedPath = normalizedSegments.join("/");
+	return preserveTrailingSlash && normalizedPath ? `${normalizedPath}/` : normalizedPath;
+}
+
+function stripMarkdownExtension(path: string): string {
+	return path.replace(/\.md$/i, "");
+}
+
+function parseProjectFilePath(project: string): string {
+	const trimmed = project.trim();
+	if (!trimmed) {
+		return "";
+	}
+
+	if (trimmed.startsWith("[[") && trimmed.endsWith("]]")) {
+		const linkContent = trimmed.slice(2, -2).trim();
+		const pipeIndex = linkContent.indexOf("|");
+		const path = pipeIndex !== -1 ? linkContent.slice(0, pipeIndex) : linkContent;
+		return stripMarkdownExtension(path.trim());
+	}
+
+	const markdownMatch = trimmed.match(/^\[[^\]]*\]\(([^)]+)\)$/);
+	if (markdownMatch) {
+		let linkPath = markdownMatch[1].trim();
+		if (linkPath.startsWith("<") && linkPath.endsWith(">")) {
+			linkPath = linkPath.slice(1, -1).trim();
+		}
+		try {
+			linkPath = decodeURIComponent(linkPath);
+		} catch (error) {
+			tasknotesLogger.debug("Failed to decode project path:", {
+				category: "persistence",
+				operation: "decode-project-path",
+				details: { value: linkPath },
+				error: error,
+			});
+		}
+		return stripMarkdownExtension(linkPath);
+	}
+
+	return stripMarkdownExtension(trimmed);
+}
+
+function sanitizeProjectFilePath(path: string): string {
+	const normalizedPath = stripMarkdownExtension(path.trim()).replace(/\\/g, "/");
+	return normalizedPath
+		.split("/")
+		.filter((segment) => segment.length > 0)
+		.map((segment) => segment.replace(/[<>:"|?*]/g, "_"))
+		.join("/");
+}
+
+function getProjectFilePath(
+	project: string,
+	extractProjectFilePath?: (project: string) => string
+): string {
+	const rawPath = extractProjectFilePath
+		? extractProjectFilePath(project)
+		: parseProjectFilePath(project);
+	return sanitizeProjectFilePath(rawPath);
+}
+
+/**
+ * Get the folder that contains a project note, i.e. the project file path with
+ * its final (basename) segment removed. Returns an empty string when the
+ * project note lives at the top level with no containing folder.
+ */
+function getProjectFolder(
+	project: string,
+	extractProjectFilePath?: (project: string) => string
+): string {
+	const filePath = getProjectFilePath(project, extractProjectFilePath);
+	if (!filePath) {
+		return "";
+	}
+	return filePath.split("/").slice(0, -1).join("/");
 }
 
 /**
  * Process a folder path template by replacing template variables with actual values
  *
  * Supported template variables:
+ *
+ * Daily Notes-style date tokens:
+ * - YYYY, YY, MMMM, MMM, MM, DD, dddd, ddd
  *
  * Date variables:
  * - {{year}}, {{month}}, {{day}}, {{date}}
@@ -69,6 +207,8 @@ export interface FolderTemplateOptions {
  * Task variables (when taskData is provided):
  * - {{context}}, {{contexts}} - First context or all contexts joined with /
  * - {{project}}, {{projects}} - First project or all projects joined with /
+ * - {{projectFilePath}}, {{projectFilePaths}} - First project path or all project paths joined with /
+ * - {{projectFolder}}, {{projectFolders}} - Folder containing the first project note or all project folders joined with /
  * - {{priority}}, {{priorityShort}}
  * - {{status}}, {{statusShort}}
  * - {{title}}, {{titleLower}}, {{titleUpper}}, {{titleSnake}}, {{titleKebab}}, {{titleCamel}}, {{titlePascal}}
@@ -111,9 +251,18 @@ export function processFolderTemplate(
 		return folderTemplate;
 	}
 
-	const { date = new Date(), taskData, icsData, extractProjectBasename } = options;
+	const {
+		date = new Date(),
+		taskData,
+		icsData,
+		extractProjectBasename,
+		extractProjectFilePath,
+	} = options;
 
 	let processedPath = folderTemplate;
+	const shouldNormalizeRelativeSegments = hasRelativePathSegments(folderTemplate);
+
+	processedPath = replaceDailyNotesDateTokens(processedPath, date);
 
 	// Replace task variables if taskData is provided
 	if (taskData) {
@@ -137,10 +286,44 @@ export function processFolderTemplate(
 		const projects =
 			Array.isArray(taskData.projects) && taskData.projects.length > 0
 				? taskData.projects
-						.map((proj) => (extractProjectBasename ? extractProjectBasename(proj) : proj))
+						.map((proj) =>
+							extractProjectBasename ? extractProjectBasename(proj) : proj
+						)
 						.join("/")
 				: "";
 		processedPath = processedPath.replace(/\{\{projects\}\}/g, projects);
+
+		// Handle full project file paths while preserving path separators
+		const projectFilePath =
+			Array.isArray(taskData.projects) && taskData.projects.length > 0
+				? getProjectFilePath(taskData.projects[0], extractProjectFilePath)
+				: "";
+		processedPath = processedPath.replace(/\{\{projectFilePath\}\}/g, projectFilePath);
+
+		const projectFilePaths =
+			Array.isArray(taskData.projects) && taskData.projects.length > 0
+				? taskData.projects
+						.map((proj) => getProjectFilePath(proj, extractProjectFilePath))
+						.filter((path) => path.length > 0)
+						.join("/")
+				: "";
+		processedPath = processedPath.replace(/\{\{projectFilePaths\}\}/g, projectFilePaths);
+
+		// Handle project folder (folder containing the first project note)
+		const projectFolder =
+			Array.isArray(taskData.projects) && taskData.projects.length > 0
+				? getProjectFolder(taskData.projects[0], extractProjectFilePath)
+				: "";
+		processedPath = processedPath.replace(/\{\{projectFolder\}\}/g, projectFolder);
+
+		const projectFolders =
+			Array.isArray(taskData.projects) && taskData.projects.length > 0
+				? taskData.projects
+						.map((proj) => getProjectFolder(proj, extractProjectFilePath))
+						.filter((folder) => folder.length > 0)
+						.join("/")
+				: "";
+		processedPath = processedPath.replace(/\{\{projectFolders\}\}/g, projectFolders);
 
 		// Handle multiple contexts
 		const contexts =
@@ -198,9 +381,7 @@ export function processFolderTemplate(
 		processedPath = processedPath.replace(/\{\{titleCamel\}\}/g, titleCamel);
 
 		const titlePascal = title
-			? title
-					.replace(/(?:^\w|[A-Z]|\b\w)/g, (word) => word.toUpperCase())
-					.replace(/\s+/g, "")
+			? title.replace(/(?:^\w|[A-Z]|\b\w)/g, (word) => word.toUpperCase()).replace(/\s+/g, "")
 			: "";
 		processedPath = processedPath.replace(/\{\{titlePascal\}\}/g, titlePascal);
 	}
@@ -274,19 +455,19 @@ export function processFolderTemplate(
 	// New date format variations
 	processedPath = processedPath.replace(/\{\{shortDate\}\}/g, format(date, "yyMMdd"));
 	processedPath = processedPath.replace(/\{\{shortYear\}\}/g, format(date, "yy"));
-	processedPath = processedPath.replace(/\{\{monthName\}\}/g, format(date, "MMMM"));
-	processedPath = processedPath.replace(/\{\{monthNameShort\}\}/g, format(date, "MMM"));
-	processedPath = processedPath.replace(/\{\{dayName\}\}/g, format(date, "EEEE"));
-	processedPath = processedPath.replace(/\{\{dayNameShort\}\}/g, format(date, "EEE"));
+	processedPath = processedPath.replace(/\{\{monthName\}\}/g, formatStableDate(date, "MMMM"));
+	processedPath = processedPath.replace(/\{\{monthNameShort\}\}/g, formatStableDate(date, "MMM"));
+	processedPath = processedPath.replace(/\{\{dayName\}\}/g, formatStableDate(date, "EEEE"));
+	processedPath = processedPath.replace(/\{\{dayNameShort\}\}/g, formatStableDate(date, "EEE"));
 	processedPath = processedPath.replace(/\{\{week\}\}/g, format(date, "ww"));
 	processedPath = processedPath.replace(/\{\{quarter\}\}/g, format(date, "q"));
 
 	// Time variations
-	processedPath = processedPath.replace(/\{\{time12\}\}/g, format(date, "hh:mm a"));
+	processedPath = processedPath.replace(/\{\{time12\}\}/g, formatStableDate(date, "hh:mm a"));
 	processedPath = processedPath.replace(/\{\{time24\}\}/g, format(date, "HH:mm"));
 	processedPath = processedPath.replace(/\{\{hourPadded\}\}/g, format(date, "HH"));
 	processedPath = processedPath.replace(/\{\{hour12\}\}/g, format(date, "hh"));
-	processedPath = processedPath.replace(/\{\{ampm\}\}/g, format(date, "a"));
+	processedPath = processedPath.replace(/\{\{ampm\}\}/g, formatStableDate(date, "a"));
 
 	// Unix timestamp and milliseconds
 	processedPath = processedPath.replace(
@@ -318,5 +499,15 @@ export function processFolderTemplate(
 	const nanoId = Date.now().toString() + Math.random().toString(36).substring(2, 7);
 	processedPath = processedPath.replace(/\{\{nano\}\}/g, nanoId);
 
-	return processedPath;
+	if (options.currentNote) {
+		const currentNote = options.currentNote;
+		processedPath = processedPath.replace(
+			/\{\{currentNote(Path|Title)\}\}/g,
+			(_match, field: string) => field === "Path" ? currentNote.path : currentNote.title
+		);
+	}
+
+	return shouldNormalizeRelativeSegments
+		? normalizeRelativeFolderPath(processedPath)
+		: processedPath;
 }

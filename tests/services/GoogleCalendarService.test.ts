@@ -8,7 +8,12 @@ import { GoogleCalendarError, RateLimitError, EventNotFoundError } from '../../s
 jest.mock('obsidian', () => ({
 	Notice: jest.fn(),
 	requestUrl: jest.fn(),
-	Platform: { isDesktopApp: true }
+	Platform: { isDesktopApp: true },
+	sanitizeHTMLToDom: (html: string) => {
+		const template = document.createElement('template');
+		template.innerHTML = html;
+		return template.content;
+	}
 }));
 
 describe('GoogleCalendarService', () => {
@@ -111,6 +116,36 @@ describe('GoogleCalendarService', () => {
 			);
 		});
 
+		test.each([
+			['user-set name', 'Running', 'Running'],
+			['missing override', undefined, 'Original Calendar'],
+			['empty override', '', 'Original Calendar'],
+		])('should resolve calendar summary with %s (#2411)', async (_, summaryOverride, expectedSummary) => {
+			const calendar = {
+				id: 'subscribed@example.com',
+				summary: 'Original Calendar',
+				summaryOverride,
+				description: 'Subscribed calendar',
+				backgroundColor: '#f83a22',
+				primary: false,
+			};
+			mockRequestUrl.mockResolvedValueOnce({
+				status: 200,
+				json: { items: [calendar] },
+				text: '',
+				arrayBuffer: new ArrayBuffer(0),
+				headers: {}
+			});
+
+			expect(await service.listCalendars()).toEqual([{
+				id: calendar.id,
+				summary: expectedSummary,
+				description: calendar.description,
+				backgroundColor: calendar.backgroundColor,
+				primary: false,
+			}]);
+		});
+
 		test('should handle empty calendar list', async () => {
 			mockRequestUrl.mockResolvedValueOnce({
 				status: 200,
@@ -155,6 +190,39 @@ describe('GoogleCalendarService', () => {
 			});
 			expect(events[0].allDay).toBe(false);
 			expect(events[1].allDay).toBe(true);
+		});
+
+		test('should normalize HTML descriptions without changing angle-bracketed text', async () => {
+			mockRequestUrl.mockResolvedValueOnce({
+				status: 200,
+				json: {
+					items: [
+						{
+							id: 'html-description',
+							summary: 'HTML description',
+							description: '<p>Agenda</p><ul><li>First item</li></ul>',
+							start: { date: '2025-10-22' },
+							end: { date: '2025-10-23' }
+						},
+						{
+							id: 'plain-description',
+							summary: 'Plain description',
+							description: 'Contact <user@example.com>; venue <TBC>',
+							start: { date: '2025-10-23' },
+							end: { date: '2025-10-24' }
+						}
+					],
+					nextSyncToken: 'sync-token-123'
+				},
+				text: '',
+				arrayBuffer: new ArrayBuffer(0),
+				headers: {}
+			});
+
+			const events = await service.getEvents('primary');
+
+			expect(events[0].description).toBe('Agenda\n\n- First item');
+			expect(events[1].description).toBe('Contact <user@example.com>; venue <TBC>');
 		});
 
 		test('should use sync token for incremental updates', async () => {
@@ -226,6 +294,58 @@ describe('GoogleCalendarService', () => {
 			const events = await service.getEvents('primary');
 			// Cancelled events should be filtered out or marked
 			expect(events.every(e => e.id !== 'deleted-event')).toBe(true);
+		});
+
+		test('should include six months of historical events on a fresh full sync', async () => {
+			jest.useFakeTimers().setSystemTime(new Date('2026-06-09T12:00:00Z'));
+
+			mockRequestUrl.mockResolvedValueOnce({
+				status: 200,
+				json: { items: [], nextSyncToken: 'sync-token-123' },
+				text: '',
+				arrayBuffer: new ArrayBuffer(0),
+				headers: {}
+			});
+
+			await service.getEvents('primary');
+
+			const request = mockRequestUrl.mock.calls[0]?.[0];
+			expect(request).toBeDefined();
+			const params = new URL(request.url).searchParams;
+			expect(params.get('timeMin')).toBe('2025-12-11T12:00:00.000Z');
+			expect(params.get('timeMax')).toBe('2026-09-07T12:00:00.000Z');
+
+			jest.useRealTimers();
+		});
+	});
+
+	describe('availability serialization (#2375)', () => {
+		const currentEvent = {
+			id: 'availability-event', summary: 'Task',
+			start: { date: '2026-10-01' }, end: { date: '2026-10-02' },
+			transparency: 'transparent',
+		};
+		const response = (json: unknown) => ({
+			status: 200, json, text: '', arrayBuffer: new ArrayBuffer(0), headers: {},
+		});
+
+		beforeEach(() => {
+			jest.spyOn(service, 'refreshAllCalendars').mockResolvedValue(undefined);
+		});
+
+		test.each(['opaque', 'transparent'] as const)('serializes %s when creating events', async (transparency) => {
+			mockRequestUrl.mockResolvedValueOnce(response(currentEvent));
+			await service.createEvent('primary', { ...currentEvent, transparency });
+			expect(JSON.parse(mockRequestUrl.mock.calls[0][0].body as string).transparency).toBe(transparency);
+		});
+
+		test.each(['opaque', 'transparent', undefined] as const)('updates or preserves availability with %s', async (transparency) => {
+			mockRequestUrl.mockResolvedValueOnce(response(currentEvent));
+			mockRequestUrl.mockResolvedValueOnce(response(currentEvent));
+			await service.updateEvent('primary', currentEvent.id, { summary: 'Updated task', transparency });
+			const payload = JSON.parse(mockRequestUrl.mock.calls[1][0].body as string);
+			expect(payload.transparency).toBe(transparency ?? currentEvent.transparency);
+			expect(payload.start).toEqual(currentEvent.start);
 		});
 	});
 
@@ -420,6 +540,47 @@ describe('GoogleCalendarService', () => {
 					method: 'PUT'
 				})
 			);
+		});
+
+		test('should restore cancelled events when updating existing event IDs', async () => {
+			mockRequestUrl.mockResolvedValueOnce({
+				status: 200,
+				json: {
+					id: 'event1',
+					status: 'cancelled',
+					summary: 'Deleted Task',
+					start: { date: '2026-04-29' },
+					end: { date: '2026-04-30' }
+				},
+				text: '',
+				arrayBuffer: new ArrayBuffer(0),
+				headers: {}
+			});
+
+			mockRequestUrl.mockResolvedValueOnce({
+				status: 200,
+				json: {
+					id: 'event1',
+					status: 'confirmed',
+					summary: 'Restored Task',
+					start: { date: '2026-04-29' },
+					end: { date: '2026-04-30' },
+					htmlLink: 'https://calendar.google.com/event'
+				},
+				text: '',
+				arrayBuffer: new ArrayBuffer(0),
+				headers: {}
+			});
+
+			await service.updateEvent('primary', 'event1', {
+				summary: 'Restored Task',
+				start: { date: '2026-04-29' },
+				end: { date: '2026-04-30' }
+			});
+
+			const requestBody = JSON.parse(mockRequestUrl.mock.calls[1][0].body as string);
+			expect(requestBody.status).toBe('confirmed');
+			expect(requestBody.summary).toBe('Restored Task');
 		});
 
 		test('should handle converting timed event to all-day', async () => {

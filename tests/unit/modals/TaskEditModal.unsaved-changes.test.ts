@@ -1,3 +1,4 @@
+import { observeTranslation as mockObserveTranslation, englishText as mockEnglishText, conceptDescriptor as mockConceptDescriptor } from "../../helpers/real-i18n";
 /**
  * TaskEditModal Unsaved Changes Tests
  *
@@ -5,16 +6,15 @@
  * Following TDD principles with comprehensive test coverage.
  */
 
+import { TaskModal } from '../../../src/modals/TaskModal';
 import { TaskEditModal } from '../../../src/modals/TaskEditModal';
 import { ConfirmationModal } from '../../../src/modals/ConfirmationModal';
-import { MockObsidian } from '../../__mocks__/obsidian';
+import { MockObsidian } from '../../helpers/obsidian-runtime';
 import type { App } from 'obsidian';
 import { TaskInfo } from '../../../src/types';
 
 // Type helper to safely cast mock App to real App type
 const createMockApp = (mockApp: any): App => mockApp as unknown as App;
-
-jest.mock('obsidian');
 
 // Mock ConfirmationModal with callback support for thirdButton
 jest.mock('../../../src/modals/ConfirmationModal', () => ({
@@ -65,19 +65,7 @@ describe('TaskEditModal - Unsaved Changes Detection', () => {
         getTaskInfo: jest.fn(),
       },
       i18n: {
-        translate: jest.fn((key: string, _vars?: any) => {
-          const translations: Record<string, string> = {
-            'modals.taskEdit.title': 'Edit Task',
-            'modals.taskEdit.notices.titleRequired': 'Title is required',
-            'modals.task.unsavedChanges.title': 'Unsaved Changes',
-            'modals.task.unsavedChanges.message': 'You have unsaved changes. Do you want to save them?',
-            'modals.task.unsavedChanges.save': 'Save Changes',
-            'modals.task.unsavedChanges.discard': 'Discard Changes',
-            'modals.task.unsavedChanges.cancel': 'Keep Editing',
-            'common.cancel': 'Cancel',
-          };
-          return translations[key] || key;
-        }),
+        translate: mockObserveTranslation(),
       },
       t: jest.fn((key: string, _vars?: any) => {
         const translations: Record<string, string> = {
@@ -121,15 +109,15 @@ describe('TaskEditModal - Unsaved Changes Detection', () => {
   // Helper function to initialize modal fields from task
   const initializeModalFields = (modal: TaskEditModal, task: TaskInfo) => {
     (modal as any).task = task;
-    (modal as any).title = task.title;
-    (modal as any).status = task.status;
-    (modal as any).priority = task.priority;
-    (modal as any).dueDate = task.due || '';
-    (modal as any).scheduledDate = task.scheduled || '';
-    (modal as any).contexts = task.contexts?.join(', ') || '';
-    (modal as any).projects = task.projects?.join(', ') || '';
-    (modal as any).tags = task.tags?.filter(t => t !== 'task').join(', ') || '';
-    (modal as any).details = task.details || '';
+    (modal as any).form.values.title = task.title;
+    (modal as any).form.values.status = task.status;
+    (modal as any).form.values.priority = task.priority;
+    (modal as any).form.values.dueDate = task.due || '';
+    (modal as any).form.values.scheduledDate = task.scheduled || '';
+    (modal as any).form.values.contexts = task.contexts?.join(', ') || '';
+    (modal as any).form.values.projects = task.projects?.join(', ') || '';
+    (modal as any).form.values.tags = task.tags?.filter(t => t !== 'task').join(', ') || '';
+    (modal as any).form.values.details = task.details || '';
     (modal as any).originalDetails = task.details || '';
   };
 
@@ -142,7 +130,7 @@ describe('TaskEditModal - Unsaved Changes Detection', () => {
       initializeModalFields(modal, mockTask);
 
       // Spy on the parent close method
-      const parentCloseSpy = jest.spyOn(Object.getPrototypeOf(Object.getPrototypeOf(modal)), 'close');
+      const parentCloseSpy = jest.spyOn(Object.getPrototypeOf(TaskModal.prototype), 'close');
 
       // Close the modal (synchronous)
       modal.close();
@@ -157,10 +145,10 @@ describe('TaskEditModal - Unsaved Changes Detection', () => {
       initializeModalFields(modal, mockTask);
 
       // Make a change
-      (modal as any).title = 'Modified Title';
+      (modal as any).form.values.title = 'Modified Title';
 
       // Spy on parent close
-      const parentCloseSpy = jest.spyOn(Object.getPrototypeOf(Object.getPrototypeOf(modal)), 'close');
+      const parentCloseSpy = jest.spyOn(Object.getPrototypeOf(TaskModal.prototype), 'close');
 
       // Use forceClose to bypass confirmation
       modal.forceClose();
@@ -177,7 +165,7 @@ describe('TaskEditModal - Unsaved Changes Detection', () => {
       initializeModalFields(modal, mockTask);
 
       // Modify the title
-      (modal as any).title = 'Modified Title';
+      (modal as any).form.values.title = 'Modified Title';
 
       // Mock confirmation modal to return false (discard)
       (ConfirmationModal as jest.Mock).mockImplementationOnce((app, options) => ({
@@ -209,7 +197,7 @@ describe('TaskEditModal - Unsaved Changes Detection', () => {
       initializeModalFields(modal, mockTask);
 
       // Modify the details
-      (modal as any).details = 'Modified details content';
+      (modal as any).form.values.details = 'Modified details content';
 
       // Mock confirmation modal
       (ConfirmationModal as jest.Mock).mockImplementationOnce((app, options) => ({
@@ -230,7 +218,7 @@ describe('TaskEditModal - Unsaved Changes Detection', () => {
       initializeModalFields(modal, mockTask);
 
       // Modify the priority
-      (modal as any).priority = 'high';
+      (modal as any).form.values.priority = 'high';
 
       // Mock confirmation modal
       (ConfirmationModal as jest.Mock).mockImplementationOnce((app, options) => ({
@@ -251,7 +239,7 @@ describe('TaskEditModal - Unsaved Changes Detection', () => {
       initializeModalFields(modal, mockTask);
 
       // Add a due date
-      (modal as any).dueDate = '2025-12-31';
+      (modal as any).form.values.dueDate = '2025-12-31';
 
       // Mock confirmation modal
       (ConfirmationModal as jest.Mock).mockImplementationOnce((app, options) => ({
@@ -268,13 +256,43 @@ describe('TaskEditModal - Unsaved Changes Detection', () => {
     });
   });
 
+  describe('Failed saves retain the form', () => {
+    it.each(['', '   '])('fails for invalid title %j', async (title) => {
+      modal = new TaskEditModal(mockApp, mockPlugin, { task: mockTask });
+      initializeModalFields(modal, mockTask);
+      (modal as any).form.values.title = title;
+      const close = jest.spyOn(modal, 'close');
+      await expect(modal.handleSave()).resolves.toEqual({ status: 'failed' });
+      expect(mockPlugin.taskService.updateTask).not.toHaveBeenCalled();
+      expect(close).not.toHaveBeenCalled();
+      expect((modal as any).form.values.details).toBe('Original details');
+    });
+
+    it.each(['validation', 'persistence'])('does not force close after %s failure in save confirmation', async (failure) => {
+      modal = new TaskEditModal(mockApp, mockPlugin, { task: mockTask });
+      initializeModalFields(modal, mockTask);
+      (modal as any).form.values.title = failure === 'validation' ? '' : 'Modified Title';
+      if (failure === 'persistence') {
+        mockPlugin.taskService.updateTask.mockRejectedValue(new Error('Write failed'));
+      }
+      jest.spyOn(modal as any, 'showThreeButtonConfirmation').mockResolvedValue('save');
+      const forceClose = jest.spyOn(modal, 'forceClose');
+
+      await (modal as any).showUnsavedChangesConfirmation();
+
+      expect(forceClose).not.toHaveBeenCalled();
+      expect((modal as any).isShowingConfirmation).toBe(false);
+      expect((modal as any).form.values.title).toBe(failure === 'validation' ? '' : 'Modified Title');
+    });
+  });
+
   describe('User confirmation choices', () => {
     it('should save and close when user confirms save', async () => {
       modal = new TaskEditModal(mockApp, mockPlugin, { task: mockTask });
       initializeModalFields(modal, mockTask);
 
       // Modify the title
-      (modal as any).title = 'Modified Title';
+      (modal as any).form.values.title = 'Modified Title';
 
       // Mock confirmation modal to return true (save)
       (ConfirmationModal as jest.Mock).mockImplementationOnce((app, options) => ({
@@ -308,7 +326,7 @@ describe('TaskEditModal - Unsaved Changes Detection', () => {
       initializeModalFields(modal, mockTask);
 
       // Modify the title
-      (modal as any).title = 'Modified Title';
+      (modal as any).form.values.title = 'Modified Title';
 
       // Mock confirmation modal to return false (discard)
       (ConfirmationModal as jest.Mock).mockImplementationOnce((app, options) => ({
@@ -337,7 +355,7 @@ describe('TaskEditModal - Unsaved Changes Detection', () => {
       initializeModalFields(modal, mockTask);
 
       // Modify the title
-      (modal as any).title = 'Modified Title';
+      (modal as any).form.values.title = 'Modified Title';
 
       // Mock confirmation modal - simulate third button (cancel) being clicked
       // The onThirdButton callback is called, then show() promise never resolves to save/discard
@@ -380,7 +398,7 @@ describe('TaskEditModal - Unsaved Changes Detection', () => {
       initializeModalFields(modal, mockTask);
 
       // Add only whitespace to title (should be trimmed)
-      (modal as any).title = 'Original Task Title   ';
+      (modal as any).form.values.title = 'Original Task Title   ';
 
       // Close the modal
       modal.close();
@@ -394,7 +412,7 @@ describe('TaskEditModal - Unsaved Changes Detection', () => {
       initializeModalFields(modal, mockTask);
 
       // Modify contexts
-      (modal as any).contexts = 'work, urgent';
+      (modal as any).form.values.contexts = 'work, urgent';
 
       // Mock confirmation modal
       (ConfirmationModal as jest.Mock).mockImplementationOnce((app, options) => ({
@@ -415,7 +433,7 @@ describe('TaskEditModal - Unsaved Changes Detection', () => {
       initializeModalFields(modal, mockTask);
 
       // Modify projects
-      (modal as any).projects = '[[Project A]]';
+      (modal as any).form.values.projects = '[[Project A]]';
 
       // Mock confirmation modal
       (ConfirmationModal as jest.Mock).mockImplementationOnce((app, options) => ({
@@ -436,7 +454,7 @@ describe('TaskEditModal - Unsaved Changes Detection', () => {
       initializeModalFields(modal, mockTask);
 
       // Modify the title
-      (modal as any).title = 'Modified Title';
+      (modal as any).form.values.title = 'Modified Title';
 
       // Mock confirmation modal with a delayed response
       let resolveShow: (value: boolean) => void;
@@ -481,7 +499,7 @@ describe('TaskEditModal - Unsaved Changes Detection', () => {
       // Simulate what happens when the markdown editor fires onChange with trailing whitespace
       // The originalDetails was set to trimmed value, but editor fires with trailing whitespace
       (modal as any).originalDetails = 'Original details';
-      (modal as any).details = 'Original details  \n';  // Same content but with trailing whitespace
+      (modal as any).form.values.details = 'Original details  \n';  // Same content but with trailing whitespace
 
       // Close the modal
       modal.close();
@@ -496,7 +514,7 @@ describe('TaskEditModal - Unsaved Changes Detection', () => {
 
       // Simulate extractDetailsFromContent() result (trimmed) vs editor content (with trailing newlines)
       (modal as any).originalDetails = 'Some task details';
-      (modal as any).details = 'Some task details\n\n';
+      (modal as any).form.values.details = 'Some task details\n\n';
 
       modal.close();
 
@@ -509,7 +527,7 @@ describe('TaskEditModal - Unsaved Changes Detection', () => {
 
       // Test mixed line endings - CRLF should normalize to LF
       (modal as any).originalDetails = 'Line 1\nLine 2';
-      (modal as any).details = 'Line 1\r\nLine 2';  // CRLF instead of LF
+      (modal as any).form.values.details = 'Line 1\r\nLine 2';  // CRLF instead of LF
 
       modal.close();
 
@@ -523,7 +541,7 @@ describe('TaskEditModal - Unsaved Changes Detection', () => {
       // Both are exactly the same - no changes made
       const identicalContent = 'Multiline content\n\nWith paragraphs';
       (modal as any).originalDetails = identicalContent;
-      (modal as any).details = identicalContent;
+      (modal as any).form.values.details = identicalContent;
 
       modal.close();
 
@@ -537,7 +555,7 @@ describe('TaskEditModal - Unsaved Changes Detection', () => {
 
       // Empty details should be compared correctly
       (modal as any).originalDetails = '';
-      (modal as any).details = '';
+      (modal as any).form.values.details = '';
 
       modal.close();
 
@@ -554,7 +572,7 @@ describe('TaskEditModal - Unsaved Changes Detection', () => {
       // When modal opens, originalDetails = content.trimEnd()
       // When editor fires onChange, details = content (without trimEnd)
       (modal as any).originalDetails = 'Content with trailing removed';
-      (modal as any).details = 'Content with trailing removed   ';
+      (modal as any).form.values.details = 'Content with trailing removed   ';
 
       modal.close();
 
@@ -567,7 +585,7 @@ describe('TaskEditModal - Unsaved Changes Detection', () => {
 
       // Actual change - should trigger confirmation
       (modal as any).originalDetails = 'Original content';
-      (modal as any).details = 'Modified content';
+      (modal as any).form.values.details = 'Modified content';
 
       (ConfirmationModal as jest.Mock).mockImplementationOnce((app, options) => ({
         show: jest.fn().mockResolvedValue(false),
@@ -586,7 +604,7 @@ describe('TaskEditModal - Unsaved Changes Detection', () => {
       initializeModalFields(modal, mockTask);
 
       (modal as any).originalDetails = 'Original';
-      (modal as any).details = 'Original\n\nNew paragraph added';
+      (modal as any).form.values.details = 'Original\n\nNew paragraph added';
 
       (ConfirmationModal as jest.Mock).mockImplementationOnce((app, options) => ({
         show: jest.fn().mockResolvedValue(false),

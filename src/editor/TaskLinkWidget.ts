@@ -4,32 +4,34 @@ import TaskNotesPlugin from "../main";
 import { dispatchTaskUpdate } from "./TaskLinkOverlay";
 import { createTaskCard } from "../ui/TaskCard";
 import { convertInternalToUserProperties } from "../utils/propertyMapping";
+import { createUTCDateFromLocalCalendarDate, formatDateForStorage } from "../utils/dateUtils";
 
 export class TaskLinkWidget extends WidgetType {
 	private taskInfo: TaskInfo;
 	private plugin: TaskNotesPlugin;
 	private originalText: string;
 	private displayText?: string;
+	private targetDate: Date;
+	private targetDateKey: string;
 
 	constructor(
 		taskInfo: TaskInfo,
 		plugin: TaskNotesPlugin,
 		originalText: string,
-		displayText?: string
+		displayText?: string,
+		targetDate: Date = createUTCDateFromLocalCalendarDate(new Date()),
+		private subpath?: string
 	) {
 		super();
 		this.taskInfo = taskInfo;
 		this.plugin = plugin;
 		this.originalText = originalText;
 		this.displayText = displayText;
+		this.targetDate = targetDate;
+		this.targetDateKey = formatDateForStorage(targetDate);
 	}
 
 	toDOM(view: EditorView): HTMLElement {
-		// Get target date for recurring task status calculation
-		// Use fresh UTC-anchored "today" to ensure correct recurring task completion status
-		const now = new Date();
-		const targetDate = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
-
 		// Get visible properties from settings (stores internal FieldMapping keys)
 		// Convert to user-configured frontmatter property names before passing to TaskCard
 		const internalProperties = this.plugin.settings.inlineVisibleProperties || [
@@ -42,22 +44,46 @@ export class TaskLinkWidget extends WidgetType {
 		const visibleProperties = convertInternalToUserProperties(internalProperties, this.plugin);
 
 		// Create a wrapper span with the tasknotes-plugin class for CSS scoping
-		const wrapper = document.createElement("span");
+		const wrapper = activeWindow.createSpan();
 		wrapper.className = "tasknotes-plugin tasknotes-inline-widget";
 		// Ensure wrapper displays inline to prevent line breaks
-		wrapper.style.display = "inline";
-		wrapper.style.verticalAlign = "baseline";
+		wrapper.classList.remove(
+			"tn-static-display-block-2a1b75c9",
+			"tn-static-display-flex-4d51fc62",
+			"tn-static-display-flex-75816cae",
+			"tn-static-display-flex-8bb39979",
+			"tn-static-display-inline-block-60e32dcb",
+			"tn-static-display-inline-flex-f984c520",
+			"tn-static-display-none-6b99de8b",
+			"tn-static-min-height-800px-997b4c8c"
+		);
+		wrapper.classList.add("tn-static-display-inline-cccfa456");
+		wrapper.classList.add("tn-static-vertical-align-baseline-657d9c46");
+
+		// Keep CodeMirror from moving the selection onto the replaced link before
+		// the card receives its click/contextmenu event.
+		wrapper.addEventListener("pointerdown", (event) => {
+			event.stopPropagation();
+		});
+		// A draggable wrapper already keeps the caret in place, and cancelling its
+		// mousedown would stop it from being dragged onto a Calendar view.
+		wrapper.addEventListener("mousedown", (event) => {
+			event.stopPropagation();
+			if (event.button === 0 && !wrapper.draggable) {
+				event.preventDefault();
+			}
+		});
+		wrapper.addEventListener("mouseup", (event) => {
+			event.stopPropagation();
+		});
 
 		// Use createTaskCard with inline layout
-		const card = createTaskCard(
-			this.taskInfo,
-			this.plugin,
-			visibleProperties,
-			{
-				layout: "inline",
-				targetDate: targetDate,
-			}
-		);
+		const card = createTaskCard(this.taskInfo, this.plugin, visibleProperties, {
+			layout: "inline",
+			targetDate: this.targetDate,
+			displayText: this.displayText,
+			navigationSubpath: this.subpath,
+		});
 
 		// Add card to wrapper
 		wrapper.appendChild(card);
@@ -65,10 +91,13 @@ export class TaskLinkWidget extends WidgetType {
 		// Store original text for reference
 		card.dataset.originalText = this.originalText;
 
+		// Let the widget be dragged onto Calendar views to schedule the task
+		this.plugin.dragDropManager?.makeTaskCardDraggable(wrapper, this.taskInfo.path);
+
 		// Trigger update after status changes (for editor sync)
 		// Listen for task updates within the card
 		card.addEventListener("tasknotes:task-updated", () => {
-			setTimeout(() => {
+			window.setTimeout(() => {
 				if (view && typeof view.dispatch === "function") {
 					dispatchTaskUpdate(view, this.taskInfo.path);
 				}
@@ -94,8 +123,14 @@ export class TaskLinkWidget extends WidgetType {
 			this.taskInfo.due === other.taskInfo.due &&
 			this.taskInfo.scheduled === other.taskInfo.scheduled &&
 			this.taskInfo.recurrence === other.taskInfo.recurrence &&
+			this.displayText === other.displayText &&
+			this.subpath === other.subpath &&
+			this.originalText === other.originalText &&
+			this.targetDateKey === other.targetDateKey &&
 			JSON.stringify(this.taskInfo.complete_instances) ===
 				JSON.stringify(other.taskInfo.complete_instances) &&
+			JSON.stringify(this.taskInfo.skipped_instances) ===
+				JSON.stringify(other.taskInfo.skipped_instances) &&
 			this.taskInfo.dateModified === other.taskInfo.dateModified
 		);
 	}
@@ -107,7 +142,12 @@ export class TaskLinkWidget extends WidgetType {
 	ignoreEvent(event: Event): boolean {
 		// Ignore mouse events to prevent cursor from moving into widget
 		// This keeps the widget rendered while interacting with it
-		if (event.type === "mousedown" || event.type === "click") {
+		if (
+			event.type === "mousedown" ||
+			event.type === "click" ||
+			event.type === "dragstart" ||
+			event.type === "dragend"
+		) {
 			return true;
 		}
 		return false;

@@ -1,30 +1,117 @@
-import { Notice, TFile, normalizePath, stringifyYaml } from "obsidian";
+import { TFile, stringifyYaml, type Vault } from "obsidian";
 import {
 	EVENT_TASK_UPDATED,
+	FieldMapping,
 	IWebhookNotifier,
 	TaskCreationData,
 	TaskInfo,
 } from "../../types";
-import { addDTSTARTToRecurrenceRule } from "../../core/recurrence";
-import { FilenameContext, generateTaskFilename, generateUniqueFilename } from "../../utils/filenameGenerator";
+import type { TaskNotesSettings } from "../../types/settings";
+import { addDTSTARTToRecurrenceRule, updateToNextScheduledOccurrence } from "../../core/recurrence";
+import {
+	FilenameContext,
+	type TaskFilenameSettings,
+	generateTaskFilename,
+	generateUniqueFilename,
+	generateOccurrenceFilename,
+	isTitleRepresentedByFilename,
+} from "../../utils/filenameGenerator";
 import { ensureFolderExists } from "../../utils/helpers";
-import { getCurrentTimestamp } from "../../utils/dateUtils";
+import { getCurrentDateString, getCurrentTimestamp } from "../../utils/dateUtils";
+import { stringifyUnknown } from "../../utils/stringUtils";
 import { mergeTemplateFrontmatter } from "../../utils/templateProcessor";
-import type TaskNotesPlugin from "../../main";
+import {
+	applyPropertyTaskIdentifier,
+	getFrontmatterTags,
+} from "../../utils/taskIdentificationFrontmatter";
+import type { UserMappedField } from "../../types/settings";
+import { createTaskNotesLogger } from "../../utils/tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Services/TaskService/TaskCreationService" });
 
 interface TemplateApplicationResult {
 	frontmatter: Record<string, unknown>;
 	body: string;
 }
 
+type Nullable<T> = T | null;
+
+interface TaskCreationWorkspace {
+	getActiveFile(): Nullable<TFile>;
+}
+
+interface TaskCreationVault extends Vault {
+	create(path: string, content: string): Promise<TFile>;
+}
+
+interface TaskCreationFieldMapper {
+	getUserFields(): UserMappedField[];
+	mapToFrontmatter(
+		taskData: Partial<TaskInfo>,
+		taskTag?: string,
+		storeTitleInFilename?: boolean
+	): Record<string, unknown>;
+	toUserField(field: keyof FieldMapping): string;
+}
+
+interface TaskCreationCacheManager {
+	waitForFreshTaskData?: (file: TFile) => Promise<void>;
+	updateTaskInfoInCache(path: string, task: TaskInfo): void;
+}
+
+interface TaskCreationEmitter {
+	trigger(event: typeof EVENT_TASK_UPDATED, payload: unknown): void;
+}
+
+interface TaskCreationCalendarSyncService {
+	syncTaskToCalendar(task: TaskInfo): Promise<unknown>;
+}
+
+interface TaskCreationStatusManager {
+	isCompletedStatus(status: string): boolean;
+}
+
+type TaskCreationSettings = Pick<
+	TaskNotesSettings,
+	| "storeTitleInFilename"
+	| "defaultTaskPriority"
+	| "defaultTaskStatus"
+	| "taskIdentificationMethod"
+	| "taskTag"
+	| "taskPropertyName"
+	| "taskPropertyValue"
+	| "inlineTaskConvertFolder"
+	| "tasksFolder"
+	| "googleCalendarExport"
+> &
+	TaskFilenameSettings;
+
+export interface TaskCreationRuntime {
+	app: {
+		vault: TaskCreationVault;
+		workspace: TaskCreationWorkspace;
+	};
+	settings: TaskCreationSettings;
+	fieldMapper: TaskCreationFieldMapper;
+	statusManager?: TaskCreationStatusManager;
+	cacheManager: TaskCreationCacheManager;
+	emitter: TaskCreationEmitter;
+	taskCalendarSyncService?: TaskCreationCalendarSyncService;
+}
+
 export interface TaskCreationServiceDependencies {
-	plugin: TaskNotesPlugin;
+	runtime: TaskCreationRuntime;
 	webhookNotifier?: IWebhookNotifier;
 	applyTaskCreationDefaults(taskData: TaskCreationData): Promise<TaskCreationData>;
 	applyTemplate(taskData: TaskCreationData): Promise<TemplateApplicationResult>;
 	processFolderTemplate(folderTemplate: string, taskData?: TaskCreationData, date?: Date): string;
 	sanitizeTitleForFilename(input: string): string;
 	sanitizeTitleForStorage(input: string): string;
+}
+
+export interface TaskCreationOptions {
+	applyDefaults?: boolean;
+	applyTemplate?: boolean;
 }
 
 export class TaskCreationService {
@@ -36,10 +123,10 @@ export class TaskCreationService {
 
 	async createTask(
 		taskData: TaskCreationData,
-		options: { applyDefaults?: boolean } = {}
+		options: TaskCreationOptions = {}
 	): Promise<{ file: TFile; taskInfo: TaskInfo }> {
-		const { applyDefaults = true } = options;
-		const { plugin } = this.deps;
+		const { applyDefaults = true, applyTemplate = true } = options;
+		const { runtime } = this.deps;
 
 		try {
 			if (applyDefaults) {
@@ -50,42 +137,82 @@ export class TaskCreationService {
 				throw new Error("Title is required");
 			}
 
-			const title = plugin.settings.storeTitleInFilename
-				? this.deps.sanitizeTitleForFilename(taskData.title.trim())
-				: this.deps.sanitizeTitleForStorage(taskData.title.trim());
-			const priority = taskData.priority || plugin.settings.defaultTaskPriority;
-			const status = taskData.status || plugin.settings.defaultTaskStatus;
+			const rawTitle = taskData.title.trim();
+			const title = this.deps.sanitizeTitleForStorage(rawTitle);
+			const filenameTitle = runtime.settings.storeTitleInFilename
+				? this.deps.sanitizeTitleForFilename(rawTitle)
+				: title;
+			const priority = taskData.priority || runtime.settings.defaultTaskPriority;
+			const status = taskData.status || runtime.settings.defaultTaskStatus;
 			const dateCreated = taskData.dateCreated || getCurrentTimestamp();
 			const dateModified = taskData.dateModified || getCurrentTimestamp();
+			const recurrence = taskData.recurrence || undefined;
+			const completedDate = !recurrence
+				? taskData.completedDate ||
+					(runtime.statusManager?.isCompletedStatus(status)
+						? getCurrentDateString()
+						: undefined)
+				: undefined;
 
 			const contextsArray = taskData.contexts || [];
 			const projectsArray = taskData.projects || [];
-			let tagsArray = taskData.tags || [];
+			let tagsArray = getFrontmatterTags(taskData.tags || []);
 
-			if (plugin.settings.taskIdentificationMethod === "tag") {
-				if (!tagsArray.includes(plugin.settings.taskTag)) {
-					tagsArray = [plugin.settings.taskTag, ...tagsArray];
+			if (runtime.settings.taskIdentificationMethod === "tag") {
+				const taskTag =
+					getFrontmatterTags(runtime.settings.taskTag)[0] ?? runtime.settings.taskTag;
+				if (taskTag && !tagsArray.includes(taskTag)) {
+					tagsArray = [taskTag, ...tagsArray];
 				}
 			}
 
 			const filenameContext: FilenameContext = {
-				title,
+				title: filenameTitle,
 				priority,
 				status,
 				date: new Date(),
 				dueDate: taskData.due,
 				scheduledDate: taskData.scheduled,
+				contexts: contextsArray,
+				projects: projectsArray,
+				tags: tagsArray,
+				timeEstimate: taskData.timeEstimate,
+				details: taskData.details,
+				parentNote: taskData.parentNote,
 			};
 
-			const baseFilename = generateTaskFilename(filenameContext, plugin.settings);
+			const occurrenceFilenameTemplate = taskData.occurrenceFilenameTemplate?.trim();
+			const baseFilename =
+				occurrenceFilenameTemplate && taskData.occurrence_date
+					? generateOccurrenceFilename(
+							filenameContext,
+							occurrenceFilenameTemplate,
+							taskData.occurrence_date
+						)
+					: generateTaskFilename(filenameContext, runtime.settings);
 			const folder = await this.resolveTargetFolder(taskData);
 
 			if (folder) {
-				await ensureFolderExists(plugin.app.vault, folder);
+				await ensureFolderExists(runtime.app.vault, folder);
 			}
 
-			const uniqueFilename = await generateUniqueFilename(baseFilename, folder, plugin.app.vault);
+			const uniqueFilename = await generateUniqueFilename(
+				baseFilename,
+				folder,
+				runtime.app.vault
+			);
 			const fullPath = folder ? `${folder}/${uniqueFilename}.md` : `${uniqueFilename}.md`;
+			// A templated occurrence filename intentionally differs from the
+			// title, but still represents it as long as the generated name was
+			// used as-is (no collision suffix) and nothing was lost to
+			// filename sanitization.
+			const expectedFilename =
+				occurrenceFilenameTemplate && taskData.occurrence_date
+					? baseFilename
+					: filenameTitle;
+			const titleIsRepresentedByFilename =
+				runtime.settings.storeTitleInFilename &&
+				isTitleRepresentedByFilename(title, filenameTitle, uniqueFilename, expectedFilename);
 
 			const completeTaskData: Partial<TaskInfo> = {
 				title,
@@ -95,16 +222,66 @@ export class TaskCreationService {
 				scheduled: taskData.scheduled || undefined,
 				contexts: contextsArray.length > 0 ? contextsArray : undefined,
 				projects: projectsArray.length > 0 ? projectsArray : undefined,
+				attachments:
+					taskData.attachments && taskData.attachments.length > 0
+						? taskData.attachments
+						: undefined,
 				timeEstimate:
-					taskData.timeEstimate && taskData.timeEstimate > 0 ? taskData.timeEstimate : undefined,
+					taskData.timeEstimate && taskData.timeEstimate > 0
+						? taskData.timeEstimate
+						: undefined,
 				dateCreated,
 				dateModified,
-				recurrence: taskData.recurrence || undefined,
+				recurrence,
+				completedDate,
 				recurrence_anchor: taskData.recurrence_anchor || undefined,
+				recurrence_original_date: taskData.recurrence_original_date || undefined,
+				recurrence_parent: taskData.recurrence_parent || undefined,
+				occurrence_date: taskData.occurrence_date || undefined,
+				occurrence_materialization: taskData.occurrence_materialization || undefined,
+				occurrence_next_trigger: taskData.occurrence_next_trigger || undefined,
+				occurrence_template: taskData.occurrence_template || undefined,
+				occurrence_past_horizon: taskData.occurrence_past_horizon || undefined,
+				occurrence_future_horizon: taskData.occurrence_future_horizon || undefined,
 				reminders:
-					taskData.reminders && taskData.reminders.length > 0 ? taskData.reminders : undefined,
+					taskData.reminders && taskData.reminders.length > 0
+						? taskData.reminders
+						: undefined,
+				customProperties: taskData.customProperties || undefined,
 				icsEventId: taskData.icsEventId || undefined,
+				blockedBy:
+					taskData.blockedBy && taskData.blockedBy.length > 0
+						? taskData.blockedBy
+						: undefined,
 			};
+
+			// Thread user-defined field values from taskData through to frontmatter.
+			// completeTaskData only lists hardcoded core fields, so we copy any user
+			// field values here before mapToFrontmatter is called.
+			const userFields = runtime.fieldMapper.getUserFields();
+			if (userFields.length > 0) {
+				const taskDataAny = taskData as Record<string, unknown>;
+				const completeAny = completeTaskData as Record<string, unknown>;
+				for (const field of userFields) {
+					if (
+						Object.prototype.hasOwnProperty.call(taskDataAny, field.key) &&
+						taskDataAny[field.key] !== undefined
+					) {
+						completeAny[field.key] = taskDataAny[field.key];
+					}
+				}
+			}
+
+			if (
+				completeTaskData.recurrence &&
+				typeof completeTaskData.recurrence === "string" &&
+				!completeTaskData.scheduled
+			) {
+				const scheduled = getFirstScheduledOccurrence(completeTaskData);
+				if (scheduled) {
+					completeTaskData.scheduled = scheduled;
+				}
+			}
 
 			if (
 				completeTaskData.recurrence &&
@@ -125,24 +302,19 @@ export class TaskCreationService {
 				}
 			}
 
-			const shouldAddTaskTag = plugin.settings.taskIdentificationMethod === "tag";
-			const taskTagForFrontmatter = shouldAddTaskTag ? plugin.settings.taskTag : undefined;
+			const shouldAddTaskTag = runtime.settings.taskIdentificationMethod === "tag";
+			const taskTagForFrontmatter = shouldAddTaskTag ? runtime.settings.taskTag : undefined;
 
-			const frontmatter = plugin.fieldMapper.mapToFrontmatter(
+			const frontmatter = runtime.fieldMapper.mapToFrontmatter(
 				completeTaskData,
 				taskTagForFrontmatter,
-				plugin.settings.storeTitleInFilename
+				titleIsRepresentedByFilename
 			);
 
-			if (plugin.settings.taskIdentificationMethod === "property") {
-				const propName = plugin.settings.taskPropertyName;
-				const propValue = plugin.settings.taskPropertyValue;
-				if (propName && propValue) {
-					const lower = propValue.toLowerCase();
-					const coercedValue =
-						lower === "true" || lower === "false" ? lower === "true" : propValue;
-					frontmatter[propName] = coercedValue;
-				}
+			if (runtime.settings.taskIdentificationMethod === "property") {
+				const propName = runtime.settings.taskPropertyName;
+				const propValue = runtime.settings.taskPropertyValue;
+				applyPropertyTaskIdentifier(frontmatter, propName, propValue);
 				if (tagsArray.length > 0) {
 					frontmatter.tags = tagsArray;
 				}
@@ -150,17 +322,33 @@ export class TaskCreationService {
 				frontmatter.tags = tagsArray;
 			}
 
-			const templateResult = await this.deps.applyTemplate(taskData);
+			const templateResult = applyTemplate
+				? await this.deps.applyTemplate(taskData)
+				: { frontmatter: {}, body: "" };
 			const normalizedBody = templateResult.body
 				? templateResult.body.replace(/\r\n/g, "\n").trimEnd()
 				: taskData.details
 					? taskData.details.replace(/\r\n/g, "\n").trimEnd()
 					: "";
 
-			let finalFrontmatter = mergeTemplateFrontmatter(frontmatter, templateResult.frontmatter);
+			let finalFrontmatter = mergeTemplateFrontmatter(
+				frontmatter,
+				templateResult.frontmatter
+			);
 			if (taskData.customFrontmatter) {
 				finalFrontmatter = { ...finalFrontmatter, ...taskData.customFrontmatter };
 			}
+			if (titleIsRepresentedByFilename) {
+				delete finalFrontmatter[runtime.fieldMapper.toUserField("title")];
+			}
+			if (runtime.settings.taskIdentificationMethod === "property") {
+				applyPropertyTaskIdentifier(
+					finalFrontmatter,
+					runtime.settings.taskPropertyName,
+					runtime.settings.taskPropertyValue
+				);
+			}
+			tagsArray = getFrontmatterTags(finalFrontmatter.tags);
 
 			const yamlHeader = stringifyYaml(finalFrontmatter);
 			let content = `---\n${yamlHeader}---\n\n`;
@@ -168,14 +356,18 @@ export class TaskCreationService {
 				content += `${normalizedBody}\n`;
 			}
 
-			const file = await plugin.app.vault.create(fullPath, content);
+			const file = await runtime.app.vault.create(fullPath, content);
 
 			const taskInfo: TaskInfo = {
 				...completeTaskData,
 				...finalFrontmatter,
-				title: String(finalFrontmatter.title || completeTaskData.title || title),
-				status: String(finalFrontmatter.status || completeTaskData.status || status),
-				priority: String(finalFrontmatter.priority || completeTaskData.priority || priority),
+				title: stringifyUnknown(finalFrontmatter.title || completeTaskData.title || title),
+				status: stringifyUnknown(
+					finalFrontmatter.status || completeTaskData.status || status
+				),
+				priority: stringifyUnknown(
+					finalFrontmatter.priority || completeTaskData.priority || priority
+				),
 				path: file.path,
 				tags: tagsArray,
 				archived: false,
@@ -183,81 +375,107 @@ export class TaskCreationService {
 			};
 
 			try {
-				if (plugin.cacheManager.waitForFreshTaskData) {
-					await plugin.cacheManager.waitForFreshTaskData(file);
+				if (runtime.cacheManager.waitForFreshTaskData) {
+					await runtime.cacheManager.waitForFreshTaskData(file);
 				}
-				plugin.cacheManager.updateTaskInfoInCache(file.path, taskInfo);
+				runtime.cacheManager.updateTaskInfoInCache(file.path, taskInfo);
 			} catch (cacheError) {
-				console.error("Error updating cache for new task:", cacheError);
+				tasknotesLogger.error("Error updating cache for new task:", {
+					category: "stale-data",
+					operation: "updating-cache-new-task",
+					error: cacheError,
+				});
 			}
 
-			plugin.emitter.trigger(EVENT_TASK_UPDATED, {
+			runtime.emitter.trigger(EVENT_TASK_UPDATED, {
 				path: file.path,
 				updatedTask: taskInfo,
 			});
 
 			if (this.deps.webhookNotifier) {
 				try {
-					await this.deps.webhookNotifier.triggerWebhook("task.created", { task: taskInfo });
+					await this.deps.webhookNotifier.triggerWebhook("task.created", {
+						task: taskInfo,
+					});
 				} catch (error) {
-					console.warn("Failed to trigger webhook for task creation:", error);
+					tasknotesLogger.warn("Failed to trigger webhook for task creation:", {
+						category: "provider",
+						operation: "trigger-webhook-task-creation",
+						error: error,
+					});
 				}
 			}
 
 			if (
-				plugin.taskCalendarSyncService?.isEnabled() &&
-				plugin.settings.googleCalendarExport.syncOnTaskCreate
+				runtime.taskCalendarSyncService &&
+				runtime.settings.googleCalendarExport.enabled &&
+				runtime.settings.googleCalendarExport.syncOnTaskCreate
 			) {
-				plugin.taskCalendarSyncService.syncTaskToCalendar(taskInfo).catch((error) => {
-					console.warn("Failed to sync task to Google Calendar:", error);
+				runtime.taskCalendarSyncService.syncTaskToCalendar(taskInfo).catch((error) => {
+					tasknotesLogger.warn("Failed to sync task to Google Calendar:", {
+						category: "provider",
+						operation: "sync-task-google-calendar",
+						error: error,
+					});
 				});
 			}
 
 			return { file, taskInfo };
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : String(error);
-			console.error("Error creating task:", {
+			tasknotesLogger.error("Error creating task:", {
+				category: "persistence",
+				operation: "creating-task",
+				details: { stack: error instanceof Error ? error.stack : undefined, taskData },
 				error: errorMessage,
-				stack: error instanceof Error ? error.stack : undefined,
-				taskData,
 			});
 			throw new Error(`Failed to create task: ${errorMessage}`);
 		}
 	}
 
 	private async resolveTargetFolder(taskData: TaskCreationData): Promise<string> {
-		const { plugin } = this.deps;
-		let folder = "";
-
+		const { runtime } = this.deps;
 		if (
 			taskData.creationContext === "inline-conversion" ||
 			taskData.creationContext === "modal-inline-creation"
 		) {
-			const inlineFolder = plugin.settings.inlineTaskConvertFolder || "";
+			const inlineFolder = runtime.settings.inlineTaskConvertFolder || "";
 			if (inlineFolder.trim()) {
-				folder = inlineFolder;
-				if (
-					inlineFolder.includes("{{currentNotePath}}") ||
-					inlineFolder.includes("{{currentNoteTitle}}")
-				) {
-					const currentFile = plugin.app.workspace.getActiveFile();
-					if (inlineFolder.includes("{{currentNotePath}}")) {
-						const currentFolderPath = currentFile?.parent?.path || "";
-						folder = folder.replace(/\{\{currentNotePath\}\}/g, currentFolderPath);
-					}
-					if (inlineFolder.includes("{{currentNoteTitle}}")) {
-						const currentNoteTitle = currentFile?.basename || "";
-						folder = folder.replace(/\{\{currentNoteTitle\}\}/g, currentNoteTitle);
-					}
-				}
-				return this.deps.processFolderTemplate(folder, taskData);
+				return this.deps.processFolderTemplate(inlineFolder, taskData);
 			}
 
-			const tasksFolder = plugin.settings.tasksFolder || "";
+			const tasksFolder = runtime.settings.tasksFolder || "";
 			return this.deps.processFolderTemplate(tasksFolder, taskData);
 		}
 
-		const tasksFolder = plugin.settings.tasksFolder || "";
+		const tasksFolder = runtime.settings.tasksFolder || "";
 		return this.deps.processFolderTemplate(tasksFolder, taskData);
 	}
+}
+
+/**
+ * A recurring task created without a scheduled date gets its first occurrence on or after
+ * today, so it behaves like a task whose recurrence was added later (for example, it can
+ * be exported to Google Calendar). The time comes from a timed DTSTART. Ended or invalid
+ * rules have no next occurrence and are left unscheduled.
+ */
+function getFirstScheduledOccurrence(task: Partial<TaskInfo>): string | undefined {
+	if (typeof task.recurrence !== "string") return undefined;
+
+	// The first occurrence of a new task is the same for both anchors. Completion-based
+	// lookup skips DTSTART itself, so it would schedule one interval late.
+	const input = { recurrence: task.recurrence, dateCreated: task.dateCreated };
+	let next = updateToNextScheduledOccurrence(input).scheduled;
+
+	// The lookup only searches a window after today, so start a future series at its start.
+	const dtstart = task.recurrence.match(/DTSTART(?:;[^:;]+)*:(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2}))?/);
+	const dtstartDate = dtstart ? `${dtstart[1]}-${dtstart[2]}-${dtstart[3]}` : undefined;
+	if (!next && dtstartDate && dtstartDate > getCurrentDateString()) {
+		next = updateToNextScheduledOccurrence(input, true, {
+			minOccurrenceDate: dtstartDate,
+		}).scheduled;
+	}
+	if (!next) return undefined;
+
+	return dtstart?.[4] ? `${next}T${dtstart[4]}:${dtstart[5]}` : next;
 }

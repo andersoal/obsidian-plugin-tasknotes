@@ -1,40 +1,110 @@
-import { Component, App, setIcon } from "obsidian";
+import { uiData } from "../i18n/dataText";
+import { uiText } from "../i18n/runtime";
+import { msg } from "@lingui/core/macro";
+import { Component, App, Notice } from "obsidian";
+import type { BasesPropertyId, BasesQueryResult, BasesViewConfig, EventRef } from "obsidian";
 import TaskNotesPlugin from "../main";
 import { BasesDataAdapter } from "./BasesDataAdapter";
 import { PropertyMappingService } from "./PropertyMappingService";
-import { TaskInfo, EVENT_TASK_UPDATED } from "../types";
+import { TaskInfo } from "../types";
 import { convertInternalToUserProperties } from "../utils/propertyMapping";
 import { DEFAULT_INTERNAL_VISIBLE_PROPERTIES } from "../settings/defaults";
 import { SearchBox } from "./components/SearchBox";
 import { TaskSearchFilter } from "./TaskSearchFilter";
 import { BatchContextMenu } from "../components/BatchContextMenu";
 import type { TaskCardOptions } from "../ui/TaskCard";
-import { BasesConfigLike, BasesQueryResultLike } from "./types";
+import { identifyTaskNotesFromBasesData } from "./helpers";
+import type { TaskCopyFormat } from "../utils/taskClipboard";
+import {
+	buildBasesTaskCreationDataForView,
+	getBasesCurrentFileLinkDefault,
+} from "./basesCreateFileForView";
+import {
+	buildBasesExportFileName,
+	buildBasesExportTable,
+	formatBasesExportAsCsv,
+	formatBasesExportAsTsv,
+	type BasesExportTable,
+} from "./basesExport";
+import { getRenderedTaskPaths, planBasesTaskDeletedEvent } from "./basesUpdateEvents";
+import { cleanupBasesNewTaskButton, injectBasesNewTaskButton } from "./basesToolbar";
+import {
+	buildBasesVisibleProperties,
+	buildBasesVisiblePropertyLabels,
+} from "./basesVisibleProperties";
+import {
+	createBasesSearchControls,
+	isBasesSearchWithNoResults,
+	renderBasesSearchNoResults,
+} from "./basesSearchUi";
+import {
+	getVisibleTaskPathsFromBasesRoot,
+	handleBasesSelectionClick,
+	handleBasesSelectionKeyDown,
+	setBasesSelectionModeUi,
+	updateBasesSelectionIndicator,
+	updateBasesSelectionVisuals,
+	clearBasesSelectionVisuals,
+} from "./basesSelectionUi";
+import { createElementInDocument } from "../utils/documentDom";
+import {
+	installBasesConfigRefreshHook,
+	scheduleBasesDataUpdateRender,
+	scheduleBasesDebouncedRefresh,
+	type BasesTimeoutScheduler,
+} from "./basesRefreshLifecycle";
+import {
+	buildBasesTaskCopyActions,
+	copyBasesCurrentViewTasks,
+	resolveBasesTaskLinkText,
+	type BasesViewAction,
+} from "./basesTaskCopyActions";
+import {
+	cleanupBasesTaskUpdateListeners,
+	registerBasesTaskUpdateListeners,
+} from "./basesTaskUpdateListeners";
+import { registerBasesDateRollover } from "./basesDateRollover";
+import { filterTopLevelSubtasks } from "./topLevelSubtasks";
+import type { BasesTaskUpdateSource } from "./basesUpdateEvents";
+import { createTaskNotesLogger, type TaskNotesLogger } from "../utils/tasknotesLogger";
+
+type BasesEphemeralState = {
+	scrollTop?: unknown;
+	containerScrollTop?: unknown;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
 
 /**
  * Abstract base class for all TaskNotes Bases views.
- * Properly extends Component to leverage lifecycle, and implements BasesView interface.
+ * Extends Component and is adapted to the public BasesView type at registration.
  * Note: Bases types (BasesView, BasesViewConfig) are available from obsidian-api declarations.
  */
 export abstract class BasesViewBase extends Component {
 	// BasesView properties (provided by Bases when factory returns this instance)
 	// These match the BasesView interface from Obsidian's internal Bases API
-	app!: App;
-	config!: BasesConfigLike;
-	data!: BasesQueryResultLike;
+	app: App = undefined as unknown as App;
+	config: BasesViewConfig = undefined as unknown as BasesViewConfig;
+	data: BasesQueryResult = undefined as unknown as BasesQueryResult;
+	allProperties: BasesPropertyId[] = [];
 	protected plugin: TaskNotesPlugin;
 	protected dataAdapter: BasesDataAdapter;
 	protected propertyMapper: PropertyMappingService;
+	protected logger: TaskNotesLogger;
 	protected containerEl: HTMLElement;
 	protected rootElement: HTMLElement | null = null;
-	protected taskUpdateListener: any = null;
+	protected taskUpdateListener: EventRef[] | null = null;
 	protected updateDebounceTimer: number | null = null;
 	protected dataUpdateDebounceTimer: number | null = null;
+	private restoreConfigChangeHook: (() => void) | null = null;
 	protected relevantPathsCache: Set<string> = new Set();
 
 	// Search functionality (opt-in via enableSearch flag)
 	protected enableSearch = false;
 	protected searchBox: SearchBox | null = null;
+	protected searchContainerEl: HTMLElement | null = null;
 	protected searchFilter: TaskSearchFilter | null = null;
 	protected currentSearchTerm = "";
 
@@ -42,8 +112,7 @@ export abstract class BasesViewBase extends Component {
 	protected selectionModeCleanup: (() => void) | null = null;
 	protected selectionIndicatorEl: HTMLElement | null = null;
 
-	constructor(controller: any, containerEl: HTMLElement, plugin: TaskNotesPlugin) {
-		// Call Component constructor
+	constructor(controller: unknown, containerEl: HTMLElement, plugin: TaskNotesPlugin) {
 		super();
 		this.plugin = plugin;
 		this.containerEl = containerEl;
@@ -51,12 +120,47 @@ export abstract class BasesViewBase extends Component {
 		// Note: app, config, and data will be set by Bases when it creates the view
 		// We just need to ensure our types match the BasesView interface
 
-		this.dataAdapter = new BasesDataAdapter(this);
-		this.propertyMapper = new PropertyMappingService(plugin, plugin.fieldMapper);
+		this.logger = createTaskNotesLogger({
+			tag: () => `Bases/${this.type}`,
+			isDebugEnabled: () => this.plugin.settings.enableDebugLogging,
+		});
+		this.dataAdapter = new BasesDataAdapter(this, this.logger.child("DataAdapter"));
+		this.propertyMapper = new PropertyMappingService(plugin.fieldMapper);
 
 		// Bind createFileForView to ensure Bases can find it
 		// Some versions of Bases may check hasOwnProperty rather than prototype chain
 		this.createFileForView = this.createFileForView.bind(this);
+		this.setupConfigChangeHook(controller);
+	}
+
+	private setupConfigChangeHook(controller: unknown): void {
+		const cleanup = installBasesConfigRefreshHook({
+			controller,
+			view: this,
+			isConnected: () => Boolean(this.rootElement?.isConnected),
+			refresh: () => this.debouncedRefresh(),
+			scheduleTimeout: (callback, delayMs) => {
+				const scheduler = this.getTimeoutScheduler();
+				scheduler.setTimeout(callback, delayMs);
+			},
+		});
+		if (!cleanup) return;
+
+		this.restoreConfigChangeHook = cleanup;
+		if (typeof this.register === "function") {
+			this.register(() => {
+				this.restoreConfigChangeHook?.();
+				this.restoreConfigChangeHook = null;
+			});
+		}
+	}
+
+	private getTimeoutScheduler(): BasesTimeoutScheduler {
+		const win = this.containerEl.ownerDocument.defaultView || window;
+		return {
+			setTimeout: (callback, delayMs) => win.setTimeout(callback, delayMs),
+			clearTimeout: (timer) => win.clearTimeout(timer),
+		};
 	}
 
 	/**
@@ -66,9 +170,10 @@ export abstract class BasesViewBase extends Component {
 	onload(): void {
 		this.setupContainer();
 		this.setupTaskUpdateListener();
+		this.setupDateRolloverListener();
 		this.setupSelectionHandling();
 		this.updateRelevantPathsCache();
-		this.render();
+		void this.render();
 	}
 
 	/**
@@ -82,22 +187,32 @@ export abstract class BasesViewBase extends Component {
 			return;
 		}
 
-		// Debounce data updates to avoid freezing during typing
-		if (this.dataUpdateDebounceTimer) {
-			clearTimeout(this.dataUpdateDebounceTimer);
-		}
-
-		// Use correct window for pop-out window support
-		const win = this.containerEl.ownerDocument.defaultView || window;
-		this.dataUpdateDebounceTimer = win.setTimeout(() => {
-			this.dataUpdateDebounceTimer = null;
-			try {
-				this.render();
-			} catch (error) {
-				console.error(`[TaskNotes][${this.type}] Render error:`, error);
+		this.dataUpdateDebounceTimer = scheduleBasesDataUpdateRender({
+			currentTimer: this.dataUpdateDebounceTimer,
+			scheduler: this.getTimeoutScheduler(),
+			isConnected: () => Boolean(this.rootElement?.isConnected),
+			beforeRender: () => this.updateRelevantPathsCache(),
+			render: async () => {
+				const savedState = this.getEphemeralState();
+				try {
+					await this.render();
+				} finally {
+					this.setEphemeralState(savedState);
+				}
+			},
+			onTimerCleared: () => {
+				this.dataUpdateDebounceTimer = null;
+			},
+			onRenderError: (error) => {
+				this.logger.error("Render error during data update", {
+					category: "internal",
+					operation: "data-update-render",
+					error,
+				});
 				this.renderError(error as Error);
-			}
-		}, 500);  // 500ms debounce for data updates
+			},
+			delayMs: 500,
+		});
 	}
 
 	/**
@@ -122,24 +237,33 @@ export abstract class BasesViewBase extends Component {
 	/**
 	 * Lifecycle: Save ephemeral state (scroll position, etc).
 	 */
-	getEphemeralState(): any {
+	getEphemeralState(): unknown {
 		return {
 			scrollTop: this.rootElement?.scrollTop || 0,
+			containerScrollTop: this.containerEl.scrollTop || 0,
 		};
 	}
 
 	/**
 	 * Lifecycle: Restore ephemeral state.
 	 */
-	setEphemeralState(state: any): void {
-		if (!state || !this.rootElement || !this.rootElement.isConnected) return;
+	setEphemeralState(state: unknown): void {
+		if (!isRecord(state) || !this.rootElement || !this.rootElement.isConnected) return;
 
 		try {
-			if (state.scrollTop !== undefined) {
-				this.rootElement.scrollTop = state.scrollTop;
+			const ephemeralState: BasesEphemeralState = state;
+			if (typeof ephemeralState.scrollTop === "number") {
+				this.rootElement.scrollTop = ephemeralState.scrollTop;
+			}
+			if (typeof ephemeralState.containerScrollTop === "number") {
+				this.containerEl.scrollTop = ephemeralState.containerScrollTop;
 			}
 		} catch (e) {
-			console.debug("[TaskNotes][Bases] Failed to restore ephemeral state:", e);
+			this.logger.debug("Failed to restore ephemeral state", {
+				category: "stale-data",
+				operation: "restore-ephemeral-state",
+				error: e,
+			});
 		}
 	}
 
@@ -152,7 +276,11 @@ export abstract class BasesViewBase extends Component {
 				this.rootElement.focus();
 			}
 		} catch (e) {
-			console.debug("[TaskNotes][Bases] Failed to focus view:", e);
+			this.logger.debug("Failed to focus view", {
+				category: "internal",
+				operation: "focus-view",
+				error: e,
+			});
 		}
 	}
 
@@ -160,7 +288,33 @@ export abstract class BasesViewBase extends Component {
 	 * Lifecycle: Refresh/re-render the view.
 	 */
 	refresh(): void {
-		this.render();
+		void this.render();
+	}
+
+	/**
+	 * Native Bases result-count menu hook.
+	 * Obsidian invokes this for the built-in Copy action before custom view actions.
+	 */
+	copyToClipboard(): void {
+		void this.copyBasesTableToClipboard();
+	}
+
+	/**
+	 * Native Bases result-count menu hook.
+	 * Obsidian invokes this for the built-in Export CSV action before custom view actions.
+	 */
+	exportTable(): void {
+		void this.exportBasesTableAsCsv();
+	}
+
+	/**
+	 * Undocumented Bases hook used by the native result-count menu.
+	 * Obsidian calls this after its built-in Copy and Export CSV actions.
+	 */
+	getViewActions(): BasesViewAction[] {
+		return buildBasesTaskCopyActions((format) => {
+			void this.copyCurrentViewTasks(format);
+		});
 	}
 
 	/**
@@ -181,7 +335,7 @@ export abstract class BasesViewBase extends Component {
 
 		// Use correct document for pop-out window support
 		const doc = this.containerEl.ownerDocument;
-		const root = doc.createElement("div");
+		const root = createElementInDocument(doc, "div");
 		root.className = `tn-bases-integration tasknotes-plugin tasknotes-container tn-${this.type}`;
 		root.tabIndex = -1; // Make focusable without adding to tab order
 		this.containerEl.appendChild(root);
@@ -197,94 +351,60 @@ export abstract class BasesViewBase extends Component {
 	 */
 	protected setupNewTaskButton(): void {
 		// Defer to allow Bases to render its toolbar first
-		setTimeout(() => this.injectNewTaskButton(), 100);
+		window.setTimeout(() => this.injectNewTaskButton(), 100);
 
 		// Register cleanup to toggle off the active class when view is unloaded
 		this.register(() => this.cleanupNewTaskButton());
 	}
 
 	/**
-	 * Clean up: just remove the "active" class, keep the button for reuse.
+	 * Clean up injected toolbar state.
 	 */
 	private cleanupNewTaskButton(): void {
-		const basesViewEl = this.containerEl.closest(".bases-view");
-		const parentEl = basesViewEl?.parentElement;
-
-		// Only remove the "active" class - button stays for potential reuse
-		parentEl?.classList.remove("tasknotes-view-active");
+		cleanupBasesNewTaskButton(this.containerEl);
 	}
 
 	/**
 	 * Inject the custom "New Task" button into the Bases toolbar.
 	 */
 	private injectNewTaskButton(): void {
-		// Find the Bases view container
-		const basesViewEl = this.containerEl.closest(".bases-view");
-		if (!basesViewEl) {
-			console.debug("[TaskNotes][Bases] No .bases-view found");
-			return;
-		}
+		const result = injectBasesNewTaskButton({
+			containerEl: this.containerEl,
+			label: this.plugin.i18n.translate(msg({ message: "New", context: "common.new" })),
+			onClick: (event) => {
+				event.preventDefault();
+				event.stopPropagation();
 
-		// The toolbar is a sibling of .bases-view, not a child
-		// Look in the parent container for the toolbar
-		const parentEl = basesViewEl.parentElement;
-		if (!parentEl) {
-			console.debug("[TaskNotes][Bases] No parent element found");
-			return;
-		}
-
-		// Mark parent as having an active TaskNotes view (controls visibility via CSS)
-		parentEl.classList.add("tasknotes-view-active");
-
-		const toolbarEl = parentEl.querySelector(".bases-toolbar");
-		if (!toolbarEl) {
-			console.debug("[TaskNotes][Bases] No .bases-toolbar found in parent");
-			return;
-		}
-
-		// Check if we already added the button (reuse existing)
-		if (toolbarEl.querySelector(".tn-bases-new-task-btn")) return;
-
-		// Use correct document for pop-out window support
-		const doc = this.containerEl.ownerDocument;
-
-		// Create "New Task" button matching Bases' text-icon-button style
-		const newTaskBtn = doc.createElement("div");
-		newTaskBtn.className = "bases-toolbar-item tn-bases-new-task-btn";
-
-		const innerBtn = doc.createElement("div");
-		innerBtn.className = "text-icon-button";
-		innerBtn.tabIndex = 0;
-
-		// Add icon
-		const iconSpan = doc.createElement("span");
-		iconSpan.className = "text-button-icon";
-		setIcon(iconSpan, "plus");
-		innerBtn.appendChild(iconSpan);
-
-		// Add label
-		const labelSpan = doc.createElement("span");
-		labelSpan.className = "text-button-label";
-		labelSpan.textContent = this.plugin.i18n.translate("common.new");
-		innerBtn.appendChild(labelSpan);
-
-		newTaskBtn.appendChild(innerBtn);
-
-		newTaskBtn.addEventListener("click", () => {
-			this.createFileForView("New Task");
+				void this.createFileForView(uiText(msg({ message: "New Task", context: "bases/BasesViewBase: BasesViewBase.injectNewTaskButton.onClick display" })));
+			},
 		});
 
-		// Find the original "New" button position and insert our button there
-		const originalNewBtn = toolbarEl.querySelector(".bases-toolbar-new-item-menu");
-		if (originalNewBtn) {
-			// Insert before the original (which will be hidden by CSS)
-			originalNewBtn.before(newTaskBtn);
-		} else {
-			// Fallback: append to end of toolbar
-			toolbarEl.appendChild(newTaskBtn);
+		if (result === "missing-bases-view") {
+			this.logger.debug("No .bases-view element found", {
+				category: "provider",
+				operation: "inject-new-task-button",
+			});
+			return;
+		}
+		if (result === "missing-parent") {
+			this.logger.debug("No parent element found for Bases view", {
+				category: "provider",
+				operation: "inject-new-task-button",
+			});
+			return;
+		}
+		if (result === "missing-toolbar") {
+			this.logger.debug("No .bases-toolbar element found", {
+				category: "provider",
+				operation: "inject-new-task-button",
+			});
+			return;
 		}
 
-		console.debug("[TaskNotes][Bases] Injected New Task button into toolbar");
+		this.logger.debug("Injected New Task button into toolbar", {
+			category: "provider",
+			operation: "inject-new-task-button",
+		});
 	}
 
 	/**
@@ -294,33 +414,68 @@ export abstract class BasesViewBase extends Component {
 	protected setupTaskUpdateListener(): void {
 		if (this.taskUpdateListener) return;
 
-		this.taskUpdateListener = this.plugin.emitter.on(EVENT_TASK_UPDATED, async (eventData: any) => {
-			try {
-				const updatedTask = eventData?.task || eventData?.taskInfo;
-				if (!updatedTask?.path) return;
-
-				// Skip if view is not visible (no point updating hidden views)
-				if (!this.rootElement?.isConnected) return;
-
-				// Use cached Set for O(1) lookup instead of O(n) iteration
-				const isRelevant = this.relevantPathsCache.has(updatedTask.path);
-
-				if (isRelevant) {
-					await this.handleTaskUpdate(updatedTask);
-				}
-			} catch (error) {
-				console.error("[TaskNotes][Bases] Error in task update handler:", error);
-				this.debouncedRefresh();
-			}
+		this.taskUpdateListener = registerBasesTaskUpdateListeners({
+			emitter: this.plugin.emitter,
+			isConnected: () => Boolean(this.rootElement?.isConnected),
+			relevantPathsCache: this.relevantPathsCache,
+			handleTaskUpdate: (task, source) => this.handleTaskUpdate(task, source),
+			handleTaskDeleted: (eventData) => this.handleTaskDeletedEvent(eventData),
+			debouncedRefresh: () => this.debouncedRefresh(),
+			onError: (error) => {
+				this.logger.error("Error in task update handler", {
+					category: "internal",
+					operation: "task-update-handler",
+					error,
+				});
+			},
 		});
 
 		// Register cleanup using Component lifecycle
 		this.register(() => {
 			if (this.taskUpdateListener) {
-				this.plugin.emitter.offref(this.taskUpdateListener);
+				cleanupBasesTaskUpdateListeners(this.plugin.emitter, this.taskUpdateListener);
 				this.taskUpdateListener = null;
 			}
 		});
+	}
+
+	private setupDateRolloverListener(): void {
+		this.register(
+			registerBasesDateRollover({
+				emitter: this.plugin.emitter,
+				getElement: () => this.rootElement,
+				onDateRollover: (previousDay) => this.handleDateRollover(previousDay),
+			})
+		);
+	}
+
+	/**
+	 * Redraw date-dependent cards on a new day, through the same path as a Bases
+	 * update so that views keep their guards against rendering mid-drag.
+	 */
+	protected handleDateRollover(_previousDay: string): void {
+		this.onDataUpdated();
+	}
+
+	private handleTaskDeletedEvent(eventData: unknown): void {
+		const deletePlan = planBasesTaskDeletedEvent(eventData, {
+			projectsField: this.plugin.fieldMapper.toUserField("projects"),
+			renderedTaskPaths: getRenderedTaskPaths(this.rootElement),
+		});
+
+		if (deletePlan.deletedPath) {
+			this.relevantPathsCache.delete(deletePlan.deletedPath);
+		}
+
+		this.plugin.projectSubtasksService?.invalidateIndex();
+
+		if (!this.rootElement?.isConnected) {
+			return;
+		}
+
+		if (deletePlan.shouldRefresh) {
+			this.debouncedRefresh();
+		}
 	}
 
 	/**
@@ -328,16 +483,22 @@ export abstract class BasesViewBase extends Component {
 	 * Timer is automatically cleaned up on component unload.
 	 */
 	protected debouncedRefresh(): void {
-		if (this.updateDebounceTimer) {
-			clearTimeout(this.updateDebounceTimer);
-		}
-
-		// Use correct window for pop-out window support
-		const win = this.containerEl.ownerDocument.defaultView || window;
-		this.updateDebounceTimer = win.setTimeout(() => {
-			this.render();
-			this.updateDebounceTimer = null;
-		}, 300);  // Increased from 150ms for better typing performance
+		this.updateDebounceTimer = scheduleBasesDebouncedRefresh({
+			currentTimer: this.updateDebounceTimer,
+			scheduler: this.getTimeoutScheduler(),
+			render: async () => {
+				const savedState = this.getEphemeralState();
+				try {
+					await this.render();
+				} finally {
+					this.setEphemeralState(savedState);
+				}
+			},
+			onTimerCleared: () => {
+				this.updateDebounceTimer = null;
+			},
+			delayMs: 300,
+		});
 
 		// Note: We don't need to explicitly register cleanup for this timer
 		// because it's short-lived (300ms) and clears itself. If the component
@@ -356,122 +517,22 @@ export abstract class BasesViewBase extends Component {
 	 * @param frontmatterProcessor - Optional callback that Bases uses to set default frontmatter values
 	 */
 	async createFileForView(
-		baseFileName: string,
-		frontmatterProcessor?: (frontmatter: any) => void
+		baseFileName?: string,
+		frontmatterProcessor?: (frontmatter: Record<string, unknown>) => void
 	): Promise<void> {
 		const { TaskCreationModal } = await import("../modals/TaskCreationModal");
-
-		// Extract any default values from the frontmatter processor if provided
-		const prePopulatedValues: Partial<TaskInfo> = {};
-		const customFrontmatter: Record<string, any> = {};
-
-		if (frontmatterProcessor) {
-			// Create a mock frontmatter object to extract defaults
-			const mockFrontmatter: any = {};
-			frontmatterProcessor(mockFrontmatter);
-
-			// Get field mapper for property name mapping
-			const fm = this.plugin.fieldMapper;
-
-			// Map core TaskNotes properties from frontmatter
-			if (mockFrontmatter[fm.toUserField("title")]) {
-				prePopulatedValues.title = String(mockFrontmatter[fm.toUserField("title")]);
-			}
-			if (mockFrontmatter[fm.toUserField("status")]) {
-				prePopulatedValues.status = String(mockFrontmatter[fm.toUserField("status")]);
-			}
-			if (mockFrontmatter[fm.toUserField("priority")]) {
-				prePopulatedValues.priority = String(mockFrontmatter[fm.toUserField("priority")]);
-			}
-			if (mockFrontmatter[fm.toUserField("due")]) {
-				prePopulatedValues.due = String(mockFrontmatter[fm.toUserField("due")]);
-			}
-			if (mockFrontmatter[fm.toUserField("scheduled")]) {
-				prePopulatedValues.scheduled = String(mockFrontmatter[fm.toUserField("scheduled")]);
-			}
-			if (mockFrontmatter[fm.toUserField("contexts")]) {
-				const contexts = mockFrontmatter[fm.toUserField("contexts")];
-				prePopulatedValues.contexts = Array.isArray(contexts) ? contexts : [contexts];
-			}
-			if (mockFrontmatter[fm.toUserField("projects")]) {
-				const projects = mockFrontmatter[fm.toUserField("projects")];
-				prePopulatedValues.projects = Array.isArray(projects) ? projects : [projects];
-			}
-
-			// Tags - check both the standard 'tags' property and archiveTag
-			if (mockFrontmatter.tags) {
-				const tags = mockFrontmatter.tags;
-				prePopulatedValues.tags = Array.isArray(tags) ? tags : [tags];
-			}
-
-			// Archived - check for archive tag
-			if (mockFrontmatter.tags && Array.isArray(mockFrontmatter.tags)) {
-				const archiveTag = fm.toUserField("archiveTag");
-				prePopulatedValues.archived = mockFrontmatter.tags.includes(archiveTag);
-			}
-
-			if (mockFrontmatter[fm.toUserField("timeEstimate")]) {
-				prePopulatedValues.timeEstimate = Number(mockFrontmatter[fm.toUserField("timeEstimate")]);
-			}
-			if (mockFrontmatter[fm.toUserField("recurrence")]) {
-				prePopulatedValues.recurrence = String(mockFrontmatter[fm.toUserField("recurrence")]);
-			}
-			if (mockFrontmatter[fm.toUserField("completedDate")]) {
-				prePopulatedValues.completedDate = String(mockFrontmatter[fm.toUserField("completedDate")]);
-			}
-			if (mockFrontmatter[fm.toUserField("dateCreated")]) {
-				prePopulatedValues.dateCreated = String(mockFrontmatter[fm.toUserField("dateCreated")]);
-			}
-			if (mockFrontmatter[fm.toUserField("blockedBy")]) {
-				const blockedBy = mockFrontmatter[fm.toUserField("blockedBy")];
-				prePopulatedValues.blockedBy = Array.isArray(blockedBy) ? blockedBy : [blockedBy];
-			}
-
-			// Handle user-defined custom fields
-			const userFields = this.plugin.settings.userFields || [];
-			for (const userField of userFields) {
-				if (mockFrontmatter[userField.key] !== undefined) {
-					// Store in customFrontmatter for TaskCreationData
-					customFrontmatter[userField.key] = mockFrontmatter[userField.key];
-				}
-			}
-
-			// Capture any other frontmatter properties that weren't mapped above
-			// This ensures we don't lose any Bases-specific values
-			const mappedKeys = new Set([
-				fm.toUserField("title"),
-				fm.toUserField("status"),
-				fm.toUserField("priority"),
-				fm.toUserField("due"),
-				fm.toUserField("scheduled"),
-				fm.toUserField("contexts"),
-				fm.toUserField("projects"),
-				"tags", // Not in FieldMapping
-				fm.toUserField("archiveTag"), // For archived status
-				fm.toUserField("timeEstimate"),
-				fm.toUserField("recurrence"),
-				fm.toUserField("completedDate"),
-				fm.toUserField("dateCreated"),
-				fm.toUserField("blockedBy"),
-				...userFields.map(uf => uf.key),
-			]);
-
-			for (const [key, value] of Object.entries(mockFrontmatter)) {
-				if (!mappedKeys.has(key)) {
-					customFrontmatter[key] = value;
-				}
-			}
-		}
-
-		// Build the complete pre-populated values (TaskCreationData structure)
-		const taskCreationData: any = { ...prePopulatedValues };
-		if (Object.keys(customFrontmatter).length > 0) {
-			taskCreationData.customFrontmatter = customFrontmatter;
-		}
+		const app = this.app || this.plugin.app;
+		const taskCreationData = buildBasesTaskCreationDataForView({
+			config: this.config,
+			fieldMapper: this.plugin.fieldMapper,
+			taskTag: this.plugin.settings.taskTag,
+			userFields: this.plugin.settings.userFields || [],
+			currentFileLink: () => getBasesCurrentFileLinkDefault(app),
+			frontmatterProcessor,
+		});
 
 		// Open TaskNotes creation modal
 		// Use this.app if available (set by Bases), otherwise fall back to plugin.app
-		const app = this.app || this.plugin.app;
 		const modal = new TaskCreationModal(app, this.plugin, {
 			prePopulatedValues: taskCreationData,
 			onTaskCreated: (task: TaskInfo) => {
@@ -488,39 +549,29 @@ export abstract class BasesViewBase extends Component {
 	 * Uses BasesView's config API directly.
 	 */
 	protected getVisibleProperties(): string[] {
-		// Get ordered properties from Bases config (configured by user in Bases UI)
-		const basesPropertyIds = this.config.getOrder();
-		let visibleProperties = this.propertyMapper.mapVisibleProperties(basesPropertyIds);
-
-		// Fallback to plugin defaults if no properties configured
-		if (!visibleProperties || visibleProperties.length === 0) {
-			const internalDefaults = this.plugin.settings.defaultVisibleProperties || [
-				...DEFAULT_INTERNAL_VISIBLE_PROPERTIES,
-				"tags",
-			];
-			// Convert internal field names to user-configured property names
-			visibleProperties = convertInternalToUserProperties(internalDefaults, this.plugin);
-		}
-
-		return visibleProperties;
+		const fallbackInternalProperties = this.plugin.settings.defaultVisibleProperties || [
+			...DEFAULT_INTERNAL_VISIBLE_PROPERTIES,
+			"tags",
+		];
+		return buildBasesVisibleProperties({
+			basesPropertyIds: this.config.getOrder(),
+			propertyMapper: this.propertyMapper,
+			fallbackInternalProperties,
+			toUserProperties: (properties) =>
+				convertInternalToUserProperties([...properties], this.plugin),
+		});
 	}
 
 	/**
 	 * Get Bases-configured display labels keyed by the TaskCard property IDs we render.
 	 */
 	protected getVisiblePropertyLabels(): Record<string, string> {
-		const labels: Record<string, string> = {};
-		const basesPropertyIds = this.config.getOrder();
-
-		for (const basesPropertyId of basesPropertyIds) {
-			const taskCardPropertyId = this.propertyMapper.basesToTaskCardProperty(basesPropertyId);
-			const displayName = this.config.getDisplayName?.(basesPropertyId);
-			if (taskCardPropertyId && typeof displayName === "string" && displayName.trim() !== "") {
-				labels[taskCardPropertyId] = displayName;
-			}
-		}
-
-		return labels;
+		return buildBasesVisiblePropertyLabels({
+			basesPropertyIds: this.config.getOrder(),
+			propertyMapper: this.propertyMapper,
+			getDisplayName: (propertyId) =>
+				this.config.getDisplayName?.(propertyId as BasesPropertyId),
+		});
 	}
 
 	protected buildTaskCardOptions(
@@ -532,12 +583,24 @@ export abstract class BasesViewBase extends Component {
 		};
 	}
 
+	protected filterTopLevelSubtasks(tasks: readonly TaskInfo[]): TaskInfo[] {
+		return filterTopLevelSubtasks(tasks, (linkPath, sourcePath) =>
+			this.plugin.app.metadataCache.getFirstLinkpathDest(linkPath, sourcePath)
+		);
+	}
+
 	/**
 	 * Initialize search functionality for this view.
 	 * Call this from render() in subclasses that want search.
 	 * Requires enableSearch to be true and will only create the UI once.
 	 */
 	protected setupSearch(container: HTMLElement): void {
+		// Tear down search UI if it exists but search has been disabled
+		if (this.searchBox && !this.enableSearch) {
+			this.teardownSearch();
+			return;
+		}
+
 		// Idempotency: if search UI is already created, restore value and return
 		if (this.searchBox) {
 			// Restore search term if it was cleared during re-render
@@ -550,22 +613,6 @@ export abstract class BasesViewBase extends Component {
 			return;
 		}
 
-		// Use correct document for pop-out window support
-		const doc = this.containerEl.ownerDocument;
-
-		// Create search container
-		const searchContainer = doc.createElement("div");
-		searchContainer.className = "tn-search-container";
-
-		// Insert search container at the top of the container so it appears above
-		// the main items/content (e.g., the task list). This keeps the search box
-		// visible while the list itself can scroll independently.
-		if (container.firstChild) {
-			container.insertBefore(searchContainer, container.firstChild);
-		} else {
-			container.appendChild(searchContainer);
-		}
-
 		// Initialize search filter with visible properties (if available)
 		// Config might not be available yet during initial setup
 		let visibleProperties: string[] = [];
@@ -574,32 +621,39 @@ export abstract class BasesViewBase extends Component {
 				visibleProperties = this.getVisibleProperties();
 			}
 		} catch (e) {
-			console.debug(`[${this.type}] Could not get visible properties during search setup:`, e);
+			this.logger.debug("Could not get visible properties during search setup", {
+				category: "provider",
+				operation: "setup-search",
+				error: e,
+			});
 		}
-		this.searchFilter = new TaskSearchFilter(visibleProperties);
-
-		// Initialize search box
-		this.searchBox = new SearchBox(
-			searchContainer,
-			(term) => this.handleSearch(term),
-			300 // 300ms debounce
-		);
-		this.searchBox.render();
-
-		// Restore search term if view is being re-initialized with existing search
-		if (this.currentSearchTerm) {
-			this.searchBox.setValue(this.currentSearchTerm);
-		}
+		const searchControls = createBasesSearchControls({
+			container,
+			visibleProperties,
+			currentSearchTerm: this.currentSearchTerm,
+			onSearch: (term) => this.handleSearch(term),
+		});
+		this.searchFilter = searchControls.searchFilter;
+		this.searchBox = searchControls.searchBox;
+		this.searchContainerEl = searchControls.searchContainer;
 
 		// Register cleanup using Component lifecycle
-		this.register(() => {
-			if (this.searchBox) {
-				this.searchBox.destroy();
-				this.searchBox = null;
-			}
-			this.searchFilter = null;
-			this.currentSearchTerm = "";
-		});
+		this.register(() => this.teardownSearch());
+	}
+
+	/**
+	 * Remove the search UI and reset search state.
+	 * Called when enableSearch is toggled off.
+	 */
+	protected teardownSearch(): void {
+		if (this.searchBox) {
+			this.searchBox.destroy();
+			this.searchBox = null;
+		}
+		this.searchContainerEl?.remove();
+		this.searchContainerEl = null;
+		this.searchFilter = null;
+		this.currentSearchTerm = "";
 	}
 
 	/**
@@ -612,15 +666,17 @@ export abstract class BasesViewBase extends Component {
 		this.currentSearchTerm = term;
 
 		// Re-render with filtered tasks
-		this.render();
+		void this.render();
 
 		const filterTime = performance.now() - startTime;
 
 		// Log slow searches for performance monitoring
 		if (filterTime > 200) {
-			console.warn(
-				`[${this.type}] Slow search: ${filterTime.toFixed(2)}ms for search term "${term}"`
-			);
+			this.logger.warn("Slow search", {
+				category: "internal",
+				operation: "search",
+				details: { elapsedMs: filterTime, term },
+			});
 		}
 	}
 
@@ -639,12 +695,101 @@ export abstract class BasesViewBase extends Component {
 
 		// Log filter performance for monitoring
 		if (filterTime > 100) {
-			console.warn(
-				`[${this.type}] Filter operation took ${filterTime.toFixed(2)}ms for ${tasks.length} tasks`
-			);
+			this.logger.warn("Slow filter operation", {
+				category: "internal",
+				operation: "filter",
+				details: { elapsedMs: filterTime, taskCount: tasks.length },
+			});
 		}
 
 		return filtered;
+	}
+
+	private async copyCurrentViewTasks(format: TaskCopyFormat): Promise<void> {
+		try {
+			const app = this.app || this.plugin.app;
+			const result = await copyBasesCurrentViewTasks({
+				dataItems: this.dataAdapter.extractDataItems(),
+				format,
+				identifyTaskNotes: (dataItems) =>
+					identifyTaskNotesFromBasesData(dataItems, this.plugin),
+				filterTasks: (tasks) => this.applySearchFilter(tasks),
+				resolveLinkText: (task) => resolveBasesTaskLinkText(app, task.path),
+				writeText: (text) => navigator.clipboard.writeText(text),
+			});
+
+			if (result.status === "empty") {
+				new Notice(this.plugin.i18n.translate(msg({ message: "No tasks to copy", context: "notices.audit.noTasksCopy" })));
+				return;
+			}
+
+			new Notice(
+				this.plugin.i18n.translate(msg({ message: "Tasks copied: {count}", context: "notices.audit.copiedTasks" }), { count: result.count })
+			);
+		} catch (error) {
+			this.logger.error("Failed to copy current view tasks", {
+				category: "provider",
+				operation: "copy-current-view-tasks",
+				error,
+			});
+			new Notice(this.plugin.i18n.translate(msg({ message: "Failed to copy to clipboard", context: "contextMenus.task.notices.copyFailure" })));
+		}
+	}
+
+	private getBasesExportTable(): BasesExportTable {
+		return buildBasesExportTable(this.data?.data ?? [], this.dataAdapter);
+	}
+
+	private getBasesExportFileName(): string {
+		const configName = typeof this.config?.get === "function" ? this.config.get("name") : "";
+		return buildBasesExportFileName(configName, this.type);
+	}
+
+	private async copyBasesTableToClipboard(): Promise<void> {
+		try {
+			const table = this.getBasesExportTable();
+			const text = formatBasesExportAsTsv(table);
+
+			await navigator.clipboard.writeText(text);
+			new Notice(
+				this.plugin.i18n.translate(msg({ message: "Rows copied: {count}", context: "notices.audit.copiedRows" }), { count: table.rows.length })
+			);
+		} catch (error) {
+			this.logger.error("Failed to copy Bases table", {
+				category: "provider",
+				operation: "copy-bases-table",
+				error,
+			});
+			new Notice(this.plugin.i18n.translate(msg({ message: "Failed to copy to clipboard", context: "contextMenus.task.notices.copyFailure" })));
+		}
+	}
+
+	private async exportBasesTableAsCsv(): Promise<void> {
+		try {
+			const table = this.getBasesExportTable();
+			const csv = formatBasesExportAsCsv(table);
+
+			const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+			const win = this.containerEl.ownerDocument.defaultView ?? window;
+			const url = win.URL.createObjectURL(blob);
+			const link = createElementInDocument(this.containerEl.ownerDocument, "a");
+			link.href = url;
+			link.download = this.getBasesExportFileName();
+			link.click();
+			win.URL.revokeObjectURL(url);
+			new Notice(
+				this.plugin.i18n.translate(msg({ message: "Rows exported: {count}", context: "notices.audit.exportedRows" }), {
+					count: table.rows.length,
+				})
+			);
+		} catch (error) {
+			this.logger.error("Failed to export Bases table", {
+				category: "provider",
+				operation: "export-bases-table",
+				error,
+			});
+			new Notice(this.plugin.i18n.translate(msg({ message: "Action failed: {action}", context: "notices.audit.failed" }), { action: uiData("CSV", "CSV interchange format name; preserve the standard acronym") }));
+		}
 	}
 
 	/**
@@ -652,7 +797,11 @@ export abstract class BasesViewBase extends Component {
 	 * Returns true if search is active and produced no matches.
 	 */
 	protected isSearchWithNoResults(filteredTasks: TaskInfo[], originalCount: number): boolean {
-		return this.currentSearchTerm.length > 0 && filteredTasks.length === 0 && originalCount > 0;
+		return isBasesSearchWithNoResults(
+			this.currentSearchTerm,
+			filteredTasks.length,
+			originalCount
+		);
 	}
 
 	/**
@@ -660,23 +809,7 @@ export abstract class BasesViewBase extends Component {
 	 * Call this when search produces no matches.
 	 */
 	protected renderSearchNoResults(container: HTMLElement): void {
-		// Use correct document for pop-out window support
-		const doc = container.ownerDocument;
-
-		const noResultsEl = doc.createElement("div");
-		noResultsEl.className = "tn-search-no-results";
-
-		const textEl = doc.createElement("div");
-		textEl.className = "tn-search-no-results__text";
-		textEl.textContent = `No tasks match "${this.currentSearchTerm}"`;
-
-		const hintEl = doc.createElement("div");
-		hintEl.className = "tn-search-no-results__hint";
-		hintEl.textContent = "Try a different search term or clear the search";
-
-		noResultsEl.appendChild(textEl);
-		noResultsEl.appendChild(hintEl);
-		container.appendChild(noResultsEl);
+		renderBasesSearchNoResults(container, this.currentSearchTerm);
 	}
 
 	// =====================
@@ -694,19 +827,13 @@ export abstract class BasesViewBase extends Component {
 
 		// Keyboard event handler for selection mode
 		const handleKeyDown = (e: KeyboardEvent) => {
-			// Escape exits selection mode and clears selection
-			if (e.key === "Escape" && selectionService.isSelectionModeActive()) {
-				selectionService.exitSelectionMode(true);
-				this.updateSelectionModeUI(false);
-			}
-
-			// Ctrl/Cmd + A to select all visible tasks (only when in selection mode)
-			if ((e.ctrlKey || e.metaKey) && e.key === "a" && selectionService.isSelectionModeActive()) {
-				e.preventDefault();
-				const visiblePaths = this.getVisibleTaskPaths();
-				selectionService.selectAll(visiblePaths);
-				this.updateSelectionVisuals();
-			}
+			handleBasesSelectionKeyDown({
+				event: e,
+				selectionService,
+				getVisibleTaskPaths: () => this.getVisibleTaskPaths(),
+				updateSelectionModeUi: (active) => this.updateSelectionModeUI(active),
+				updateSelectionVisuals: () => this.updateSelectionVisuals(),
+			});
 		};
 
 		// Add listener to the root element
@@ -736,15 +863,7 @@ export abstract class BasesViewBase extends Component {
 	protected updateSelectionModeUI(active: boolean): void {
 		if (!this.rootElement) return;
 
-		if (active) {
-			this.rootElement.classList.add("tn-selection-mode");
-			this.rootElement.setAttribute("data-selection-mode", "true");
-		} else {
-			this.rootElement.classList.remove("tn-selection-mode");
-			this.rootElement.removeAttribute("data-selection-mode");
-			// Also clear visual selection indicators
-			this.clearSelectionVisuals();
-		}
+		setBasesSelectionModeUi(this.rootElement, active);
 	}
 
 	/**
@@ -756,45 +875,7 @@ export abstract class BasesViewBase extends Component {
 		const selectionService = this.plugin.taskSelectionService;
 		if (!selectionService) return;
 
-		// Find all task cards and update their selection state
-		const primaryPath = selectionService.getPrimarySelectedPath();
-
-		const cards = this.rootElement.querySelectorAll<HTMLElement>(".task-card");
-		for (const card of cards) {
-			const path = card.dataset.taskPath;
-			if (path) {
-				if (selectionService.isSelected(path)) {
-					card.classList.add("task-card--selected");
-					if (path === primaryPath) {
-						card.classList.add("task-card--selected-primary");
-					} else {
-						card.classList.remove("task-card--selected-primary");
-					}
-				} else {
-					card.classList.remove("task-card--selected");
-					card.classList.remove("task-card--selected-primary");
-				}
-			}
-		}
-
-		// Also update kanban card wrappers (for visual consistency)
-		const cardWrappers = this.rootElement.querySelectorAll<HTMLElement>(".kanban-view__card-wrapper");
-		for (const wrapper of cardWrappers) {
-			const path = wrapper.dataset.taskPath;
-			if (path) {
-				if (selectionService.isSelected(path)) {
-					wrapper.classList.add("kanban-view__card-wrapper--selected");
-					if (path === primaryPath) {
-						wrapper.classList.add("kanban-view__card-wrapper--selected-primary");
-					} else {
-						wrapper.classList.remove("kanban-view__card-wrapper--selected-primary");
-					}
-				} else {
-					wrapper.classList.remove("kanban-view__card-wrapper--selected");
-					wrapper.classList.remove("kanban-view__card-wrapper--selected-primary");
-				}
-			}
-		}
+		updateBasesSelectionVisuals(this.rootElement, selectionService);
 	}
 
 	/**
@@ -803,17 +884,7 @@ export abstract class BasesViewBase extends Component {
 	protected clearSelectionVisuals(): void {
 		if (!this.rootElement) return;
 
-		const cards = this.rootElement.querySelectorAll<HTMLElement>(".task-card--selected");
-		for (const card of cards) {
-			card.classList.remove("task-card--selected");
-			card.classList.remove("task-card--selected-primary");
-		}
-
-		const cardWrappers = this.rootElement.querySelectorAll<HTMLElement>(".kanban-view__card-wrapper--selected");
-		for (const wrapper of cardWrappers) {
-			wrapper.classList.remove("kanban-view__card-wrapper--selected");
-			wrapper.classList.remove("kanban-view__card-wrapper--selected-primary");
-		}
+		clearBasesSelectionVisuals(this.rootElement);
 	}
 
 	/**
@@ -822,24 +893,15 @@ export abstract class BasesViewBase extends Component {
 	protected updateSelectionIndicator(count: number): void {
 		if (!this.rootElement) return;
 
-		if (count > 0) {
-			// Create or update indicator
-			if (!this.selectionIndicatorEl) {
-				// Use correct document for pop-out window support
-				const doc = this.rootElement.ownerDocument;
-				this.selectionIndicatorEl = doc.createElement("div");
-				this.selectionIndicatorEl.className = "tn-selection-indicator";
-				this.selectionIndicatorEl.addEventListener("click", () => {
-					this.plugin.taskSelectionService?.clearSelection();
-					this.plugin.taskSelectionService?.exitSelectionMode();
-				});
-				this.rootElement.appendChild(this.selectionIndicatorEl);
-			}
-			this.selectionIndicatorEl.textContent = `${count} selected`;
-			this.selectionIndicatorEl.style.display = "block";
-		} else if (this.selectionIndicatorEl) {
-			this.selectionIndicatorEl.style.display = "none";
-		}
+		this.selectionIndicatorEl = updateBasesSelectionIndicator({
+			rootElement: this.rootElement,
+			indicatorEl: this.selectionIndicatorEl,
+			count,
+			onClearSelection: () => {
+				this.plugin.taskSelectionService?.clearSelection();
+				this.plugin.taskSelectionService?.exitSelectionMode();
+			},
+		});
 	}
 
 	/**
@@ -848,33 +910,19 @@ export abstract class BasesViewBase extends Component {
 	 */
 	protected handleSelectionClick(event: MouseEvent, taskPath: string): boolean {
 		const selectionService = this.plugin.taskSelectionService;
-		if (!selectionService) return false;
+		const handled = handleBasesSelectionClick({
+			event,
+			taskPath,
+			selectionService,
+			getVisibleTaskPaths: () => this.getVisibleTaskPaths(),
+			updateSelectionVisuals: () => this.updateSelectionVisuals(),
+		});
 
-		// If not in selection mode and no modifier keys, don't handle
-		if (!selectionService.isSelectionModeActive() && !event.shiftKey && !event.ctrlKey && !event.metaKey) {
-			return false;
+		if (handled) {
+			this.rootElement?.focus({ preventScroll: true });
 		}
 
-		// Enter selection mode if shift is pressed
-		if (event.shiftKey && !selectionService.isSelectionModeActive()) {
-			selectionService.enterSelectionMode();
-		}
-
-		// Handle different click modes
-		if (event.shiftKey) {
-			// Range selection
-			const visiblePaths = this.getVisibleTaskPaths();
-			selectionService.selectRange(taskPath, visiblePaths);
-		} else if (event.ctrlKey || event.metaKey) {
-			// Toggle individual selection
-			selectionService.toggleSelection(taskPath);
-		} else if (selectionService.isSelectionModeActive()) {
-			// In selection mode, regular click toggles selection
-			selectionService.toggleSelection(taskPath);
-		}
-
-		this.updateSelectionVisuals();
-		return true;
+		return handled;
 	}
 
 	/**
@@ -891,7 +939,7 @@ export abstract class BasesViewBase extends Component {
 			plugin: this.plugin,
 			selectedPaths,
 			onUpdate: () => {
-				this.render();
+				void this.render();
 			},
 		});
 
@@ -903,18 +951,7 @@ export abstract class BasesViewBase extends Component {
 	 * Subclasses should override this to return the correct paths based on their rendering.
 	 */
 	protected getVisibleTaskPaths(): string[] {
-		// Default implementation: extract from DOM
-		if (!this.rootElement) return [];
-
-		const cards = this.rootElement.querySelectorAll<HTMLElement>(".task-card[data-task-path]");
-		const paths: string[] = [];
-		for (const card of cards) {
-			const path = card.dataset.taskPath;
-			if (path) {
-				paths.push(path);
-			}
-		}
-		return paths;
+		return getVisibleTaskPathsFromBasesRoot(this.rootElement);
 	}
 
 	// Abstract methods that subclasses must implement
@@ -923,7 +960,7 @@ export abstract class BasesViewBase extends Component {
 	 * Render the view with current data.
 	 * Subclasses implement view-specific rendering (list, kanban, calendar).
 	 */
-	abstract render(): void;
+	abstract render(): void | Promise<void>;
 
 	/**
 	 * Render an error state when rendering fails.
@@ -936,7 +973,10 @@ export abstract class BasesViewBase extends Component {
 	 * Handle a single task update for selective rendering.
 	 * Subclasses can implement efficient updates or fall back to full refresh.
 	 */
-	protected abstract handleTaskUpdate(task: TaskInfo): Promise<void>;
+	protected abstract handleTaskUpdate(
+		task: TaskInfo,
+		source?: BasesTaskUpdateSource
+	): Promise<void>;
 
 	/**
 	 * The view type identifier (required by BasesView).

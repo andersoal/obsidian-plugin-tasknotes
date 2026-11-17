@@ -1,0 +1,542 @@
+import type { FieldMappingKey, TaskInfo, TimeEntry } from "../../types";
+import { addDTSTARTToRecurrenceRule, updateToNextScheduledOccurrence } from "../../core/recurrence";
+import {
+	applyGoogleCalendarRecurringExceptionCleanup,
+	applyGoogleCalendarRecurringExceptionForScheduledChange,
+	resolveGoogleCalendarRecurringExceptionAfterCurrentInstanceAction,
+} from "./googleCalendarRecurringExceptions";
+import {
+	applyRecurringMoveForScheduledChange,
+	clearRecurringMoveAfterSeriesChange,
+	getRecurringMoveOriginalDate,
+	resolveRecurringMoveAfterAction,
+} from "./recurringMoveIdentity";
+import {
+	applyPropertyTaskIdentifier,
+	getFrontmatterTags,
+} from "../../utils/taskIdentificationFrontmatter";
+
+export type TaskUpdateInput = Partial<TaskInfo> & {
+	details?: string;
+	customFrontmatter?: Record<string, unknown>;
+};
+
+export interface TaskUpdateFieldMapper {
+	mapFromFrontmatter: (
+		frontmatter: unknown,
+		filePath: string,
+		storeTitleInFilename?: boolean
+	) => Partial<TaskInfo>;
+	mapToFrontmatter: (
+		taskData: Partial<TaskInfo>,
+		taskTag?: string,
+		storeTitleInFilename?: boolean
+	) => Record<string, unknown>;
+	toUserField: (field: FieldMappingKey) => string;
+}
+
+export interface TaskIdentificationSettings {
+	method: string;
+	tag: string;
+	propertyName: string;
+	propertyValue: string;
+}
+
+export interface BuildTaskUpdateRecurrenceUpdatesInput {
+	originalTask: TaskInfo;
+	updates: TaskUpdateInput;
+	maintainDueDateOffsetInRecurring: boolean;
+	updateToNextScheduledOccurrenceFn?: typeof updateToNextScheduledOccurrence;
+	addDTSTARTToRecurrenceRuleFn?: typeof addDTSTARTToRecurrenceRule;
+}
+
+export interface ApplyTaskUpdateFrontmatterChangeInput {
+	frontmatter: Record<string, unknown>;
+	originalTask: TaskInfo;
+	updates: TaskUpdateInput;
+	recurrenceUpdates: Partial<TaskInfo>;
+	dateModified: string;
+	fieldMapper: TaskUpdateFieldMapper;
+	taskIdentification: TaskIdentificationSettings;
+	storeTitleInFilename: boolean;
+	titleIsRepresentedByFilename?: boolean;
+	updateCompletedDateInFrontmatter: (
+		frontmatter: Record<string, unknown>,
+		newStatus: string,
+		isRecurring: boolean
+	) => void;
+}
+
+export interface ApplyTaskUpdateFrontmatterChangeResult {
+	finalTags: string[];
+}
+
+export interface BuildUpdatedTaskFromPlanInput {
+	originalTask: TaskInfo;
+	updates: TaskUpdateInput;
+	recurrenceUpdates: Partial<TaskInfo>;
+	newPath: string;
+	dateModified: string;
+	currentDateString: string;
+	normalizedDetails: string | null;
+	finalTags?: string[];
+	isCompletedStatus: (status: string) => boolean;
+}
+
+export function normalizeTaskUpdateInput(updates: TaskUpdateInput): TaskUpdateInput {
+	if (!Array.isArray(updates.timeEntries)) {
+		return { ...updates };
+	}
+
+	return {
+		...updates,
+		timeEntries: updates.timeEntries.map(stripTimeEntryDuration),
+	};
+}
+
+function stripTimeEntryDuration(entry: TimeEntry): TimeEntry {
+	const sanitizedEntry = { ...entry };
+	delete sanitizedEntry.duration;
+	return sanitizedEntry;
+}
+
+function getStringArray(value: unknown): string[] {
+	return Array.isArray(value)
+		? value.filter((entry): entry is string => typeof entry === "string")
+		: [];
+}
+
+/**
+ * When completing or skipping a recurring instance also advances `scheduled` to the
+ * next occurrence, that's the series cursor rolling forward - not a manual reschedule
+ * of a single occurrence. Returns the instance date that was newly marked complete or
+ * skipped, if any, so the caller can resolve (rather than create) a Google Calendar
+ * "moved occurrence" exception. Without this distinction, sync would create a detached
+ * event for the next occurrence in addition to the recurring series event already
+ * covering that date.
+ */
+function getNewlyRecordedInstanceDate(
+	originalTask: TaskInfo,
+	updates: TaskUpdateInput
+): string | undefined {
+	const originalCompleted = new Set(getStringArray(originalTask.complete_instances));
+	const originalSkipped = new Set(getStringArray(originalTask.skipped_instances));
+
+	let latest: string | undefined;
+	const consider = (dateStr: string) => {
+		if (!latest || dateStr > latest) {
+			latest = dateStr;
+		}
+	};
+
+	if (Object.prototype.hasOwnProperty.call(updates, "complete_instances")) {
+		for (const dateStr of getStringArray(updates.complete_instances)) {
+			if (!originalCompleted.has(dateStr)) {
+				consider(dateStr);
+			}
+		}
+	}
+
+	if (Object.prototype.hasOwnProperty.call(updates, "skipped_instances")) {
+		for (const dateStr of getStringArray(updates.skipped_instances)) {
+			if (!originalSkipped.has(dateStr)) {
+				consider(dateStr);
+			}
+		}
+	}
+
+	return latest;
+}
+
+export function normalizeTaskUpdateDetails(updates: TaskUpdateInput): string | null {
+	if (!Object.prototype.hasOwnProperty.call(updates, "details")) {
+		return null;
+	}
+
+	return typeof updates.details === "string" ? updates.details.replace(/\r\n/g, "\n") : "";
+}
+
+export function buildTaskUpdateRecurrenceUpdates({
+	originalTask,
+	updates,
+	maintainDueDateOffsetInRecurring,
+	updateToNextScheduledOccurrenceFn = updateToNextScheduledOccurrence,
+	addDTSTARTToRecurrenceRuleFn = addDTSTARTToRecurrenceRule,
+}: BuildTaskUpdateRecurrenceUpdatesInput): Partial<TaskInfo> {
+	const recurrenceUpdates: Partial<TaskInfo> = {};
+
+	if (updates.recurrence !== undefined && updates.recurrence !== originalTask.recurrence) {
+		const tempTask: TaskInfo = { ...originalTask, ...updates };
+		const nextDates = updateToNextScheduledOccurrenceFn(
+			tempTask,
+			maintainDueDateOffsetInRecurring
+		);
+		if (nextDates.scheduled) {
+			recurrenceUpdates.scheduled = nextDates.scheduled;
+		}
+		if (nextDates.due) {
+			recurrenceUpdates.due = nextDates.due;
+		}
+		if (
+			typeof updates.recurrence === "string" &&
+			updates.recurrence &&
+			!updates.recurrence.includes("DTSTART:")
+		) {
+			const tempTaskWithRecurrence: TaskInfo = {
+				...originalTask,
+				...updates,
+				...recurrenceUpdates,
+			};
+			const updatedRecurrence = addDTSTARTToRecurrenceRuleFn(tempTaskWithRecurrence);
+			if (updatedRecurrence) {
+				recurrenceUpdates.recurrence = updatedRecurrence;
+			}
+		}
+	} else if (
+		updates.recurrence !== undefined &&
+		!originalTask.recurrence &&
+		updates.recurrence
+	) {
+		if (
+			typeof updates.recurrence === "string" &&
+			!updates.recurrence.includes("DTSTART:")
+		) {
+			const tempTask: TaskInfo = { ...originalTask, ...updates };
+			const updatedRecurrence = addDTSTARTToRecurrenceRuleFn(tempTask);
+			if (updatedRecurrence) {
+				recurrenceUpdates.recurrence = updatedRecurrence;
+			}
+		}
+	}
+
+	if (
+		updates.scheduled !== undefined &&
+		updates.scheduled !== originalTask.scheduled &&
+		(!Object.prototype.hasOwnProperty.call(updates, "recurrence") ||
+			updates.recurrence === originalTask.recurrence) &&
+		originalTask.recurrence &&
+		typeof originalTask.recurrence === "string" &&
+		!originalTask.recurrence.includes("DTSTART:")
+	) {
+		const updatedRecurrence = addDTSTARTToRecurrenceRuleFn(originalTask);
+		if (updatedRecurrence) {
+			recurrenceUpdates.recurrence = updatedRecurrence;
+		}
+	}
+
+	if (Object.prototype.hasOwnProperty.call(updates, "scheduled")) {
+		const nextTask: TaskInfo = { ...originalTask, ...updates, ...recurrenceUpdates };
+		const completionActionDate = getNewlyRecordedInstanceDate(originalTask, updates);
+
+		// History edits alone do not prove this is automatic advancement: API/modal
+		// patches can also include an intentional reschedule. Compare against the
+		// next occurrence from the original cursor, using only the updated history.
+		const expectedAdvance = completionActionDate
+			? updateToNextScheduledOccurrenceFn({
+				...originalTask,
+				complete_instances: updates.complete_instances ?? originalTask.complete_instances,
+				skipped_instances: updates.skipped_instances ?? originalTask.skipped_instances,
+			}, maintainDueDateOffsetInRecurring)
+			: undefined;
+		const isAutomaticAdvance =
+			completionActionDate &&
+			updates.scheduled === expectedAdvance?.scheduled &&
+			(updates.recurrence === undefined || updates.recurrence === originalTask.recurrence);
+
+		if (isAutomaticAdvance) {
+			const pendingOriginal = getRecurringMoveOriginalDate(originalTask);
+			const processed =
+				pendingOriginal &&
+				(nextTask.complete_instances?.includes(pendingOriginal) ||
+					nextTask.skipped_instances?.includes(pendingOriginal));
+			if (pendingOriginal && !processed) {
+				nextTask.scheduled = originalTask.scheduled;
+				nextTask.due = originalTask.due;
+				recurrenceUpdates.scheduled = originalTask.scheduled;
+				recurrenceUpdates.due = originalTask.due;
+			} else {
+				resolveRecurringMoveAfterAction(originalTask, nextTask, true);
+			}
+			resolveGoogleCalendarRecurringExceptionAfterCurrentInstanceAction(
+				originalTask,
+				completionActionDate,
+				nextTask
+			);
+		} else {
+			applyRecurringMoveForScheduledChange(originalTask, nextTask);
+			applyGoogleCalendarRecurringExceptionForScheduledChange(
+				originalTask,
+				updates.scheduled,
+				nextTask
+			);
+		}
+
+		recurrenceUpdates.googleCalendarExceptionOriginalScheduled =
+			nextTask.googleCalendarExceptionOriginalScheduled;
+		recurrenceUpdates.googleCalendarMovedOriginalDates =
+			nextTask.googleCalendarMovedOriginalDates;
+		if (originalTask.recurrence_original_date || nextTask.recurrence_original_date) {
+			recurrenceUpdates.recurrence_original_date = nextTask.recurrence_original_date;
+		}
+	}
+
+	const nextTask: TaskInfo = { ...originalTask, ...updates, ...recurrenceUpdates };
+	if (
+		Object.prototype.hasOwnProperty.call(updates, "recurrence") ||
+		Object.prototype.hasOwnProperty.call(updates, "recurrence_anchor")
+	) {
+		clearRecurringMoveAfterSeriesChange(originalTask, nextTask);
+		if (originalTask.recurrence_original_date || nextTask.recurrence_original_date) {
+			recurrenceUpdates.recurrence_original_date = nextTask.recurrence_original_date;
+		}
+	}
+	applyGoogleCalendarRecurringExceptionCleanup(nextTask);
+	recurrenceUpdates.googleCalendarExceptionOriginalScheduled =
+		nextTask.googleCalendarExceptionOriginalScheduled;
+	recurrenceUpdates.googleCalendarMovedOriginalDates = nextTask.googleCalendarMovedOriginalDates;
+
+	return recurrenceUpdates;
+}
+
+export function applyTaskUpdateFrontmatterChange({
+	frontmatter,
+	originalTask,
+	updates,
+	recurrenceUpdates,
+	dateModified,
+	fieldMapper,
+	taskIdentification,
+	storeTitleInFilename,
+	titleIsRepresentedByFilename = false,
+	updateCompletedDateInFrontmatter,
+}: ApplyTaskUpdateFrontmatterChangeInput): ApplyTaskUpdateFrontmatterChangeResult {
+	// Publish only the named patch and its recurrence consequences.
+	const completeTaskData: Partial<TaskInfo> = {
+		tags: getFrontmatterTags(frontmatter.tags),
+		...updates,
+		...recurrenceUpdates,
+		dateModified,
+	};
+
+	const mappedFrontmatter = fieldMapper.mapToFrontmatter(
+		completeTaskData,
+		taskIdentification.method === "tag" ? taskIdentification.tag : undefined,
+		storeTitleInFilename
+	);
+	preserveUnchangedExistingTitleFrontmatter(frontmatter, updates, mappedFrontmatter, fieldMapper);
+
+	Object.entries(mappedFrontmatter).forEach(([key, value]) => {
+		if (value !== undefined) {
+			frontmatter[key] = value;
+		}
+	});
+
+	if (updates.status !== undefined) {
+		updateCompletedDateInFrontmatter(frontmatter, updates.status, !!originalTask.recurrence);
+	}
+
+	if (taskIdentification.method === "property") {
+		applyConfiguredPropertyTaskIdentifier(frontmatter, taskIdentification);
+	}
+
+	if (updates.customFrontmatter) {
+		Object.entries(updates.customFrontmatter).forEach(([key, value]) => {
+			if (value === null) {
+				delete frontmatter[key];
+			} else {
+				frontmatter[key] = value;
+			}
+		});
+	}
+
+	removeUnsetMappedFields(frontmatter, { ...updates, ...recurrenceUpdates }, fieldMapper);
+
+	// Use the resolved filename, not just the requested title: sanitization,
+	// fallback names and collision suffixes all need a lossless property copy.
+	if (
+		storeTitleInFilename &&
+		updates.title !== undefined &&
+		updates.title !== originalTask.title
+	) {
+		const titleField = fieldMapper.toUserField("title");
+		if (titleIsRepresentedByFilename) {
+			delete frontmatter[titleField];
+		} else {
+			frontmatter[titleField] = updates.title;
+		}
+	}
+
+	if (Object.prototype.hasOwnProperty.call(updates, "tags")) {
+		const tagsToSet = getFrontmatterTags(updates.tags);
+		if (tagsToSet.length > 0) {
+			frontmatter.tags = tagsToSet;
+		} else {
+			delete frontmatter.tags;
+		}
+	}
+
+	if (taskIdentification.method === "property") {
+		applyPropertyTaskIdentifier(
+			frontmatter,
+			taskIdentification.propertyName,
+			taskIdentification.propertyValue
+		);
+	}
+
+	return {
+		finalTags: getFrontmatterTags(frontmatter.tags),
+	};
+}
+
+function preserveUnchangedExistingTitleFrontmatter(
+	frontmatter: Record<string, unknown>,
+	updates: TaskUpdateInput,
+	mappedFrontmatter: Record<string, unknown>,
+	fieldMapper: TaskUpdateFieldMapper
+): void {
+	if (Object.prototype.hasOwnProperty.call(updates, "title")) {
+		return;
+	}
+
+	const titleField = fieldMapper.toUserField("title");
+	if (Object.prototype.hasOwnProperty.call(frontmatter, titleField)) {
+		delete mappedFrontmatter[titleField];
+	}
+}
+
+function applyConfiguredPropertyTaskIdentifier(
+	frontmatter: Record<string, unknown>,
+	taskIdentification: TaskIdentificationSettings
+): void {
+	applyPropertyTaskIdentifier(
+		frontmatter,
+		taskIdentification.propertyName,
+		taskIdentification.propertyValue
+	);
+}
+
+function removeUnsetMappedFields(
+	frontmatter: Record<string, unknown>,
+	updates: TaskUpdateInput,
+	fieldMapper: TaskUpdateFieldMapper
+): void {
+	if (Object.prototype.hasOwnProperty.call(updates, "due") && updates.due === undefined) {
+		delete frontmatter[fieldMapper.toUserField("due")];
+	}
+	if (
+		Object.prototype.hasOwnProperty.call(updates, "scheduled") &&
+		updates.scheduled === undefined
+	) {
+		delete frontmatter[fieldMapper.toUserField("scheduled")];
+	}
+	if (
+		Object.prototype.hasOwnProperty.call(updates, "contexts") &&
+		(!Array.isArray(updates.contexts) || updates.contexts.length === 0)
+	) {
+		delete frontmatter[fieldMapper.toUserField("contexts")];
+	}
+	if (Object.prototype.hasOwnProperty.call(updates, "projects")) {
+		const projectsField = fieldMapper.toUserField("projects");
+		const projectsToSet = Array.isArray(updates.projects) ? updates.projects : [];
+		if (projectsToSet.length > 0) {
+			frontmatter[projectsField] = projectsToSet;
+		} else {
+			delete frontmatter[projectsField];
+		}
+	}
+	if (
+		Object.prototype.hasOwnProperty.call(updates, "attachments") &&
+		(!Array.isArray(updates.attachments) || updates.attachments.length === 0)
+	) {
+		delete frontmatter[fieldMapper.toUserField("attachments")];
+	}
+	if (
+		Object.prototype.hasOwnProperty.call(updates, "timeEstimate") &&
+		updates.timeEstimate === undefined
+	) {
+		delete frontmatter[fieldMapper.toUserField("timeEstimate")];
+	}
+	if (
+		Object.prototype.hasOwnProperty.call(updates, "completedDate") &&
+		updates.completedDate === undefined
+	) {
+		delete frontmatter[fieldMapper.toUserField("completedDate")];
+	}
+	if (
+		Object.prototype.hasOwnProperty.call(updates, "recurrence") &&
+		updates.recurrence === undefined
+	) {
+		delete frontmatter[fieldMapper.toUserField("recurrence")];
+	}
+	if (
+		Object.prototype.hasOwnProperty.call(updates, "recurrence_original_date") &&
+		updates.recurrence_original_date === undefined
+	) {
+		delete frontmatter[fieldMapper.toUserField("recurrenceOriginalDate")];
+	}
+	if (
+		Object.prototype.hasOwnProperty.call(updates, "googleCalendarExceptionOriginalScheduled") &&
+		updates.googleCalendarExceptionOriginalScheduled === undefined
+	) {
+		delete frontmatter[fieldMapper.toUserField("googleCalendarExceptionOriginalScheduled")];
+	}
+	if (
+		Object.prototype.hasOwnProperty.call(updates, "googleCalendarMovedOriginalDates") &&
+		(!Array.isArray(updates.googleCalendarMovedOriginalDates) ||
+			updates.googleCalendarMovedOriginalDates.length === 0)
+	) {
+		delete frontmatter[fieldMapper.toUserField("googleCalendarMovedOriginalDates")];
+	}
+	if (
+		Object.prototype.hasOwnProperty.call(updates, "blockedBy") &&
+		(!Array.isArray(updates.blockedBy) || updates.blockedBy.length === 0)
+	) {
+		delete frontmatter[fieldMapper.toUserField("blockedBy")];
+	}
+	if (
+		Object.prototype.hasOwnProperty.call(updates, "reminders") &&
+		(!Array.isArray(updates.reminders) || updates.reminders.length === 0)
+	) {
+		delete frontmatter[fieldMapper.toUserField("reminders")];
+	}
+}
+
+export function buildUpdatedTaskFromPlan({
+	originalTask,
+	updates,
+	recurrenceUpdates,
+	newPath,
+	dateModified,
+	currentDateString,
+	normalizedDetails,
+	finalTags,
+	isCompletedStatus,
+}: BuildUpdatedTaskFromPlanInput): TaskInfo {
+	const updatedTask: TaskInfo = {
+		...originalTask,
+		...updates,
+		...recurrenceUpdates,
+		path: newPath,
+		dateModified,
+	};
+
+	if (finalTags) {
+		updatedTask.tags = finalTags;
+	}
+
+	if (normalizedDetails !== null) {
+		updatedTask.details = normalizedDetails;
+	}
+
+	if (updates.status !== undefined && !originalTask.recurrence) {
+		if (isCompletedStatus(updates.status)) {
+			if (!originalTask.completedDate) {
+				updatedTask.completedDate = currentDateString;
+			}
+		} else {
+			updatedTask.completedDate = undefined;
+		}
+	}
+
+	return updatedTask;
+}

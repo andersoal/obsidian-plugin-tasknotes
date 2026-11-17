@@ -1,9 +1,10 @@
-import { TAbstractFile } from "obsidian";
+import { uiData } from "../../../i18n/dataText";
+import { msg } from "@lingui/core/macro";
+import { setIcon, TAbstractFile } from "obsidian";
 import TaskNotesPlugin from "../../../main";
 import {
 	createCard,
 	createCardInput,
-	createDeleteHeaderButton,
 	createCardToggle,
 	CardRow,
 } from "../../components/CardComponent";
@@ -30,7 +31,7 @@ export function renderProjectsPropertyCard(
 
 		const propertyKeyInput = createCardInput(
 			"text",
-			"projects",
+			uiData("projects", "Editable frontmatter property identifier or filename-template syntax, not a display label"),
 			plugin.settings.fieldMapping.projects
 		);
 
@@ -40,7 +41,7 @@ export function renderProjectsPropertyCard(
 		});
 
 		// Create nested content for default projects
-		const nestedContainer = document.createElement("div");
+		const nestedContainer = activeWindow.createDiv();
 		nestedContainer.addClass("tasknotes-settings__nested-content");
 
 		// Default projects container
@@ -68,39 +69,50 @@ export function renderProjectsPropertyCard(
 		// Select projects button
 		const selectButtonContainer = defaultProjectsContainer.createDiv();
 		const selectButton = selectButtonContainer.createEl("button", {
-			text: translate("settings.defaults.basicDefaults.defaultProjects.selectButton"),
+			text: translate(msg({ message: "Select projects", context: "settings.defaults.basicDefaults.defaultProjects.selectButton" })),
 			cls: "tn-btn tn-btn--ghost",
 		});
 		selectButton.onclick = () => {
-			const modal = new ProjectSelectModal(
-				plugin.app,
-				plugin,
-				(file: TAbstractFile) => {
-					if (!selectedDefaultProjectFiles.includes(file)) {
-						selectedDefaultProjectFiles.push(file);
-						const projectLinks = selectedDefaultProjectFiles
-							.map((f) => `[[${f.path.replace(/\.md$/, "")}]]`)
-							.join(", ");
-						plugin.settings.taskCreationDefaults.defaultProjects = projectLinks;
-						save();
-						renderDefaultProjectsList(
-							projectsListContainer,
-							plugin,
-							save,
-							selectedDefaultProjectFiles,
-							translate
-						);
-					}
+			const modal = new ProjectSelectModal(plugin.app, plugin, (file: TAbstractFile) => {
+				if (!selectedDefaultProjectFiles.includes(file)) {
+					selectedDefaultProjectFiles.push(file);
+					const projectLinks = selectedDefaultProjectFiles
+						.map((f) => `[[${f.path.replace(/\.md$/, "")}]]`)
+						.join(", ");
+					plugin.settings.taskCreationDefaults.defaultProjects = projectLinks;
+					save();
+					renderDefaultProjectsList(
+						projectsListContainer,
+						plugin,
+						save,
+						selectedDefaultProjectFiles,
+						translate
+					);
 				}
-			);
+			});
 			modal.open();
 		};
 
 		// Projects list
-		const projectsListContainer = defaultProjectsContainer.createDiv("default-projects-list-container");
-		renderDefaultProjectsList(projectsListContainer, plugin, save, selectedDefaultProjectFiles, translate);
+		const projectsListContainer = defaultProjectsContainer.createDiv(
+			"default-projects-list-container"
+		);
+		renderDefaultProjectsList(
+			projectsListContainer,
+			plugin,
+			save,
+			selectedDefaultProjectFiles,
+			translate
+		);
 
-		// Use parent note as project toggle
+		const useParentNoteForTaskCreationToggle = createCardToggle(
+			plugin.settings.taskCreationDefaults.useParentNoteForTaskCreation,
+			(value) => {
+				plugin.settings.taskCreationDefaults.useParentNoteForTaskCreation = value;
+				save();
+			}
+		);
+
 		const useParentNoteToggle = createCardToggle(
 			plugin.settings.taskCreationDefaults.useParentNoteAsProject,
 			(value) => {
@@ -109,23 +121,63 @@ export function renderProjectsPropertyCard(
 			}
 		);
 
+		const useParentHeaderToggle = createCardToggle(
+			plugin.settings.taskCreationDefaults.useParentHeaderAsProject,
+			(value) => {
+				plugin.settings.taskCreationDefaults.useParentHeaderAsProject = value;
+				save();
+			}
+		);
+
+		const inheritParentTaskPropertiesToggle = createCardToggle(
+			plugin.settings.taskCreationDefaults.inheritParentTaskProperties,
+			(value) => {
+				plugin.settings.taskCreationDefaults.inheritParentTaskProperties = value;
+				save();
+			}
+		);
+
 		const nlpRows = createNLPTriggerRows(plugin, "projects", "+", save, translate);
 
 		// Create description element
 		const descriptionEl = createPropertyDescription(
-			translate("settings.taskProperties.properties.projects.description")
+			translate(msg({ message: "Links to project notes this task belongs to. Stored as wikilinks (e.g., [[Project Name]]). Tasks can belong to multiple projects.", context: "settings.taskProperties.properties.projects.description" }))
 		);
 
 		// Create autosuggest settings section
-		const autosuggestSection = document.createElement("div");
+		const autosuggestSection = activeWindow.createDiv();
 		autosuggestSection.addClass("tasknotes-settings__nested-content");
 		renderProjectAutosuggestSettings(autosuggestSection, plugin, save, translate, renderCard);
 
 		const rows: CardRow[] = [
 			{ label: "", input: descriptionEl, fullWidth: true },
-			{ label: translate("settings.taskProperties.propertyCard.propertyKey"), input: propertyKeyInput },
-			{ label: translate("settings.taskProperties.projectsCard.defaultProjects"), input: nestedContainer, fullWidth: true },
-			{ label: translate("settings.taskProperties.projectsCard.useParentNote"), input: useParentNoteToggle },
+			{
+				label: translate(msg({ message: "Property key:", context: "settings.taskProperties.propertyCard.propertyKey" })),
+				input: propertyKeyInput,
+			},
+			{
+				label: translate(msg({ message: "Default projects:", context: "settings.taskProperties.projectsCard.defaultProjects" })),
+				input: nestedContainer,
+				fullWidth: true,
+			},
+			{
+				label: translate(
+					msg({ message: "Use active note for new tasks:", context: "settings.taskProperties.projectsCard.useParentNoteForTaskCreation" })
+				),
+				input: useParentNoteForTaskCreationToggle,
+			},
+			{
+				label: translate(msg({ message: "Use parent note for inline/instant conversion:", context: "settings.taskProperties.projectsCard.useParentNoteForInlineTasks" })),
+				input: useParentNoteToggle,
+			},
+			{
+				label: translate(msg({ message: "Use parent heading as project:", context: "settings.taskProperties.projectsCard.useParentHeader" })),
+				input: useParentHeaderToggle,
+			},
+			{
+				label: translate(msg({ message: "Inherit parent task properties for subtasks:", context: "settings.taskProperties.projectsCard.inheritParentTaskProperties" })),
+				input: inheritParentTaskPropertiesToggle,
+			},
 			...nlpRows,
 			{ label: "", input: autosuggestSection, fullWidth: true },
 		];
@@ -138,7 +190,7 @@ export function renderProjectsPropertyCard(
 				isCollapsed = collapsed;
 			},
 			header: {
-				primaryText: translate("settings.taskProperties.properties.projects.name"),
+				primaryText: translate(msg({ message: "Projects", context: "settings.taskProperties.properties.projects.name" })),
 				secondaryText: plugin.settings.fieldMapping.projects,
 			},
 			content: {
@@ -187,14 +239,23 @@ function renderProjectAutosuggestSettings(
 	};
 
 	// ===== AUTOSUGGEST FILTERS SECTION =====
+	const projectAutosuggest = plugin.settings.projectAutosuggest;
+	if (!projectAutosuggest) {
+		return;
+	}
+
 	const filterSectionWrapper = container.createDiv("tasknotes-settings__collapsible-section");
 	filterSectionWrapper.addClass("tasknotes-settings__collapsible-section--collapsed");
 
-	const filterHeader = filterSectionWrapper.createDiv("tasknotes-settings__collapsible-section-header");
-	const filterHeaderLeft = filterHeader.createDiv("tasknotes-settings__collapsible-section-header-left");
+	const filterHeader = filterSectionWrapper.createDiv(
+		"tasknotes-settings__collapsible-section-header"
+	);
+	const filterHeaderLeft = filterHeader.createDiv(
+		"tasknotes-settings__collapsible-section-header-left"
+	);
 
 	filterHeaderLeft.createSpan({
-		text: translate("settings.taskProperties.projectsCard.autosuggestFilters"),
+		text: translate(msg({ message: "Autosuggest filters", context: "settings.taskProperties.projectsCard.autosuggestFilters" })),
 		cls: "tasknotes-settings__collapsible-section-title",
 	});
 
@@ -202,32 +263,62 @@ function renderProjectAutosuggestSettings(
 	const filterBadge = filterHeaderLeft.createSpan("tasknotes-settings__filter-badge");
 	const updateFilterBadge = () => {
 		if (hasActiveFilters()) {
-			filterBadge.style.display = "inline-flex";
-			filterBadge.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"></polygon></svg><span>${translate("settings.taskProperties.projectsCard.filtersOn")}</span>`;
+			filterBadge.classList.remove(
+				"tn-static-display-block-2a1b75c9",
+				"tn-static-display-flex-4d51fc62",
+				"tn-static-display-flex-75816cae",
+				"tn-static-display-flex-8bb39979",
+				"tn-static-display-inline-block-60e32dcb",
+				"tn-static-display-inline-cccfa456",
+				"tn-static-display-none-6b99de8b",
+				"tn-static-min-height-800px-997b4c8c"
+			);
+			filterBadge.classList.add("tn-static-display-inline-flex-f984c520");
+			filterBadge.empty();
+			const iconEl = filterBadge.createSpan();
+			setIcon(iconEl, "filter");
+			filterBadge.createSpan({
+				text: translate(msg({ message: "Filters on", context: "settings.taskProperties.projectsCard.filtersOn" })),
+			});
 		} else {
-			filterBadge.style.display = "none";
+			filterBadge.classList.remove(
+				"tn-static-display-block-2a1b75c9",
+				"tn-static-display-flex-4d51fc62",
+				"tn-static-display-flex-75816cae",
+				"tn-static-display-flex-8bb39979",
+				"tn-static-display-inline-block-60e32dcb",
+				"tn-static-display-inline-cccfa456",
+				"tn-static-display-inline-flex-f984c520",
+				"tn-static-min-height-800px-997b4c8c"
+			);
+			filterBadge.classList.add("tn-static-display-none-6b99de8b");
+			filterBadge.empty();
 		}
 	};
 	updateFilterBadge();
 
-	const filterChevron = filterHeader.createSpan("tasknotes-settings__collapsible-section-chevron");
-	filterChevron.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>`;
+	const filterChevron = filterHeader.createSpan(
+		"tasknotes-settings__collapsible-section-chevron"
+	);
+	setIcon(filterChevron, "chevron-down");
 
-	const filterContent = filterSectionWrapper.createDiv("tasknotes-settings__collapsible-section-content");
+	const filterContent = filterSectionWrapper.createDiv(
+		"tasknotes-settings__collapsible-section-content"
+	);
 
 	createFilterSettingsInputs(
 		filterContent,
 		{
-			requiredTags: plugin.settings.projectAutosuggest.requiredTags,
-			includeFolders: plugin.settings.projectAutosuggest.includeFolders,
-			propertyKey: plugin.settings.projectAutosuggest.propertyKey,
-			propertyValue: plugin.settings.projectAutosuggest.propertyValue,
+			requiredTags: projectAutosuggest.requiredTags,
+			includeFolders: projectAutosuggest.includeFolders,
+			propertyKey: projectAutosuggest.propertyKey,
+			propertyValue: projectAutosuggest.propertyValue,
 		},
 		(updated) => {
-			plugin.settings.projectAutosuggest!.requiredTags = updated.requiredTags;
-			plugin.settings.projectAutosuggest!.includeFolders = updated.includeFolders;
-			plugin.settings.projectAutosuggest!.propertyKey = updated.propertyKey;
-			plugin.settings.projectAutosuggest!.propertyValue = updated.propertyValue;
+			projectAutosuggest.requiredTags = updated.requiredTags;
+			projectAutosuggest.includeFolders = updated.includeFolders;
+			projectAutosuggest.propertyKey = updated.propertyKey;
+			projectAutosuggest.propertyValue = updated.propertyValue;
 			updateFilterBadge();
 			save();
 		},
@@ -245,37 +336,42 @@ function renderProjectAutosuggestSettings(
 	const displaySectionWrapper = container.createDiv("tasknotes-settings__collapsible-section");
 	displaySectionWrapper.addClass("tasknotes-settings__collapsible-section--collapsed");
 
-	const displayHeader = displaySectionWrapper.createDiv("tasknotes-settings__collapsible-section-header");
-	const displayHeaderLeft = displayHeader.createDiv("tasknotes-settings__collapsible-section-header-left");
+	const displayHeader = displaySectionWrapper.createDiv(
+		"tasknotes-settings__collapsible-section-header"
+	);
+	const displayHeaderLeft = displayHeader.createDiv(
+		"tasknotes-settings__collapsible-section-header-left"
+	);
 
 	displayHeaderLeft.createSpan({
-		text: translate("settings.taskProperties.projectsCard.customizeDisplay"),
+		text: translate(msg({ message: "Customize display", context: "settings.taskProperties.projectsCard.customizeDisplay" })),
 		cls: "tasknotes-settings__collapsible-section-title",
 	});
 
-	const displayChevron = displayHeader.createSpan("tasknotes-settings__collapsible-section-chevron");
-	displayChevron.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>`;
+	const displayChevron = displayHeader.createSpan(
+		"tasknotes-settings__collapsible-section-chevron"
+	);
+	setIcon(displayChevron, "chevron-down");
 
-	const displayContent = displaySectionWrapper.createDiv("tasknotes-settings__collapsible-section-content");
+	const displayContent = displaySectionWrapper.createDiv(
+		"tasknotes-settings__collapsible-section-content"
+	);
 
 	// Fuzzy matching toggle
 	const fuzzyRow = displayContent.createDiv("tasknotes-settings__card-config-row");
 	fuzzyRow.createSpan({
-		text: translate("settings.appearance.projectAutosuggest.enableFuzzyMatching.name"),
+		text: translate(msg({ message: "Enable fuzzy matching", context: "settings.appearance.projectAutosuggest.enableFuzzyMatching.name" })),
 		cls: "tasknotes-settings__card-config-label",
 	});
-	const fuzzyToggle = createCardToggle(
-		plugin.settings.projectAutosuggest.enableFuzzy,
-		(value) => {
-			plugin.settings.projectAutosuggest!.enableFuzzy = value;
-			save();
-		}
-	);
+	const fuzzyToggle = createCardToggle(projectAutosuggest.enableFuzzy, (value) => {
+		projectAutosuggest.enableFuzzy = value;
+		save();
+	});
 	fuzzyRow.appendChild(fuzzyToggle);
 
 	// Display rows help text
 	displayContent.createDiv({
-		text: translate("settings.appearance.projectAutosuggest.displayRowsHelp"),
+		text: translate(msg({ message: "Configure up to 3 lines of information to show for each project suggestion.", context: "settings.appearance.projectAutosuggest.displayRowsHelp" })),
 		cls: "setting-item-description",
 	});
 
@@ -294,12 +390,12 @@ function renderProjectAutosuggestSettings(
 	// Row 1
 	const row1Container = displayContent.createDiv("tasknotes-settings__card-config-row");
 	row1Container.createSpan({
-		text: translate("settings.appearance.projectAutosuggest.displayRows.row1.name"),
+		text: translate(msg({ message: "Row 1", context: "settings.appearance.projectAutosuggest.displayRows.row1.name" })),
 		cls: "tasknotes-settings__card-config-label",
 	});
 	const row1Input = createCardInput(
 		"text",
-		translate("settings.appearance.projectAutosuggest.displayRows.row1.placeholder"),
+		translate(msg({ message: "'{'title|n(Title)'}'", context: "settings.appearance.projectAutosuggest.displayRows.row1.placeholder" })),
 		getRows()[0] || ""
 	);
 	row1Input.addEventListener("change", () => setRow(0, row1Input.value));
@@ -308,12 +404,12 @@ function renderProjectAutosuggestSettings(
 	// Row 2
 	const row2Container = displayContent.createDiv("tasknotes-settings__card-config-row");
 	row2Container.createSpan({
-		text: translate("settings.appearance.projectAutosuggest.displayRows.row2.name"),
+		text: translate(msg({ message: "Row 2 (optional)", context: "settings.appearance.projectAutosuggest.displayRows.row2.name" })),
 		cls: "tasknotes-settings__card-config-label",
 	});
 	const row2Input = createCardInput(
 		"text",
-		translate("settings.appearance.projectAutosuggest.displayRows.row2.placeholder"),
+		translate(msg({ message: "'{'aliases|n(Aliases)'}'", context: "settings.appearance.projectAutosuggest.displayRows.row2.placeholder" })),
 		getRows()[1] || ""
 	);
 	row2Input.addEventListener("change", () => setRow(1, row2Input.value));
@@ -322,12 +418,12 @@ function renderProjectAutosuggestSettings(
 	// Row 3
 	const row3Container = displayContent.createDiv("tasknotes-settings__card-config-row");
 	row3Container.createSpan({
-		text: translate("settings.appearance.projectAutosuggest.displayRows.row3.name"),
+		text: translate(msg({ message: "Row 3 (optional)", context: "settings.appearance.projectAutosuggest.displayRows.row3.name" })),
 		cls: "tasknotes-settings__card-config-label",
 	});
 	const row3Input = createCardInput(
 		"text",
-		translate("settings.appearance.projectAutosuggest.displayRows.row3.placeholder"),
+		translate(msg({ message: "'{'file.path|n(Path)'}'", context: "settings.appearance.projectAutosuggest.displayRows.row3.placeholder" })),
 		getRows()[2] || ""
 	);
 	row3Input.addEventListener("change", () => setRow(2, row3Input.value));
@@ -336,23 +432,23 @@ function renderProjectAutosuggestSettings(
 	// Quick reference help section
 	const helpContainer = displayContent.createDiv("tasknotes-settings__help-section");
 	helpContainer.createEl("h4", {
-		text: translate("settings.appearance.projectAutosuggest.quickReference.header"),
+		text: translate(msg({ message: "Quick reference", context: "settings.appearance.projectAutosuggest.quickReference.header" })),
 	});
 	const helpList = helpContainer.createEl("ul");
 	helpList.createEl("li", {
-		text: translate("settings.appearance.projectAutosuggest.quickReference.properties"),
+		text: translate(msg({ message: "Available properties: title, aliases, file.path, file.parent, or any frontmatter field", context: "settings.appearance.projectAutosuggest.quickReference.properties" })),
 	});
 	helpList.createEl("li", {
-		text: translate("settings.appearance.projectAutosuggest.quickReference.labels"),
+		text: translate(msg({ message: "Add labels: '{'title|n(Title)'}' → \"Title: My Project\"", context: "settings.appearance.projectAutosuggest.quickReference.labels" })),
 	});
 	helpList.createEl("li", {
-		text: translate("settings.appearance.projectAutosuggest.quickReference.searchable"),
+		text: translate(msg({ message: "Make searchable: '{'description|s'}' includes description in + search", context: "settings.appearance.projectAutosuggest.quickReference.searchable" })),
 	});
 	helpList.createEl("li", {
-		text: translate("settings.appearance.projectAutosuggest.quickReference.staticText"),
+		text: translate(msg({ message: "Static text: literal:My Custom Label", context: "settings.appearance.projectAutosuggest.quickReference.staticText" })),
 	});
 	helpContainer.createEl("p", {
-		text: translate("settings.appearance.projectAutosuggest.quickReference.alwaysSearchable"),
+		text: translate(msg({ message: "Filename, title, and aliases are always searchable by default.", context: "settings.appearance.projectAutosuggest.quickReference.alwaysSearchable" })),
 		cls: "settings-help-note",
 	});
 
@@ -378,7 +474,7 @@ function renderDefaultProjectsList(
 
 	if (selectedFiles.length === 0) {
 		container.createDiv({
-			text: translate("settings.taskProperties.projectsCard.noDefaultProjects"),
+			text: translate(msg({ message: "No default projects selected", context: "settings.taskProperties.projectsCard.noDefaultProjects" })),
 			cls: "setting-item-description",
 		});
 		return;
@@ -391,8 +487,11 @@ function renderDefaultProjectsList(
 		const removeButton = projectItem.createEl("button", {
 			cls: "tasknotes-settings__card-header-btn tasknotes-settings__card-header-btn--delete",
 		});
-		removeButton.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>`;
-		removeButton.title = translate("settings.defaults.basicDefaults.defaultProjects.removeTooltip", { name: file.name });
+		setIcon(removeButton, "x");
+		removeButton.title = translate(
+			msg({ message: "Remove {name} from default projects", context: "settings.defaults.basicDefaults.defaultProjects.removeTooltip" }),
+			{ name: file.name }
+		);
 		removeButton.onclick = () => {
 			const index = selectedFiles.indexOf(file);
 			if (index > -1) {

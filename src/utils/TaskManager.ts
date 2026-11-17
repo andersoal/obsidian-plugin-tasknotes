@@ -1,26 +1,42 @@
-/* eslint-disable no-console */
-import { TFile, App, Events, EventRef } from "obsidian";
-import { TaskInfo, NoteInfo } from "../types";
-import { FieldMapper } from "../services/FieldMapper";
-import { FilterUtils } from "./FilterUtils";
-import {
-	getTodayString,
-	formatDateForStorage,
-	isBeforeDateSafe,
-	getDatePart,
-} from "./dateUtils";
-import { calculateTotalTimeSpent } from "./helpers";
+import { TFile, App, Events, EventRef, parseYaml } from "obsidian";
+import { TaskInfo, NoteInfo, EVENT_TASK_UPDATED } from "../types";
+import { FieldMapper } from "../core/FieldMapper";
+import { normalizePriorityConfigValue, normalizeStatusConfigValue } from "../core/fieldMapping";
+import { getTodayString, formatDateForStorage, isBeforeDateSafe, getDatePart } from "./dateUtils";
 import { TaskNotesSettings } from "../types/settings";
+import type { DependencyCache } from "./DependencyCache";
+import { isPathInExcludedFolder, parseExcludedFolders } from "./pathExclusions";
+import { buildTaskInfoFromMappedTask } from "./taskInfoAssembly";
+import { isTaskFrontmatter } from "./taskIdentification";
+import { createTaskNotesLogger } from "./tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Utils/TaskManager" });
+
+type DateIndexProperty = "due" | "scheduled";
+type DateRangeOperator = "is-before" | "is-after" | "is-on-or-before" | "is-on-or-after";
+
+interface TaskFilterIndexEntry {
+	path: string;
+	status?: string;
+	priority?: string;
+	dueDate?: string;
+	scheduledDate?: string;
+	tags: string[];
+	contexts: string[];
+	projects: string[];
+	timeEstimate?: number;
+	isCompleted: boolean;
+	signature: string;
+}
 
 /**
- * Just-in-time task manager that reads task information on-demand from Obsidian's
- * native metadata cache. No internal indexes or caching - always fresh data.
+ * Task manager backed by Obsidian's native metadata cache.
  *
  * Design Philosophy:
- * - Read on-demand: No caching, always query metadataCache directly
+ * - Read task details on-demand from metadataCache
+ * - Maintain small field indexes for filter/query hot paths
  * - Event-driven: Listen to Obsidian events and emit change notifications
- * - Simple: No complex indexes, just iterate when needed
- * - Fast enough: MetadataCache is already optimized, we don't need our own cache
+ * - Keep index updates field-aware so ordinary note edits do not invalidate filter work
  */
 export class TaskManager extends Events {
 	private app: App;
@@ -41,17 +57,27 @@ export class TaskManager extends Events {
 	private debouncedHandlers: Map<string, number> = new Map();
 	private readonly DEBOUNCE_DELAY = 300; // 300ms delay after user stops typing
 
+	// Write-through fallback for files TaskNotes just wrote before Obsidian metadata is ready.
+	private pendingTaskInfoByPath = new Map<string, TaskInfo>();
+
+	// Filter/query indexes, built lazily and maintained incrementally after first use.
+	private filterIndexesBuilt = false;
+	private indexedTaskPaths: Set<string> = new Set();
+	private taskFilterEntries: Map<string, TaskFilterIndexEntry> = new Map();
+	private statusIndex: Map<string, Set<string>> = new Map();
+	private priorityIndex: Map<string, Set<string>> = new Map();
+	private dueDateIndex: Map<string, Set<string>> = new Map();
+	private scheduledDateIndex: Map<string, Set<string>> = new Map();
+	private tagCounts: Map<string, number> = new Map();
+	private contextCounts: Map<string, number> = new Map();
+	private projectCounts: Map<string, number> = new Map();
+
 	constructor(app: App, settings: TaskNotesSettings, fieldMapper?: FieldMapper) {
 		super();
 		this.app = app;
 		this.settings = settings;
 		this.taskTag = settings.taskTag;
-		this.excludedFolders = settings.excludedFolders
-			? settings.excludedFolders
-					.split(",")
-					.map((folder) => folder.trim())
-					.filter((folder) => folder.length > 0)
-			: [];
+		this.excludedFolders = parseExcludedFolders(settings.excludedFolders);
 		this.fieldMapper = fieldMapper;
 		this.disableNoteIndexing = settings.disableNoteIndexing;
 		this.storeTitleInFilename = settings.storeTitleInFilename;
@@ -80,50 +106,8 @@ export class TaskManager extends Events {
 	/**
 	 * Check if a file is a task based on current settings
 	 */
-	isTaskFile(frontmatter: any): boolean {
-		if (!frontmatter) return false;
-
-		if (this.settings.taskIdentificationMethod === "property") {
-			const propName = this.settings.taskPropertyName;
-			const propValue = this.settings.taskPropertyValue;
-			if (!propName || !propValue) return false; // Not configured
-
-			const frontmatterValue = frontmatter[propName];
-			if (frontmatterValue === undefined) return false;
-
-			// Handle both single and multi-value properties
-			if (Array.isArray(frontmatterValue)) {
-				return frontmatterValue.some((val: any) =>
-					this.comparePropertyValues(val, propValue)
-				);
-			}
-			return this.comparePropertyValues(frontmatterValue, propValue);
-		} else {
-			// Fallback to legacy tag-based method with hierarchical support
-			if (!Array.isArray(frontmatter.tags)) return false;
-			return frontmatter.tags.some((tag: string) => {
-				if (typeof tag !== 'string') return false;
-				// Obsidian metadata cache prepends '#' to frontmatter tags
-				const cleanTag = tag.startsWith('#') ? tag.slice(1) : tag;
-				return FilterUtils.matchesHierarchicalTagExact(cleanTag, this.taskTag);
-			});
-		}
-	}
-
-	/**
-	 * Compare frontmatter property values with settings value, with boolean coercion support.
-	 */
-	private comparePropertyValues(frontmatterValue: any, settingValue: string): boolean {
-		// Handle boolean frontmatter values compared to string settings (e.g., true vs "true")
-		if (typeof frontmatterValue === "boolean" && typeof settingValue === "string") {
-			const lower = settingValue.toLowerCase();
-			if (lower === "true" || lower === "false") {
-				return frontmatterValue === (lower === "true");
-			}
-		}
-
-		// Fallback to strict equality for other types (strings, numbers, etc.)
-		return frontmatterValue === settingValue;
+	isTaskFile(frontmatter: unknown): boolean {
+		return isTaskFrontmatter(frontmatter, this.settings);
 	}
 
 	/**
@@ -158,7 +142,7 @@ export class TaskManager extends Events {
 	/**
 	 * Handle file changes with debouncing to prevent excessive updates
 	 */
-	private handleFileChangedDebounced(file: TFile, cache: any): void {
+	private handleFileChangedDebounced(file: TFile, cache: unknown): void {
 		const path = file.path;
 
 		// Cancel existing debounced handler for this file
@@ -170,7 +154,7 @@ export class TaskManager extends Events {
 		// Schedule new handler
 		const timeoutId = window.setTimeout(() => {
 			this.debouncedHandlers.delete(path);
-			this.handleFileChanged(file, cache);
+			void this.handleFileChanged(file, cache);
 		}, this.DEBOUNCE_DELAY);
 
 		this.debouncedHandlers.set(path, timeoutId);
@@ -179,16 +163,51 @@ export class TaskManager extends Events {
 	/**
 	 * Handle file change - emit events for listeners
 	 */
-	private async handleFileChanged(file: TFile, cache: any): Promise<void> {
-		// Just emit the event - no cache to update
-		this.trigger("file-updated", { path: file.path, file });
+	private async handleFileChanged(file: TFile, cache: unknown): Promise<void> {
+		let updatedTask: TaskInfo | null = null;
+		let filterIndexChanged = false;
+
+		if (cache && typeof cache === "object" && "frontmatter" in cache) {
+			const frontmatter = (cache as { frontmatter?: unknown }).frontmatter;
+			if (frontmatter && this.isTaskFile(frontmatter)) {
+				const metadataTaskInfo = this.extractTaskInfoFromNative(file.path, frontmatter);
+				const pendingTaskInfo = this.getPendingTaskInfo(file.path);
+				if (
+					pendingTaskInfo &&
+					this.shouldUsePendingTaskInfo(pendingTaskInfo, metadataTaskInfo)
+				) {
+					updatedTask = pendingTaskInfo;
+				} else {
+					this.pendingTaskInfoByPath.delete(file.path);
+					updatedTask = metadataTaskInfo;
+				}
+			} else {
+				this.pendingTaskInfoByPath.delete(file.path);
+			}
+		}
+		filterIndexChanged = this.updateFilterIndexesForFile(file.path, cache);
+
+		// Emit both the generic file event and the task-specific event so rendered task cards
+		// refresh when users edit task frontmatter directly in Obsidian.
+		this.trigger("file-updated", { path: file.path, file, updatedTask, filterIndexChanged });
+		if (updatedTask) {
+			this.trigger(EVENT_TASK_UPDATED, {
+				path: file.path,
+				task: updatedTask,
+				taskInfo: updatedTask,
+				updatedTask,
+			});
+		}
 		this.trigger("data-changed");
 	}
 
 	/**
 	 * Handle file deletion
 	 */
-	private handleFileDeleted(path: string, prevCache: any): void {
+	private handleFileDeleted(path: string, prevCache: unknown): void {
+		this.pendingTaskInfoByPath.delete(path);
+		this.removeFilterIndexEntry(path);
+
 		// Cancel any pending debounced handlers
 		const timeoutId = this.debouncedHandlers.get(path);
 		if (timeoutId) {
@@ -204,12 +223,24 @@ export class TaskManager extends Events {
 	 * Handle file rename
 	 */
 	private handleFileRenamed(file: TFile, oldPath: string): void {
+		const pendingTaskInfo = this.pendingTaskInfoByPath.get(oldPath);
+		if (pendingTaskInfo) {
+			this.pendingTaskInfoByPath.delete(oldPath);
+			this.pendingTaskInfoByPath.set(file.path, {
+				...pendingTaskInfo,
+				id: file.path,
+				path: file.path,
+			});
+		}
+
 		// Cancel any pending debounced handlers for old path
 		const timeoutId = this.debouncedHandlers.get(oldPath);
 		if (timeoutId) {
 			window.clearTimeout(timeoutId);
 			this.debouncedHandlers.delete(oldPath);
 		}
+		this.removeFilterIndexEntry(oldPath);
+		this.updateFilterIndexesForFile(file.path, this.app.metadataCache.getFileCache(file));
 
 		this.trigger("file-renamed", { oldPath, newPath: file.path, file });
 		this.trigger("data-changed");
@@ -219,32 +250,79 @@ export class TaskManager extends Events {
 	 * Check if a file path is valid for inclusion
 	 */
 	isValidFile(path: string): boolean {
-		// Filter out excluded folders
-		if (this.excludedFolders.some((folder) => path.startsWith(folder))) {
-			return false;
-		}
-		return true;
+		return !isPathInExcludedFolder(path, this.excludedFolders);
 	}
 
 	/**
 	 * Get task info for a specific file path (just-in-time)
 	 */
 	async getTaskInfo(path: string): Promise<TaskInfo | null> {
+		if (!this.isValidFile(path)) return null;
+
 		const file = this.app.vault.getAbstractFileByPath(path);
 		if (!(file instanceof TFile)) return null;
 
+		const pendingTaskInfo = this.getPendingTaskInfo(path);
 		const metadata = this.app.metadataCache.getFileCache(file);
-		if (!metadata?.frontmatter) return null;
+		if (!metadata?.frontmatter) {
+			if (pendingTaskInfo) {
+				return pendingTaskInfo;
+			}
 
-		if (!this.isTaskFile(metadata.frontmatter)) return null;
+			// getFileCache returns null only while a file is still unindexed; an indexed
+			// file that reports no frontmatter genuinely has no YAML block, so reading it
+			// from disk cannot surface anything the cache is missing.
+			if (metadata) return null;
 
-		return this.extractTaskInfoFromNative(path, metadata.frontmatter);
+			const frontmatter = await this.readFrontmatterFromFile(file);
+			if (!frontmatter || !this.isTaskFile(frontmatter)) return null;
+
+			return this.extractTaskInfoFromNative(path, frontmatter);
+		}
+
+		const metadataTaskInfo = this.isTaskFile(metadata.frontmatter)
+			? this.extractTaskInfoFromNative(path, metadata.frontmatter)
+			: null;
+
+		if (pendingTaskInfo && this.shouldUsePendingTaskInfo(pendingTaskInfo, metadataTaskInfo)) {
+			return pendingTaskInfo;
+		}
+
+		this.pendingTaskInfoByPath.delete(path);
+
+		return metadataTaskInfo;
+	}
+
+	private getPendingTaskInfo(path: string): TaskInfo | null {
+		const taskInfo = this.pendingTaskInfoByPath.get(path);
+		if (!taskInfo) return null;
+
+		return {
+			...taskInfo,
+			id: taskInfo.id ?? path,
+			path,
+		};
+	}
+
+	private shouldUsePendingTaskInfo(
+		pendingTaskInfo: TaskInfo,
+		metadataTaskInfo: TaskInfo | null
+	): boolean {
+		if (!metadataTaskInfo) {
+			return true;
+		}
+
+		if (pendingTaskInfo.dateModified) {
+			return metadataTaskInfo.dateModified !== pendingTaskInfo.dateModified;
+		}
+
+		return false;
 	}
 
 	/**
 	 * Extract task info from native frontmatter
 	 */
-	private extractTaskInfoFromNative(path: string, frontmatter: any): TaskInfo | null {
+	private extractTaskInfoFromNative(path: string, frontmatter: unknown): TaskInfo | null {
 		if (!frontmatter || !this.fieldMapper) return null;
 
 		// Validate that the file is actually a task
@@ -258,11 +336,6 @@ export class TaskManager extends Events {
 				this.storeTitleInFilename
 			);
 
-			// Calculate computed fields that aren't stored in frontmatter
-			const totalTrackedTime = mappedTask.timeEntries
-				? calculateTotalTimeSpent(mappedTask.timeEntries)
-				: 0;
-
 			// Get dependency information from DependencyCache
 			let isBlocked = false;
 			let blockingTasks: string[] = [];
@@ -274,32 +347,345 @@ export class TaskManager extends Events {
 				// Fallback when dependency cache not available: use simple existence check
 				isBlocked = Array.isArray(mappedTask.blockedBy) && mappedTask.blockedBy.length > 0;
 			}
-			const isBlocking = blockingTasks.length > 0;
 
-			// Return all FieldMapper fields plus computed fields
-			// This ensures new fields from FieldMapper automatically flow through
-			return {
-				...mappedTask,
-				// Override/add fields with defaults or computed values
-				id: path, // Add id field for API consistency
-				path, // Ensure path is set (FieldMapper should set this, but be explicit)
-				title: mappedTask.title || "Untitled task",
-				status: mappedTask.status || this.settings.defaultTaskStatus,
-				priority: mappedTask.priority || "normal",
-				archived: mappedTask.archived || false,
-				tags: Array.isArray(mappedTask.tags) ? mappedTask.tags : [],
-				contexts: Array.isArray(mappedTask.contexts) ? mappedTask.contexts : [],
-				projects: Array.isArray(mappedTask.projects) ? mappedTask.projects : [],
-				// Computed fields
-				totalTrackedTime,
+			return buildTaskInfoFromMappedTask({
+				path,
+				mappedTask,
+				defaultTaskStatus: this.settings.defaultTaskStatus,
 				isBlocked,
-				isBlocking,
-				blocking: blockingTasks.length > 0 ? blockingTasks : undefined,
-			};
+				blockingTasks,
+			});
 		} catch (error) {
-			console.error(`Error extracting task info from native metadata for ${path}:`, error);
+			tasknotesLogger.error(`Error extracting task info from native metadata for ${path}:`, {
+				category: "persistence",
+				operation: "extracting-task-info-native-metadata",
+				error: error,
+			});
 			return null;
 		}
+	}
+
+	private ensureFilterIndexes(): void {
+		if (this.filterIndexesBuilt) {
+			return;
+		}
+
+		this.clearFilterIndexes();
+
+		for (const file of this.app.vault.getMarkdownFiles()) {
+			if (!this.isValidFile(file.path)) {
+				continue;
+			}
+
+			const metadata = this.app.metadataCache.getFileCache(file);
+			if (metadata?.frontmatter && this.isTaskFile(metadata.frontmatter)) {
+				const entry = this.createFilterIndexEntry(file.path, metadata.frontmatter);
+				this.addFilterIndexEntry(entry);
+			}
+		}
+
+		this.filterIndexesBuilt = true;
+	}
+
+	private updateFilterIndexesForFile(path: string, cache: unknown): boolean {
+		if (!this.filterIndexesBuilt) {
+			return true;
+		}
+
+		if (!this.isValidFile(path)) {
+			return this.removeFilterIndexEntry(path);
+		}
+
+		const frontmatter = this.getFrontmatterFromCache(cache) ?? this.getFrontmatterForPath(path);
+		if (!frontmatter || !this.isTaskFile(frontmatter)) {
+			return this.removeFilterIndexEntry(path);
+		}
+
+		const nextEntry = this.createFilterIndexEntry(path, frontmatter);
+		const previousEntry = this.taskFilterEntries.get(path);
+		if (previousEntry?.signature === nextEntry.signature) {
+			return false;
+		}
+
+		if (previousEntry) {
+			this.removeFilterIndexEntry(path);
+		}
+		this.addFilterIndexEntry(nextEntry);
+		return true;
+	}
+
+	private updateFilterIndexesFromTaskInfo(path: string, taskInfo: TaskInfo): boolean {
+		if (!this.filterIndexesBuilt) {
+			return true;
+		}
+
+		if (!this.isValidFile(path)) {
+			return this.removeFilterIndexEntry(path);
+		}
+
+		const nextEntry = this.createFilterIndexEntryFromTaskInfo(path, taskInfo);
+		const previousEntry = this.taskFilterEntries.get(path);
+		if (previousEntry?.signature === nextEntry.signature) {
+			return false;
+		}
+
+		if (previousEntry) {
+			this.removeFilterIndexEntry(path);
+		}
+		this.addFilterIndexEntry(nextEntry);
+		return true;
+	}
+
+	private getFrontmatterFromCache(cache: unknown): Record<string, unknown> | null {
+		if (!cache || typeof cache !== "object" || !("frontmatter" in cache)) {
+			return null;
+		}
+
+		const frontmatter = (cache as { frontmatter?: unknown }).frontmatter;
+		if (!frontmatter || typeof frontmatter !== "object" || Array.isArray(frontmatter)) {
+			return null;
+		}
+
+		return frontmatter as Record<string, unknown>;
+	}
+
+	private getFrontmatterForPath(path: string): Record<string, unknown> | null {
+		const file = this.app.vault.getAbstractFileByPath(path);
+		if (!(file instanceof TFile)) {
+			return null;
+		}
+
+		return this.getFrontmatterFromCache(this.app.metadataCache.getFileCache(file));
+	}
+
+	private createFilterIndexEntry(
+		path: string,
+		frontmatter: Record<string, unknown>
+	): TaskFilterIndexEntry {
+		const statusField = this.fieldMapper?.toUserField("status") || "status";
+		const priorityField = this.fieldMapper?.toUserField("priority") || "priority";
+		const scheduledField = this.fieldMapper?.toUserField("scheduled") || "scheduled";
+		const dueField = this.fieldMapper?.toUserField("due") || "due";
+		const contextField = this.fieldMapper?.toUserField("contexts") || "context";
+		const projectField = this.fieldMapper?.toUserField("projects") || "project";
+		const timeEstimateField = this.fieldMapper?.toUserField("timeEstimate") || "timeEstimate";
+
+		const status =
+			normalizeStatusConfigValue(frontmatter[statusField], this.settings.customStatuses) ??
+			undefined;
+		const priority =
+			normalizePriorityConfigValue(frontmatter[priorityField], this.settings.customPriorities) ??
+			undefined;
+		const dueDate = this.normalizeDateValue(frontmatter[dueField]);
+		const scheduledDate = this.normalizeDateValue(frontmatter[scheduledField]);
+		const tags = this.normalizeStringValues(frontmatter.tags, false);
+		const contexts = this.normalizeStringValues(frontmatter[contextField], true);
+		const projects = this.normalizeStringValues(frontmatter[projectField], true);
+		const rawTimeEstimate = frontmatter[timeEstimateField];
+		const timeEstimate =
+			typeof rawTimeEstimate === "number" && rawTimeEstimate > 0 ? rawTimeEstimate : undefined;
+
+		const isCompleted =
+			this.settings.customStatuses?.some((s) => s.value === status && s.isCompleted) || false;
+
+		return this.withFilterIndexSignature({
+			path,
+			status,
+			priority,
+			dueDate,
+			scheduledDate,
+			tags,
+			contexts,
+			projects,
+			timeEstimate,
+			isCompleted,
+			signature: "",
+		});
+	}
+
+	private createFilterIndexEntryFromTaskInfo(
+		path: string,
+		taskInfo: TaskInfo
+	): TaskFilterIndexEntry {
+		const status =
+			normalizeStatusConfigValue(taskInfo.status, this.settings.customStatuses) ?? undefined;
+		const priority =
+			normalizePriorityConfigValue(taskInfo.priority, this.settings.customPriorities) ??
+			undefined;
+		const dueDate = this.normalizeDateValue(taskInfo.due);
+		const scheduledDate = this.normalizeDateValue(taskInfo.scheduled);
+		const tags = this.normalizeStringValues(taskInfo.tags, false);
+		const contexts = this.normalizeStringValues(taskInfo.contexts, true);
+		const projects = this.normalizeStringValues(taskInfo.projects, true);
+		const timeEstimate =
+			typeof taskInfo.timeEstimate === "number" && taskInfo.timeEstimate > 0
+				? taskInfo.timeEstimate
+				: undefined;
+		const isCompleted =
+			this.settings.customStatuses?.some((s) => s.value === status && s.isCompleted) || false;
+
+		return this.withFilterIndexSignature({
+			path,
+			status,
+			priority,
+			dueDate,
+			scheduledDate,
+			tags,
+			contexts,
+			projects,
+			timeEstimate,
+			isCompleted,
+			signature: "",
+		});
+	}
+
+	private withFilterIndexSignature(entry: TaskFilterIndexEntry): TaskFilterIndexEntry {
+		return {
+			...entry,
+			signature: JSON.stringify({
+				contexts: entry.contexts,
+				dueDate: entry.dueDate,
+				isCompleted: entry.isCompleted,
+				priority: entry.priority,
+				projects: entry.projects,
+				scheduledDate: entry.scheduledDate,
+				status: entry.status,
+				tags: entry.tags,
+				timeEstimate: entry.timeEstimate,
+			}),
+		};
+	}
+
+	private normalizeDateValue(value: unknown): string | undefined {
+		if (typeof value !== "string" || value.length === 0) {
+			return undefined;
+		}
+
+		const date = getDatePart(value);
+		return date.length > 0 ? date : undefined;
+	}
+
+	private normalizeStringValues(value: unknown, includeScalar: boolean): string[] {
+		const values = Array.isArray(value) ? value : includeScalar && value ? [value] : [];
+		const normalized = new Set<string>();
+
+		for (const item of values) {
+			if (typeof item !== "string") {
+				continue;
+			}
+
+			const trimmed = item.trim();
+			if (trimmed) {
+				normalized.add(trimmed);
+			}
+		}
+
+		return Array.from(normalized).sort();
+	}
+
+	private addFilterIndexEntry(entry: TaskFilterIndexEntry): void {
+		this.taskFilterEntries.set(entry.path, entry);
+		this.indexedTaskPaths.add(entry.path);
+		this.addPathToIndex(this.statusIndex, entry.status, entry.path);
+		this.addPathToIndex(this.priorityIndex, entry.priority, entry.path);
+		this.addPathToIndex(this.dueDateIndex, entry.dueDate, entry.path);
+		this.addPathToIndex(this.scheduledDateIndex, entry.scheduledDate, entry.path);
+		this.incrementValues(this.tagCounts, entry.tags);
+		this.incrementValues(this.contextCounts, entry.contexts);
+		this.incrementValues(this.projectCounts, entry.projects);
+	}
+
+	private removeFilterIndexEntry(path: string): boolean {
+		if (!this.filterIndexesBuilt) {
+			return false;
+		}
+
+		const entry = this.taskFilterEntries.get(path);
+		if (!entry) {
+			return false;
+		}
+
+		this.taskFilterEntries.delete(path);
+		this.indexedTaskPaths.delete(path);
+		this.removePathFromIndex(this.statusIndex, entry.status, path);
+		this.removePathFromIndex(this.priorityIndex, entry.priority, path);
+		this.removePathFromIndex(this.dueDateIndex, entry.dueDate, path);
+		this.removePathFromIndex(this.scheduledDateIndex, entry.scheduledDate, path);
+		this.decrementValues(this.tagCounts, entry.tags);
+		this.decrementValues(this.contextCounts, entry.contexts);
+		this.decrementValues(this.projectCounts, entry.projects);
+		return true;
+	}
+
+	private addPathToIndex(
+		index: Map<string, Set<string>>,
+		value: string | undefined,
+		path: string
+	): void {
+		if (!value) {
+			return;
+		}
+
+		const existingPaths = index.get(value);
+		if (existingPaths) {
+			existingPaths.add(path);
+			return;
+		}
+
+		index.set(value, new Set([path]));
+	}
+
+	private removePathFromIndex(
+		index: Map<string, Set<string>>,
+		value: string | undefined,
+		path: string
+	): void {
+		if (!value) {
+			return;
+		}
+
+		const paths = index.get(value);
+		if (!paths) {
+			return;
+		}
+
+		paths.delete(path);
+		if (paths.size === 0) {
+			index.delete(value);
+		}
+	}
+
+	private incrementValues(counts: Map<string, number>, values: string[]): void {
+		for (const value of values) {
+			counts.set(value, (counts.get(value) ?? 0) + 1);
+		}
+	}
+
+	private decrementValues(counts: Map<string, number>, values: string[]): void {
+		for (const value of values) {
+			const nextCount = (counts.get(value) ?? 0) - 1;
+			if (nextCount > 0) {
+				counts.set(value, nextCount);
+			} else {
+				counts.delete(value);
+			}
+		}
+	}
+
+	private sortedCountKeys(counts: Map<string, number>): string[] {
+		return Array.from(counts.keys()).sort();
+	}
+
+	private clearFilterIndexes(): void {
+		this.indexedTaskPaths.clear();
+		this.taskFilterEntries.clear();
+		this.statusIndex.clear();
+		this.priorityIndex.clear();
+		this.dueDateIndex.clear();
+		this.scheduledDateIndex.clear();
+		this.tagCounts.clear();
+		this.contextCounts.clear();
+		this.projectCounts.clear();
 	}
 
 	/**
@@ -322,134 +708,129 @@ export class TaskManager extends Events {
 	}
 
 	/**
-	 * Get all task paths (just-in-time scan)
+	 * Get every task currently available in Obsidian's metadata cache.
+	 *
+	 * This intentionally avoids getTaskInfo's disk fallback so recurring background
+	 * scans cannot turn an incomplete metadata cache into a vault-wide read.
+	 */
+	getAllCachedTasks(): TaskInfo[] {
+		const tasks: TaskInfo[] = [];
+		const files = this.app.vault.getMarkdownFiles();
+
+		for (const file of files) {
+			if (!this.isValidFile(file.path)) continue;
+
+			const taskInfo = this.getCachedTaskInfoSync(file.path);
+			if (taskInfo) {
+				tasks.push(taskInfo);
+			}
+		}
+
+		return tasks;
+	}
+
+	/**
+	 * Get all task paths from the filter index.
 	 */
 	getAllTaskPaths(): Set<string> {
-		const taskPaths = new Set<string>();
-		const files = this.app.vault.getMarkdownFiles();
-
-		for (const file of files) {
-			if (!this.isValidFile(file.path)) continue;
-
-			const metadata = this.app.metadataCache.getFileCache(file);
-			if (metadata?.frontmatter && this.isTaskFile(metadata.frontmatter)) {
-				taskPaths.add(file.path);
-			}
-		}
-
-		return taskPaths;
+		this.ensureFilterIndexes();
+		return new Set(this.indexedTaskPaths);
 	}
 
 	/**
-	 * Get tasks for a specific date (just-in-time)
+	 * Get tasks for a specific date from due and scheduled indexes.
 	 */
 	getTasksForDate(date: string): string[] {
-		const taskPaths: string[] = [];
-		const files = this.app.vault.getMarkdownFiles();
 		const targetDate = getDatePart(date);
+		this.ensureFilterIndexes();
+		return Array.from(
+			new Set([
+				...(this.scheduledDateIndex.get(targetDate) ?? []),
+				...(this.dueDateIndex.get(targetDate) ?? []),
+			])
+		);
+	}
 
-		const scheduledField = this.fieldMapper?.toUserField("scheduled") || "scheduled";
-		const dueField = this.fieldMapper?.toUserField("due") || "due";
+	getTaskPathsForDateRange(
+		property: DateIndexProperty,
+		operator: DateRangeOperator,
+		date: string
+	): Set<string> {
+		this.ensureFilterIndexes();
 
-		for (const file of files) {
-			if (!this.isValidFile(file.path)) continue;
+		const targetDate = getDatePart(date);
+		const index = property === "due" ? this.dueDateIndex : this.scheduledDateIndex;
+		const matchingPaths = new Set<string>();
 
-			const metadata = this.app.metadataCache.getFileCache(file);
-			if (!metadata?.frontmatter || !this.isTaskFile(metadata.frontmatter)) continue;
+		for (const [indexedDate, paths] of index) {
+			if (!this.matchesDateRange(indexedDate, operator, targetDate)) {
+				continue;
+			}
 
-			const scheduled = metadata.frontmatter[scheduledField];
-			const due = metadata.frontmatter[dueField];
-
-			const scheduledDate =
-				typeof scheduled === "string" && scheduled.length > 0
-					? getDatePart(scheduled)
-					: undefined;
-			const dueDate =
-				typeof due === "string" && due.length > 0 ? getDatePart(due) : undefined;
-
-			// Match date-only queries against both date-only and datetime frontmatter values.
-			if (scheduledDate === targetDate || dueDate === targetDate) {
-				taskPaths.push(file.path);
+			for (const path of paths) {
+				matchingPaths.add(path);
 			}
 		}
 
-		return taskPaths;
+		return matchingPaths;
+	}
+
+	private matchesDateRange(
+		indexedDate: string,
+		operator: DateRangeOperator,
+		targetDate: string
+	): boolean {
+		switch (operator) {
+			case "is-before":
+				return indexedDate < targetDate;
+			case "is-after":
+				return indexedDate > targetDate;
+			case "is-on-or-before":
+				return indexedDate <= targetDate;
+			case "is-on-or-after":
+				return indexedDate >= targetDate;
+			default:
+				return false;
+		}
 	}
 
 	/**
-	 * Get tasks by status (just-in-time)
+	 * Get tasks by status from the filter index.
 	 */
 	getTaskPathsByStatus(status: string): string[] {
-		const taskPaths: string[] = [];
-		const files = this.app.vault.getMarkdownFiles();
-
-		const statusField = this.fieldMapper?.toUserField("status") || "status";
-
-		for (const file of files) {
-			if (!this.isValidFile(file.path)) continue;
-
-			const metadata = this.app.metadataCache.getFileCache(file);
-			if (!metadata?.frontmatter || !this.isTaskFile(metadata.frontmatter)) continue;
-
-			if (metadata.frontmatter[statusField] === status) {
-				taskPaths.push(file.path);
-			}
-		}
-
-		return taskPaths;
+		const expectedStatus =
+			normalizeStatusConfigValue(status, this.settings.customStatuses) ?? status;
+		this.ensureFilterIndexes();
+		return Array.from(this.statusIndex.get(expectedStatus) ?? []);
 	}
 
 	/**
-	 * Get tasks by priority (just-in-time)
+	 * Get tasks by priority from the filter index.
 	 */
 	getTaskPathsByPriority(priority: string): string[] {
-		const taskPaths: string[] = [];
-		const files = this.app.vault.getMarkdownFiles();
-
-		const priorityField = this.fieldMapper?.toUserField("priority") || "priority";
-
-		for (const file of files) {
-			if (!this.isValidFile(file.path)) continue;
-
-			const metadata = this.app.metadataCache.getFileCache(file);
-			if (!metadata?.frontmatter || !this.isTaskFile(metadata.frontmatter)) continue;
-
-			if (metadata.frontmatter[priorityField] === priority) {
-				taskPaths.push(file.path);
-			}
-		}
-
-		return taskPaths;
+		const expectedPriority =
+			normalizePriorityConfigValue(priority, this.settings.customPriorities) ?? priority;
+		this.ensureFilterIndexes();
+		return Array.from(this.priorityIndex.get(expectedPriority) ?? []);
 	}
 
 	/**
-	 * Get overdue task paths (just-in-time)
+	 * Get overdue task paths from the due-date index.
 	 */
 	getOverdueTaskPaths(): Set<string> {
 		const overdue = new Set<string>();
-		const files = this.app.vault.getMarkdownFiles();
 		const today = getTodayString();
+		this.ensureFilterIndexes();
 
-		const dueField = this.fieldMapper?.toUserField("due") || "due";
-		const statusField = this.fieldMapper?.toUserField("status") || "status";
-
-		for (const file of files) {
-			if (!this.isValidFile(file.path)) continue;
-
-			const metadata = this.app.metadataCache.getFileCache(file);
-			if (!metadata?.frontmatter || !this.isTaskFile(metadata.frontmatter)) continue;
-
-			const due = metadata.frontmatter[dueField];
-			const status = metadata.frontmatter[statusField];
-
-			// Only count as overdue if the status is not marked as completed
-			// Check against user-defined completed statuses from settings
-			const isCompletedStatus = this.settings.customStatuses?.some(
-				s => s.value === status && s.isCompleted
-			) || false;
-
-			if (due && !isCompletedStatus && isBeforeDateSafe(due, today)) {
-				overdue.add(file.path);
+		for (const [dueDate, paths] of this.dueDateIndex) {
+			if (!isBeforeDateSafe(dueDate, today)) {
+				continue;
+			}
+			for (const path of paths) {
+				const entry = this.taskFilterEntries.get(path);
+				if (entry && !entry.isCompleted) {
+					overdue.add(path);
+				}
 			}
 		}
 
@@ -457,147 +838,55 @@ export class TaskManager extends Events {
 	}
 
 	/**
-	 * Get all unique statuses (just-in-time)
+	 * Get all unique statuses from the filter index.
 	 */
 	getAllStatuses(): string[] {
-		const statuses = new Set<string>();
-		const files = this.app.vault.getMarkdownFiles();
-
-		const statusField = this.fieldMapper?.toUserField("status") || "status";
-
-		for (const file of files) {
-			if (!this.isValidFile(file.path)) continue;
-
-			const metadata = this.app.metadataCache.getFileCache(file);
-			if (!metadata?.frontmatter || !this.isTaskFile(metadata.frontmatter)) continue;
-
-			const status = metadata.frontmatter[statusField];
-			if (status) statuses.add(status);
-		}
-
-		return Array.from(statuses).sort();
+		this.ensureFilterIndexes();
+		return Array.from(this.statusIndex.keys()).sort();
 	}
 
 	/**
-	 * Get all unique priorities (just-in-time)
+	 * Get all unique priorities from the filter index.
 	 */
 	getAllPriorities(): string[] {
-		const priorities = new Set<string>();
-		const files = this.app.vault.getMarkdownFiles();
-
-		const priorityField = this.fieldMapper?.toUserField("priority") || "priority";
-
-		for (const file of files) {
-			if (!this.isValidFile(file.path)) continue;
-
-			const metadata = this.app.metadataCache.getFileCache(file);
-			if (!metadata?.frontmatter || !this.isTaskFile(metadata.frontmatter)) continue;
-
-			const priority = metadata.frontmatter[priorityField];
-			if (priority) priorities.add(priority);
-		}
-
-		return Array.from(priorities).sort();
+		this.ensureFilterIndexes();
+		return Array.from(this.priorityIndex.keys()).sort();
 	}
 
 	/**
-	 * Get all unique tags (just-in-time)
+	 * Get all unique tags from the filter index.
 	 */
 	getAllTags(): string[] {
-		const tags = new Set<string>();
-		const files = this.app.vault.getMarkdownFiles();
-
-		for (const file of files) {
-			if (!this.isValidFile(file.path)) continue;
-
-			const metadata = this.app.metadataCache.getFileCache(file);
-			if (!metadata?.frontmatter || !this.isTaskFile(metadata.frontmatter)) continue;
-
-			const taskTags = metadata.frontmatter.tags;
-			if (Array.isArray(taskTags)) {
-				taskTags.forEach(tag => {
-					if (typeof tag === 'string') tags.add(tag);
-				});
-			}
-		}
-
-		return Array.from(tags).sort();
+		this.ensureFilterIndexes();
+		return this.sortedCountKeys(this.tagCounts);
 	}
 
 	/**
-	 * Get all unique contexts (just-in-time)
+	 * Get all unique contexts from the filter index.
 	 */
 	getAllContexts(): string[] {
-		const contexts = new Set<string>();
-		const files = this.app.vault.getMarkdownFiles();
-
-		const contextField = this.fieldMapper?.toUserField("contexts") || "context";
-
-		for (const file of files) {
-			if (!this.isValidFile(file.path)) continue;
-
-			const metadata = this.app.metadataCache.getFileCache(file);
-			if (!metadata?.frontmatter || !this.isTaskFile(metadata.frontmatter)) continue;
-
-			const context = metadata.frontmatter[contextField];
-			if (Array.isArray(context)) {
-				context.forEach(ctx => {
-					if (typeof ctx === 'string') contexts.add(ctx);
-				});
-			} else if (context) {
-				contexts.add(context);
-			}
-		}
-
-		return Array.from(contexts).sort();
+		this.ensureFilterIndexes();
+		return this.sortedCountKeys(this.contextCounts);
 	}
 
 	/**
-	 * Get all unique projects (just-in-time)
+	 * Get all unique projects from the filter index.
 	 */
 	getAllProjects(): string[] {
-		const projects = new Set<string>();
-		const files = this.app.vault.getMarkdownFiles();
-
-		const projectField = this.fieldMapper?.toUserField("projects") || "project";
-
-		for (const file of files) {
-			if (!this.isValidFile(file.path)) continue;
-
-			const metadata = this.app.metadataCache.getFileCache(file);
-			if (!metadata?.frontmatter || !this.isTaskFile(metadata.frontmatter)) continue;
-
-			const project = metadata.frontmatter[projectField];
-			if (Array.isArray(project)) {
-				project.forEach(proj => {
-					if (typeof proj === 'string') projects.add(proj);
-				});
-			} else if (project) {
-				projects.add(project);
-			}
-		}
-
-		return Array.from(projects).sort();
+		this.ensureFilterIndexes();
+		return this.sortedCountKeys(this.projectCounts);
 	}
 
 	/**
-	 * Get all time estimates (just-in-time)
+	 * Get all time estimates from the filter index.
 	 */
 	getAllTimeEstimates(): Map<string, number> {
 		const estimates = new Map<string, number>();
-		const files = this.app.vault.getMarkdownFiles();
+		this.ensureFilterIndexes();
 
-		const timeEstimateField = this.fieldMapper?.toUserField("timeEstimate") || "timeEstimate";
-
-		for (const file of files) {
-			if (!this.isValidFile(file.path)) continue;
-
-			const metadata = this.app.metadataCache.getFileCache(file);
-			if (!metadata?.frontmatter || !this.isTaskFile(metadata.frontmatter)) continue;
-
-			const timeEstimate = metadata.frontmatter[timeEstimateField];
-			if (typeof timeEstimate === 'number' && timeEstimate > 0) {
-				estimates.set(file.path, timeEstimate);
+		for (const [path, entry] of this.taskFilterEntries) {
+			if (entry.timeEstimate !== undefined) {
+				estimates.set(path, entry.timeEstimate);
 			}
 		}
 
@@ -628,7 +917,9 @@ export class TaskManager extends Events {
 			if (noteDate === dateStr) {
 				notes.push({
 					path: file.path,
-					title: this.storeTitleInFilename ? file.basename : (metadata.frontmatter.title || file.basename),
+					title: this.storeTitleInFilename
+						? file.basename
+						: metadata.frontmatter.title || file.basename,
 					tags: metadata.frontmatter.tags || [],
 				});
 			}
@@ -655,13 +946,68 @@ export class TaskManager extends Events {
 	 * Synchronous task info getter (reads from metadataCache)
 	 */
 	getCachedTaskInfoSync(path: string): TaskInfo | null {
+		if (!this.isValidFile(path)) return null;
+
 		const file = this.app.vault.getAbstractFileByPath(path);
 		if (!(file instanceof TFile)) return null;
 
+		const pendingTaskInfo = this.getPendingTaskInfo(path);
 		const metadata = this.app.metadataCache.getFileCache(file);
-		if (!metadata?.frontmatter || !this.isTaskFile(metadata.frontmatter)) return null;
+		if (!metadata?.frontmatter) {
+			return pendingTaskInfo;
+		}
 
-		return this.extractTaskInfoFromNative(path, metadata.frontmatter);
+		const metadataTaskInfo = this.isTaskFile(metadata.frontmatter)
+			? this.extractTaskInfoFromNative(path, metadata.frontmatter)
+			: null;
+		if (pendingTaskInfo && this.shouldUsePendingTaskInfo(pendingTaskInfo, metadataTaskInfo)) {
+			return pendingTaskInfo;
+		}
+
+		this.pendingTaskInfoByPath.delete(path);
+		return metadataTaskInfo;
+	}
+
+	private async readFrontmatterFromFile(file: TFile): Promise<Record<string, unknown> | null> {
+		try {
+			const content = await this.app.vault.read(file);
+			return this.parseFrontmatterFromContent(content, file.path);
+		} catch (error) {
+			tasknotesLogger.warn(
+				`TaskManager: Failed to read frontmatter fallback for ${file.path}`,
+				{
+					category: "validation",
+					operation: "taskmanager-read-frontmatter-fallback",
+					error: error,
+				}
+			);
+			return null;
+		}
+	}
+
+	private parseFrontmatterFromContent(
+		content: string,
+		path?: string
+	): Record<string, unknown> | null {
+		const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+		if (!match) return null;
+
+		try {
+			const parsed = parseYaml(match[1] || "");
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+				return null;
+			}
+			return parsed as Record<string, unknown>;
+		} catch (error) {
+			const fileContext = path ? ` for ${path}` : "";
+			tasknotesLogger.warn(`TaskManager: Failed to parse frontmatter fallback${fileContext}`, {
+				category: "validation",
+				operation: "taskmanager-parse-frontmatter-fallback",
+				details: path ? { path } : undefined,
+				error: error,
+			});
+			return null;
+		}
 	}
 
 	/**
@@ -687,21 +1033,26 @@ export class TaskManager extends Events {
 		});
 		this.eventListeners = [];
 
+		this.clearFilterIndexes();
+		this.filterIndexesBuilt = false;
 		this.initialized = false;
 	}
 
 	/**
 	 * Delegate dependency methods to DependencyCache (will be set by main.ts)
 	 */
-	private _dependencyCache?: any;
+	private _dependencyCache: DependencyCache | undefined = undefined;
 
-	setDependencyCache(cache: any): void {
+	setDependencyCache(cache: DependencyCache): void {
 		this._dependencyCache = cache;
 	}
 
 	getBlockingTaskPaths(taskPath: string): string[] {
 		if (!this._dependencyCache) {
-			console.warn("DependencyCache not set in TaskManager");
+			tasknotesLogger.warn("DependencyCache not set in TaskManager", {
+				category: "stale-data",
+				operation: "dependencycache-not-set-taskmanager",
+			});
 			return [];
 		}
 		return this._dependencyCache.getBlockingTaskPaths(taskPath);
@@ -709,7 +1060,10 @@ export class TaskManager extends Events {
 
 	getBlockedTaskPaths(taskPath: string): string[] {
 		if (!this._dependencyCache) {
-			console.warn("DependencyCache not set in TaskManager");
+			tasknotesLogger.warn("DependencyCache not set in TaskManager", {
+				category: "stale-data",
+				operation: "dependencycache-not-set-taskmanager",
+			});
 			return [];
 		}
 		return this._dependencyCache.getBlockedTaskPaths(taskPath);
@@ -724,7 +1078,10 @@ export class TaskManager extends Events {
 
 	getTasksReferencingProject(projectPath: string): string[] {
 		if (!this._dependencyCache) {
-			console.warn("DependencyCache not set in TaskManager");
+			tasknotesLogger.warn("DependencyCache not set in TaskManager", {
+				category: "stale-data",
+				operation: "dependencycache-not-set-taskmanager",
+			});
 			return [];
 		}
 		return this._dependencyCache.getTasksReferencingProject(projectPath);
@@ -742,15 +1099,19 @@ export class TaskManager extends Events {
 	 * This is necessary after creating/modifying files because the metadata cache
 	 * updates asynchronously.
 	 */
-	async waitForFreshTaskData(pathOrFile: string | TFile, maxRetries = 10): Promise<void> {
-		const path = pathOrFile instanceof TFile ? pathOrFile.path : pathOrFile;
-		const file = pathOrFile instanceof TFile
-			? pathOrFile
-			: this.app.vault.getAbstractFileByPath(path);
+	async waitForFreshTaskData(
+		pathOrFile: string | { path: string },
+		maxRetries = 10
+	): Promise<void> {
+		const path = typeof pathOrFile === "string" ? pathOrFile : pathOrFile.path;
+		const file =
+			typeof pathOrFile === "string"
+				? this.app.vault.getAbstractFileByPath(path)
+				: pathOrFile;
 
 		if (!(file instanceof TFile)) {
 			// File doesn't exist yet, just wait a bit
-			await new Promise(resolve => setTimeout(resolve, 100));
+			await new Promise((resolve) => window.setTimeout(resolve, 100));
 			return;
 		}
 
@@ -762,42 +1123,51 @@ export class TaskManager extends Events {
 				return;
 			}
 			// Wait before retrying (50ms, 100ms, 150ms, etc.)
-			await new Promise(resolve => setTimeout(resolve, 50 * (i + 1)));
+			await new Promise((resolve) => window.setTimeout(resolve, 50 * (i + 1)));
 		}
 
 		// If we still don't have metadata after retries, log a warning but continue
-		console.warn(`TaskManager: Metadata cache not ready for ${path} after ${maxRetries} retries`);
+		tasknotesLogger.warn(
+			`TaskManager: Metadata cache not ready for ${path} after ${maxRetries} retries`,
+			{ category: "stale-data", operation: "taskmanager-metadata-cache-not-ready" }
+		);
 	}
 
-	updateConfig(settings: any): void {
+	updateConfig(settings: TaskNotesSettings): void {
 		// Update settings
 		this.settings = settings;
 		this.taskTag = settings.taskTag;
-		this.excludedFolders = settings.excludedFolders
-			? settings.excludedFolders
-					.split(",")
-					.map((folder: string) => folder.trim())
-					.filter((folder: string) => folder.length > 0)
-			: [];
+		this.excludedFolders = parseExcludedFolders(settings.excludedFolders);
 		this.disableNoteIndexing = settings.disableNoteIndexing;
 		this.storeTitleInFilename = settings.storeTitleInFilename;
+		this.clearFilterIndexes();
+		this.filterIndexesBuilt = false;
+		this.pruneExcludedPendingTaskInfo();
 
 		// Emit config changed event
 		this.trigger("data-changed");
 	}
 
-	subscribe(event: string, callback: (...args: any[]) => void): () => void {
+	private pruneExcludedPendingTaskInfo(): void {
+		for (const path of this.pendingTaskInfoByPath.keys()) {
+			if (!this.isValidFile(path)) {
+				this.pendingTaskInfoByPath.delete(path);
+			}
+		}
+	}
+
+	subscribe(event: string, callback: (...args: unknown[]) => void): () => void {
 		this.on(event, callback);
 		return () => {
 			this.off(event, callback);
 		};
 	}
 
-	async getCalendarData(year: number, month: number): Promise<any> {
+	async getCalendarData(year: number, month: number): Promise<Record<string, TaskInfo[]>> {
 		// For now, return a simple calendar data structure
 		// This can be optimized later if needed
 		const tasks = await this.getAllTasks();
-		const calendarData: any = {};
+		const calendarData: Record<string, TaskInfo[]> = {};
 
 		for (const task of tasks) {
 			if (task.scheduled) {
@@ -868,17 +1238,32 @@ export class TaskManager extends Events {
 	}
 
 	async clearAllCaches(): Promise<void> {
-		// Not needed - we don't cache
+		this.pendingTaskInfoByPath.clear();
+		this.clearFilterIndexes();
+		this.filterIndexesBuilt = false;
 		this.trigger("data-changed");
 	}
 
 	clearCacheEntry(path: string): void {
-		// Not needed - we don't cache
+		this.pendingTaskInfoByPath.delete(path);
+		this.removeFilterIndexEntry(path);
 	}
 
 	updateTaskInfoInCache(path: string, taskInfo: TaskInfo): void {
-		// Not needed - we don't cache
-		// Just emit an event
-		this.trigger("file-updated", { path });
+		let filterIndexChanged = false;
+		if (!this.isValidFile(path)) {
+			this.pendingTaskInfoByPath.delete(path);
+			filterIndexChanged = this.removeFilterIndexEntry(path);
+			this.trigger("data-changed");
+			return;
+		}
+
+		this.pendingTaskInfoByPath.set(path, {
+			...taskInfo,
+			id: taskInfo.id ?? path,
+			path,
+		});
+		filterIndexChanged = this.updateFilterIndexesFromTaskInfo(path, taskInfo);
+		this.trigger("file-updated", { path, updatedTask: taskInfo, filterIndexChanged });
 	}
 }

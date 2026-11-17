@@ -2,6 +2,9 @@
 
 A task management plugin where each task is a separate Markdown note, and all views are powered by [Obsidian Bases](https://help.obsidian.md/bases).
 
+> [!NOTE]
+> **TaskNotes is also available in Beta on the web and iPhone.** [Open TaskNotes on the web](https://app.tasknotes.dev/) or [download it from the App Store](https://apps.apple.com/app/tasknotes/id6797168033).
+
 <img src="https://github.com/callumalpass/tasknotes/blob/main/media/2025-12-07T15-43-26.png?raw=true" />
 
 ## Overview
@@ -65,11 +68,23 @@ recurrence: "FREQ=WEEKLY;BYDAY=MO"
 complete_instances: ["2024-01-08"]
 ```
 
+When an individual recurrence needs its own note, TaskNotes can materialize that occurrence as a normal task. Calendar views show the note-backed occurrence in place of the matching virtual recurrence instance:
+
+```yaml
+title: "Weekly meeting"
+recurrence_parent: "[[Tasks/Weekly meeting]]"
+occurrence_date: "2024-01-15"
+scheduled: "2024-01-15T09:30"
+timeEstimate: 60
+```
+
+Occurrence notes inherit planning metadata from the recurring parent, such as scheduled time, due offset, tags, contexts, projects, reminders, details, and time estimate. They do not copy the parent's recurrence rule, completion history, or time entries.
+
 All property names are configurable. If you already use `deadline` instead of `due`, remap it in settings.
 
 ## Other features
 
-Calendar sync with Google and Microsoft (OAuth) or any ICS feed. Time tracking with start/stop per task, Pomodoro timer, and session history. Recurring tasks with fixed or flexible schedules and per-instance completion tracking. Dependencies between tasks. Natural language parsing for task creation. Custom statuses, priorities, and user-defined fields.
+Calendar sync with Google and Microsoft (OAuth) or any ICS feed. Time tracking with start/stop per task, Pomodoro timer, and session history. Recurring tasks with fixed or flexible schedules, per-instance completion tracking, and optional materialized occurrence notes. Dependencies between tasks. Natural language parsing for task creation. Custom statuses, priorities, and user-defined fields.
 
 ## Integrations
 

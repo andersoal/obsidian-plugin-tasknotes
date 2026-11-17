@@ -35,18 +35,24 @@ Task link overlays work in both Live Preview and Reading modes:
 - **Live Preview Mode**: Widgets hide when the cursor is within the wikilink range, allowing for easy editing.
 - **Reading Mode**: Widgets display with full functionality and integrate with the reading mode typography.
 
+On Obsidian mobile, long titles are ellipsized to fit the available line after the status and priority indicators, including in nested bullets. Enabled properties remain available in a horizontally scrollable strip that can flow onto the next line. Configure these properties under `Settings -> TaskNotes -> Features -> Inline Task Card Properties`.
+
 The overlays support drag-and-drop to calendar views and provide keyboard shortcuts for quick navigation (Ctrl/Cmd+Click to open the source file).
 
-## Create Inline Task Command
+## Create New Inline Task Command
 
-The `Create inline task` command allows you to create a new task from the current line in the editor. This command is available in the command palette.
+The `Create new inline task` command opens the task creation modal from the editor and inserts a link to the new task when it is saved. This command is available in the command palette.
 
-When you run the command, the current line is used as the title of the new task. The line is then replaced with a link to the new task file.
+When the cursor is on an empty line, the link is inserted at the cursor. When the cursor is on a line with content, TaskNotes inserts a new line below it and places the task link there. The command does not use the current line as the task title.
+
+To turn the current line into a TaskNote, use `Convert to TaskNote` or the instant conversion button next to a supported line. That flow uses the current line as the task title and replaces the original line with a link to the new task file.
 
 ## Instant Task Conversion
 
 The **Instant Task Conversion** feature transforms lines in your notes into TaskNotes files. This works with both checkbox tasks and regular lines of text. Turn the feature on or off from `Settings -> TaskNotes -> Features` (`Show convert button next to checkboxes`). When enabled, a "convert" button appears next to content in edit mode. Clicking this button creates a new task note using the line text as the title and replaces the original line with a link to the new task file.
 This supports progressive conversion from draft notes to dedicated task files.
+
+With a selection, `Convert to TaskNote` uses the first selected line as the title and additional selected text as details. Text outside the selection is left in place. Selecting a whole line through the start of the next line (for example, Home then Shift+Down) does not include that next line in the conversion.
 
 ### Folder Configuration
 
@@ -79,6 +85,12 @@ When converting lines:
 Conversion preserves surrounding formatting, including callouts, outlines, and nested lists.
 
 The feature handles edge cases like nested blockquotes and maintains proper indentation in the final link replacement.
+
+### Converting into an Existing Note
+
+If the line links to a note with the alias `note`, for example `- [ ] Practise the demo [[Skills/Live demos|note]] 📅 2026-05-08`, conversion makes that note the task instead of creating a new file. The link is resolved the same way Obsidian resolves any link from the current note. The note keeps its name, body and existing properties: TaskNotes only adds task properties it doesn't already have (such as the due date above, or the task tag or identifying property) and adds any new tags. If the line says more than the note's name, or sets a value the note already has differently, the line's text is appended to the end of the note so nothing from it is lost. Any selected details are appended too. The line is then replaced with a link to the note.
+
+A link with any other alias, or one that doesn't resolve to an existing note, is converted as usual.
 
 ## Bulk Task Conversion
 
@@ -146,16 +158,17 @@ For large notes, converting a small section first helps validate folder and file
 
 **New in v4**: The Relationships Widget consolidates what were previously three separate widgets (project subtasks, task dependencies, and blocking tasks) into a single dynamic interface.
 
-The widget appears in task notes and automatically displays up to four tabs based on available relationship data:
+The widget appears in task notes and automatically displays up to five tabs based on available relationship data:
 
 - **Subtasks Tab (Kanban)**: Shows tasks that reference the current note as a project. Uses Kanban layout for visual task management.
+- **Occurrences Tab (List)**: Shows materialized occurrence notes that reference the current recurring task as their parent. Uses list layout sorted by occurrence date.
 - **Projects Tab (List)**: Shows projects that the current task belongs to. Uses list layout.
 - **Blocked By Tab (List)**: Shows tasks that are blocking the current task. Uses list layout.
 - **Blocking Tab (Kanban)**: Shows tasks that the current task is blocking. Uses Kanban layout.
 
 ### Automatic Tab Management
 
-Tabs automatically show or hide based on the presence of relationship data. If a task has no subtasks, the Subtasks tab does not appear. If there are no blocking relationships, those tabs remain hidden. This keeps the interface focused on relevant information.
+Tabs automatically show or hide based on the presence of relationship data. If a task has no subtasks, the Subtasks tab does not appear. If a recurring task has no materialized occurrence notes, the Occurrences tab does not appear. If there are no blocking relationships, those tabs remain hidden. This keeps the interface focused on relevant information.
 The widget layout changes with available data, so simple tasks show fewer sections.
 
 ### Features
@@ -196,7 +209,7 @@ These settings are replaced in v4 by:
 
 - `showRelationships` and `relationshipsPosition`
 
-If you had project subtasks enabled in v3, the relationships widget is enabled automatically after upgrading to v4. The underlying Bases file changed from `TaskNotes/Views/project-subtasks.base` to `TaskNotes/Views/relationships.base`. Run the **Create default files** action in `Settings -> TaskNotes -> Integrations` if `relationships.base` is missing.
+If you had project subtasks enabled in v3, the relationships widget is enabled automatically after upgrading to v4. The underlying Bases file changed from `TaskNotes/Views/project-subtasks.base` to `TaskNotes/Views/relationships.base`. Run the **Create files** action in `Settings -> TaskNotes -> General -> Views & base files` if `relationships.base` is missing.
 
 ## Natural Language Processing
 

@@ -35,9 +35,11 @@ Recurring events:
 - `recurring.instance.completed`
 - `recurring.instance.skipped`
 
+Completing a materialized occurrence note emits `recurring.instance.completed` with the reconciled parent task plus the completed `occurrence` and `date` in the event data. Skipping virtual recurring instances emits `recurring.instance.skipped`; materialized occurrence skip currently reconciles the parent and occurrence note without emitting a separate skip webhook.
+
 Reminder events:
 
-- `reminder.triggered`
+- `reminder.triggered` (`data.missed` is `true` when the reminder is delivered late, for example after Obsidian was closed)
 
 ## Payload Shape
 
@@ -112,7 +114,7 @@ Current implementation behavior:
 - Each delivery starts with one attempt.
 - Failed deliveries retry with exponential backoff: `1s`, `2s`, `4s`.
 - Maximum retries: `3` retries after initial attempt (up to 4 attempts total).
-- If cumulative `failureCount` for a webhook exceeds `10`, webhook is auto-disabled.
+- A webhook is auto-disabled after more than `10` consecutive deliveries exhaust all retries. Success resets this streak (`consecutiveFailures`); cumulative `failureCount` and `successCount` remain telemetry.
 - No explicit request timeout is set in delivery fetch.
 
 Because retries and duplicates are possible, handlers should be idempotent.
@@ -147,48 +149,11 @@ A webhook can specify `transformFile` pointing to a file in your vault.
 
 Supported file types:
 
-- `.js`: JavaScript transform function
 - `.json`: event template map with variable interpolation
 
 If transform execution fails, TaskNotes falls back to original payload.
 
-### JavaScript Transform Files
-
-Expected format:
-
-```javascript
-function transform(payload) {
-  return payload;
-}
-```
-
-Execution model:
-
-- File is read from the vault.
-- Code is executed with `new Function(...)`.
-- Returned value becomes the outgoing request body.
-
-Important behavior:
-
-- Returning `null` does not skip delivery. Payload body becomes JSON `null`.
-- Returning an array does not fan out to multiple URLs. Array is posted to the configured single URL.
-- `console.log` is available because code runs in plugin runtime context.
-
-Example:
-
-```javascript
-function transform(payload) {
-  if (payload.event === "task.completed") {
-    return {
-      text: `Completed: ${payload.data.task.title}`,
-      event: payload.event,
-      at: payload.timestamp,
-    };
-  }
-
-  return payload;
-}
-```
+JavaScript transform files are no longer supported.
 
 ### JSON Transform Files
 
@@ -264,7 +229,7 @@ For quick inspection, use a request-bin tool such as `webhook.site`.
 
 ### Webhook disabled automatically
 
-If failures continue and `failureCount` exceeds 10, webhook is disabled.
+If more than 10 consecutive deliveries exhaust all retries, the webhook is disabled. A successful delivery resets the streak; intermittent lifetime failures do not disable a recovered endpoint.
 
 1. Fix endpoint availability or response handling.
 2. Re-enable webhook in TaskNotes settings, or recreate it via `POST /api/webhooks`.
@@ -272,5 +237,5 @@ If failures continue and `failureCount` exceeds 10, webhook is disabled.
 ### Transform errors
 
 1. Confirm `transformFile` exists in vault.
-2. For JS, ensure `transform` function is defined.
+2. Confirm the file is a `.json` transform template.
 3. Check Obsidian console logs for transform exceptions.

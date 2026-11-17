@@ -1,3 +1,5 @@
+import { uiText } from "../../i18n/runtime";
+import { msg } from "@lingui/core/macro";
 /**
  * ====================================================================
  * TaskNotes Card Component System
@@ -175,7 +177,14 @@
  * - Content and actions sections hide when collapsed
  */
 
-import { setIcon } from "obsidian";
+import { Setting, ToggleComponent, setIcon } from "obsidian";
+import {
+	colorValueToInputValue,
+	normalizeThemeColor,
+	THEME_COLOR_INPUT_PLACEHOLDER,
+	THEME_COLOR_SUGGESTIONS,
+} from "../../utils/themeColors";
+import { runAsyncSettingCallback } from "./settingHelpers";
 
 /**
  * Main configuration interface for creating cards
@@ -222,7 +231,7 @@ export interface CardHeaderButton {
 	/** Tooltip text on hover */
 	tooltip?: string;
 	/** Click handler */
-	onClick: () => void;
+	onClick: () => unknown;
 }
 
 /** Content section containing form rows */
@@ -249,9 +258,49 @@ export interface CardButton {
 	/** Button style variant */
 	variant?: "primary" | "secondary" | "delete" | "warning" | "default";
 	/** Click handler */
-	onClick: () => void;
+	onClick: () => unknown;
 	/** Whether button is disabled */
 	disabled?: boolean;
+}
+
+export const CARD_COLLAPSE_CHANGED = "tasknotes:card-collapse-changed";
+
+/** Update presentation without treating restoration as a user interaction. */
+export function setCardCollapsed(card: HTMLElement, collapsed: boolean): void {
+	card.classList.toggle("tasknotes-settings__card--collapsed", collapsed);
+	const header = card.querySelector<HTMLElement>(":scope > .tasknotes-settings__card-header");
+	if (header) header.title = collapsed ? uiText(msg({ message: "Expand card", context: "settings/components/CardComponent: setCardCollapsed display" })) : uiText(msg({ message: "Collapse card", context: "settings/components/CardComponent: setCardCollapsed display" }));
+}
+
+const CARD_INFO_CLASS = "tasknotes-settings__card-info";
+const CARD_PRIMARY_TEXT_CLASS = "tasknotes-settings__card-primary-text";
+const CARD_SECONDARY_TEXT_CLASS = "tasknotes-settings__card-secondary-text";
+
+function getCardHeaderInfo(card: Element): HTMLElement | null {
+	return card.querySelector<HTMLElement>(
+		`:scope > .tasknotes-settings__card-header .${CARD_INFO_CLASS}`
+	);
+}
+
+/** Update a card's header title in place without re-rendering the card. */
+export function setCardPrimaryText(card: Element | null | undefined, text: string): void {
+	const primaryText = card && getCardHeaderInfo(card)?.querySelector(`.${CARD_PRIMARY_TEXT_CLASS}`);
+	if (primaryText) primaryText.textContent = text;
+}
+
+/**
+ * Update a card's header subtitle in place without re-rendering the card.
+ * Creates the subtitle when the card was rendered without one.
+ */
+export function setCardSecondaryText(card: Element | null | undefined, text: string): void {
+	const headerInfo = card ? getCardHeaderInfo(card) : null;
+	if (!headerInfo) return;
+	let secondaryText = headerInfo.querySelector(`.${CARD_SECONDARY_TEXT_CLASS}`);
+	if (!secondaryText) {
+		if (!text) return;
+		secondaryText = headerInfo.createSpan(CARD_SECONDARY_TEXT_CLASS);
+	}
+	secondaryText.textContent = text;
 }
 
 /**
@@ -285,40 +334,80 @@ export function createCard(container: HTMLElement, config: CardConfig): HTMLElem
 		dragHandle = header.createDiv("tasknotes-settings__card-drag-handle");
 		dragHandle.textContent = "⋮⋮";
 		dragHandle.draggable = true;
-		dragHandle.title = "Drag to reorder";
+		dragHandle.title = uiText(msg({ message: "Drag to reorder", context: "settings/components/CardComponent: createCard display" }));
 	}
 
 	// Left side of header with color indicator and info
 	const headerLeft = header.createDiv();
-	headerLeft.style.display = "flex";
-	headerLeft.style.alignItems = "center";
-	headerLeft.style.flex = "1";
-	headerLeft.style.minWidth = "0";
+	headerLeft.classList.remove(
+		"tn-static-display-block-2a1b75c9",
+		"tn-static-display-flex-4d51fc62",
+		"tn-static-display-flex-8bb39979",
+		"tn-static-display-inline-block-60e32dcb",
+		"tn-static-display-inline-cccfa456",
+		"tn-static-display-inline-flex-f984c520",
+		"tn-static-display-none-6b99de8b",
+		"tn-static-min-height-800px-997b4c8c"
+	);
+	headerLeft.classList.add("tn-static-display-flex-75816cae");
+	headerLeft.classList.remove(
+		"tn-static-align-items-baseline-4b95b5c7",
+		"tn-static-align-items-flex-start-0486f781"
+	);
+	headerLeft.classList.add("tn-static-align-items-center-7c619740");
+	headerLeft.classList.remove("tn-static-flex-1-14e3b769", "tn-static-margin-top-12px-91e0f558");
+	headerLeft.classList.add("tn-static-flex-1-97445a8d");
+	headerLeft.classList.remove("tn-static-min-width-2px-709d7da0");
+	headerLeft.classList.add("tn-static-min-width-0-3922d326");
 
 	// Color indicator
 	if (config.colorIndicator) {
 		const colorIndicator = headerLeft.createDiv("tasknotes-settings__card-color-indicator");
-		colorIndicator.style.backgroundColor = config.colorIndicator.color;
+		colorIndicator.style.backgroundColor = normalizeThemeColor(config.colorIndicator.color);
 		if (config.colorIndicator.cssVar) {
-			colorIndicator.style.setProperty("--card-color", config.colorIndicator.color);
+			colorIndicator.style.setProperty(
+				"--card-color",
+				normalizeThemeColor(config.colorIndicator.color)
+			);
 		}
 	}
 
 	// Header info
 	const headerInfo = headerLeft.createDiv("tasknotes-settings__card-info");
-	const primaryText = headerInfo.createSpan("tasknotes-settings__card-primary-text");
+	const primaryText = headerInfo.createSpan(CARD_PRIMARY_TEXT_CLASS);
 	primaryText.textContent = config.header.primaryText;
 
 	if (config.header.secondaryText) {
-		const secondaryText = headerInfo.createSpan("tasknotes-settings__card-secondary-text");
+		const secondaryText = headerInfo.createSpan(CARD_SECONDARY_TEXT_CLASS);
 		secondaryText.textContent = config.header.secondaryText;
 	}
 
 	// Right side of header with meta elements and actions
 	const headerRight = header.createDiv();
-	headerRight.style.display = "flex";
-	headerRight.style.alignItems = "center";
-	headerRight.style.gap = "0.5rem";
+	headerRight.classList.remove(
+		"tn-static-display-block-2a1b75c9",
+		"tn-static-display-flex-4d51fc62",
+		"tn-static-display-flex-8bb39979",
+		"tn-static-display-inline-block-60e32dcb",
+		"tn-static-display-inline-cccfa456",
+		"tn-static-display-inline-flex-f984c520",
+		"tn-static-display-none-6b99de8b",
+		"tn-static-min-height-800px-997b4c8c"
+	);
+	headerRight.classList.add("tn-static-display-flex-75816cae");
+	headerRight.classList.remove(
+		"tn-static-align-items-baseline-4b95b5c7",
+		"tn-static-align-items-flex-start-0486f781"
+	);
+	headerRight.classList.add("tn-static-align-items-center-7c619740");
+	headerRight.classList.remove(
+		"tn-static-display-flex-8bb39979",
+		"tn-static-gap-10px-f3d7ce77",
+		"tn-static-gap-12px-ed7b3d87",
+		"tn-static-gap-6px-f0abc1db",
+		"tn-static-gap-8px-33fcd4c3"
+	);
+	headerRight.classList.add("tn-static-gap-0-5rem-ce2fca4d");
 
 	// Meta elements
 	if (config.header.meta && config.header.meta.length > 0) {
@@ -351,7 +440,7 @@ export function createCard(container: HTMLElement, config: CardConfig): HTMLElem
 
 			button.onclick = (e) => {
 				e.stopPropagation(); // Prevent header click from firing
-				actionConfig.onClick();
+				runAsyncSettingCallback(actionConfig.onClick);
 			};
 		});
 	}
@@ -362,22 +451,16 @@ export function createCard(container: HTMLElement, config: CardConfig): HTMLElem
 		const toggleCollapse = () => {
 			const isCurrentlyCollapsed = card.hasClass("tasknotes-settings__card--collapsed");
 
-			if (isCurrentlyCollapsed) {
-				// Expand
-				card.removeClass("tasknotes-settings__card--collapsed");
-				header.title = "Collapse card";
-				config.onCollapseChange?.(false);
-			} else {
-				// Collapse
-				card.addClass("tasknotes-settings__card--collapsed");
-				header.title = "Expand card";
-				config.onCollapseChange?.(true);
-			}
+			const collapsed = !isCurrentlyCollapsed;
+			setCardCollapsed(card, collapsed);
+			// Record state before callbacks can rebuild or remove the card.
+			card.dispatchEvent(new CustomEvent(CARD_COLLAPSE_CHANGED, { bubbles: true }));
+			config.onCollapseChange?.(collapsed);
 		};
 
 		// Make entire header clickable
 		header.addClass("tasknotes-settings__card-header--clickable");
-		header.title = config.defaultCollapsed ? "Expand card" : "Collapse card";
+		header.title = config.defaultCollapsed ? uiText(msg({ message: "Expand card", context: "settings/components/CardComponent: createCard display" })) : uiText(msg({ message: "Collapse card", context: "settings/components/CardComponent: createCard display" }));
 		header.onclick = (e) => {
 			// Don't trigger if clicking on action buttons
 			if ((e.target as Element).closest(".tasknotes-settings__card-header-actions")) {
@@ -399,9 +482,25 @@ export function createCard(container: HTMLElement, config: CardConfig): HTMLElem
 				const configRow = content.createDiv("tasknotes-settings__card-config-row");
 
 				if (row.fullWidth) {
-					configRow.style.flexDirection = "column";
-					configRow.style.alignItems = "flex-start";
-					configRow.style.gap = "0.5rem";
+					configRow.classList.remove(
+						"tn-static-display-flex-4d51fc62",
+						"tn-static-display-flex-8bb39979",
+						"tn-static-min-height-800px-997b4c8c"
+					);
+					configRow.classList.add("tn-static-flex-direction-column-06c8b5ed");
+					configRow.classList.remove(
+						"tn-static-align-items-baseline-4b95b5c7",
+						"tn-static-align-items-center-7c619740"
+					);
+					configRow.classList.add("tn-static-align-items-flex-start-0486f781");
+					configRow.classList.remove(
+						"tn-static-display-flex-8bb39979",
+						"tn-static-gap-10px-f3d7ce77",
+						"tn-static-gap-12px-ed7b3d87",
+						"tn-static-gap-6px-f0abc1db",
+						"tn-static-gap-8px-33fcd4c3"
+					);
+					configRow.classList.add("tn-static-gap-0-5rem-ce2fca4d");
 				}
 
 				const label = configRow.createSpan("tasknotes-settings__card-config-label");
@@ -439,7 +538,9 @@ export function createCard(container: HTMLElement, config: CardConfig): HTMLElem
 				button.disabled = true;
 			}
 
-			button.onclick = buttonConfig.onClick;
+			button.onclick = () => {
+				runAsyncSettingCallback(buttonConfig.onClick);
+			};
 		});
 	}
 
@@ -453,7 +554,7 @@ export function createStatusBadge(
 	text: string,
 	variant: "active" | "inactive" | "completed" | "default" = "default"
 ): HTMLElement {
-	const badge = document.createElement("span");
+	const badge = activeWindow.createSpan();
 	badge.addClass("tasknotes-settings__card-status-badge");
 	badge.addClass(`tasknotes-settings__card-status-badge--${variant}`);
 	badge.textContent = text;
@@ -463,11 +564,14 @@ export function createStatusBadge(
 /**
  * Creates a header delete button for compact card design
  */
-export function createDeleteHeaderButton(onClick: () => void, tooltip?: string): CardHeaderButton {
+export function createDeleteHeaderButton(
+	onClick: () => unknown,
+	tooltip?: string
+): CardHeaderButton {
 	return {
 		icon: "trash-2",
 		variant: "delete",
-		tooltip: tooltip || "Delete",
+		tooltip: tooltip || uiText(msg({ message: "Delete", context: "settings/components/CardComponent: createDeleteHeaderButton tooltip" })),
 		onClick,
 	};
 }
@@ -480,7 +584,7 @@ export function createCardInput(
 	placeholder?: string,
 	value?: string
 ): HTMLInputElement {
-	const input = document.createElement("input");
+	const input = activeWindow.createEl("input");
 	input.type = type;
 	input.addClass("tasknotes-settings__card-input");
 
@@ -495,26 +599,134 @@ export function createCardInput(
 	return input;
 }
 
+const THEME_COLOR_DATALIST_ID = "tasknotes-theme-color-options";
+const THEME_COLOR_NATIVE_PICKER_CLASS = "tasknotes-theme-color-picker";
+const THEME_COLOR_TEXT_INPUT_CLASS = "tasknotes-theme-color-text-input";
+const THEME_COLOR_PICKER_FALLBACK = "#6366f1";
+const HEX_COLOR_INPUT_PATTERN = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i;
+
+type ThemeColorTextInput = HTMLInputElement & {
+	tasknotesThemeColorPicker?: HTMLInputElement;
+};
+
+function ensureThemeColorDatalist(): void {
+	if (activeDocument.getElementById(THEME_COLOR_DATALIST_ID)) return;
+
+	const datalist = activeWindow.createEl("datalist");
+	datalist.id = THEME_COLOR_DATALIST_ID;
+	for (const value of THEME_COLOR_SUGGESTIONS) {
+		datalist.createEl("option", { value });
+	}
+	activeDocument.body.appendChild(datalist);
+}
+
+function hexColorForNativePicker(value: string | null | undefined): string | null {
+	const match = value?.trim().match(HEX_COLOR_INPUT_PATTERN);
+	if (!match) return null;
+
+	const hex = match[1].toLowerCase();
+	if (hex.length === 3) {
+		return `#${hex[0]}${hex[0]}${hex[1]}${hex[1]}${hex[2]}${hex[2]}`;
+	}
+
+	return `#${hex}`;
+}
+
+function dispatchNativePickerInput(input: HTMLInputElement): void {
+	input.dispatchEvent(new Event("input", { bubbles: true }));
+	input.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+function configureNativeThemeColorPicker(input: ThemeColorTextInput): void {
+	const parent = input.parentElement;
+	if (!parent) return;
+
+	if (input.tasknotesThemeColorPicker?.isConnected) {
+		const pickerColor = hexColorForNativePicker(input.value);
+		if (pickerColor) {
+			input.tasknotesThemeColorPicker.value = pickerColor;
+		}
+		return;
+	}
+
+	const picker = activeWindow.createEl("input");
+	picker.type = "color";
+	picker.addClass(THEME_COLOR_NATIVE_PICKER_CLASS);
+	picker.value = hexColorForNativePicker(input.value) || THEME_COLOR_PICKER_FALLBACK;
+	picker.title = uiText(msg({ message: "Open color picker", context: "settings/components/CardComponent: configureNativeThemeColorPicker display" }));
+	picker.setAttribute("aria-label", uiText(msg({ message: "Open color picker", context: "settings/components/CardComponent: configureNativeThemeColorPicker display" })));
+
+	const syncInputFromPicker = () => {
+		if (input.value === picker.value) return;
+		input.value = picker.value;
+		dispatchNativePickerInput(input);
+	};
+
+	const syncPickerFromInput = () => {
+		const pickerColor = hexColorForNativePicker(input.value);
+		if (pickerColor) {
+			picker.value = pickerColor;
+		}
+	};
+
+	picker.addEventListener("input", syncInputFromPicker);
+	picker.addEventListener("change", syncInputFromPicker);
+	input.addEventListener("input", syncPickerFromInput);
+	input.addEventListener("change", syncPickerFromInput);
+	input.insertAdjacentElement("afterend", picker);
+	input.tasknotesThemeColorPicker = picker;
+}
+
+export function configureThemeColorInput(input: HTMLInputElement): void {
+	const themeInput = input as ThemeColorTextInput;
+	input.type = "text";
+	input.addClass(THEME_COLOR_TEXT_INPUT_CLASS);
+	input.placeholder = THEME_COLOR_INPUT_PLACEHOLDER;
+	input.setAttribute("list", THEME_COLOR_DATALIST_ID);
+	input.title = THEME_COLOR_INPUT_PLACEHOLDER;
+	ensureThemeColorDatalist();
+	configureNativeThemeColorPicker(themeInput);
+}
+
+export function createThemeColorInput(value?: string): HTMLInputElement {
+	const input = createCardInput("text", THEME_COLOR_INPUT_PLACEHOLDER, colorValueToInputValue(value));
+	configureThemeColorInput(input);
+	return input;
+}
+
+export function readThemeColorInput(input: HTMLInputElement, fallback: string): string {
+	const color = normalizeThemeColor(input.value, fallback);
+	input.value = colorValueToInputValue(color);
+	return color;
+}
+
 /**
  * Creates an Obsidian-style toggle switch for card content
  * Returns the toggle component's toggleEl directly
  */
-export function createCardToggle(initialValue = false, onChange?: (value: boolean) => void): HTMLElement {
-	// eslint-disable-next-line @typescript-eslint/no-require-imports
-	const { Setting } = require("obsidian");
-	const tempContainer = document.createElement("div");
+export function createCardToggle(
+	initialValue = false,
+	onChange?: (value: boolean) => unknown
+): HTMLElement {
+	const tempContainer = activeWindow.createDiv();
 	const setting = new Setting(tempContainer);
 
-	let toggleEl: HTMLElement;
-	setting.addToggle((toggle: any) => {
+	let toggleEl: HTMLElement | null = null;
+	setting.addToggle((toggle: ToggleComponent) => {
 		toggle.setValue(initialValue);
 		if (onChange) {
-			toggle.onChange(onChange);
+			toggle.onChange((value) => {
+				runAsyncSettingCallback(() => onChange(value));
+			});
 		}
 		toggleEl = toggle.toggleEl;
 	});
 
-	return toggleEl!;
+	if (!toggleEl) {
+		throw new Error("Failed to create card toggle");
+	}
+
+	return toggleEl;
 }
 
 /**
@@ -524,7 +736,7 @@ export function createCardSelect(
 	options: Array<{ value: string; label: string }>,
 	selectedValue?: string
 ): HTMLSelectElement {
-	const select = document.createElement("select");
+	const select = activeWindow.createEl("select");
 	select.addClass("tasknotes-settings__card-input");
 
 	options.forEach((option) => {
@@ -602,7 +814,10 @@ export function setupCardDragAndDrop(
 			"tasknotes-settings__card--drag-over-bottom"
 		);
 
-		const draggedCardId = e.dataTransfer!.getData("text/plain");
+		const draggedCardId = e.dataTransfer?.getData("text/plain");
+		if (!draggedCardId) {
+			return;
+		}
 		const targetCardId = cardId;
 
 		if (draggedCardId !== targetCardId) {
@@ -622,11 +837,14 @@ export function setupCardDragAndDrop(
 /**
  * Creates an edit header button with consistent styling
  */
-export function createEditHeaderButton(onClick: () => void, tooltip?: string): CardHeaderButton {
+export function createEditHeaderButton(
+	onClick: () => unknown,
+	tooltip?: string
+): CardHeaderButton {
 	return {
 		icon: "edit",
 		variant: "edit",
-		tooltip: tooltip || "Edit",
+		tooltip: tooltip || uiText(msg({ message: "Edit", context: "settings/components/CardComponent: createEditHeaderButton tooltip" })),
 		onClick,
 	};
 }
@@ -639,7 +857,7 @@ export function createCardTextarea(
 	value?: string,
 	rows = 3
 ): HTMLTextAreaElement {
-	const textarea = document.createElement("textarea");
+	const textarea = activeWindow.createEl("textarea");
 	textarea.addClass("tasknotes-settings__card-input");
 	textarea.rows = rows;
 
@@ -694,9 +912,7 @@ export function createCardNumberInput(
 export function normalizeCalendarUrl(url: string): string {
 	if (!url) return url;
 
-	return url
-		.replace(/^webcal:\/\//i, 'http://')
-		.replace(/^webcals:\/\//i, 'https://');
+	return url.replace(/^webcal:\/\//i, "http://").replace(/^webcals:\/\//i, "https://");
 }
 
 /**
@@ -708,7 +924,7 @@ export function normalizeCalendarUrl(url: string): string {
  * http/https when the URL is saved.
  */
 export function createCardUrlInput(placeholder?: string, value?: string): HTMLInputElement {
-	const input = document.createElement("input");
+	const input = activeWindow.createEl("input");
 	// Use type="text" instead of type="url" to allow webcal:// and webcals:// protocols
 	// HTML5 type="url" validation only accepts http://, https://, and ftp://
 	input.type = "text";
@@ -716,7 +932,7 @@ export function createCardUrlInput(placeholder?: string, value?: string): HTMLIn
 
 	// Add pattern validation to accept calendar URL protocols
 	input.pattern = "^(https?|webcals?)://.*";
-	input.title = "Enter an http://, https://, webcal://, or webcals:// URL";
+	input.title = uiText(msg({ message: "Enter an HTTP://, HTTPS://, webcal://, or webcals:// URL", context: "settings/components/CardComponent: createCardUrlInput display" }));
 
 	if (placeholder) {
 		input.placeholder = placeholder;
@@ -747,7 +963,7 @@ export function createSimpleCard(container: HTMLElement, rows: CardRow[]): HTMLE
  * Creates an info badge for displaying read-only information
  */
 export function createInfoBadge(text: string): HTMLElement {
-	const badge = document.createElement("span");
+	const badge = activeWindow.createSpan();
 	badge.addClass("tasknotes-settings__card-info-badge");
 	badge.textContent = text;
 	return badge;
@@ -760,9 +976,36 @@ export function showCardLoading(container: HTMLElement, message = "Loading..."):
 	container.empty();
 	const loadingCard = container.createDiv("tasknotes-settings__card");
 	const loadingContent = loadingCard.createDiv("tasknotes-settings__card-content");
-	loadingContent.style.textAlign = "center";
-	loadingContent.style.padding = "2rem";
-	loadingContent.style.color = "var(--text-muted)";
+	loadingContent.classList.remove("tn-static-padding-20px-7a035d95");
+	loadingContent.classList.add("tn-static-text-align-center-91a87015");
+	loadingContent.classList.remove(
+		"tn-static-margin-8px-0-0-0-a2eb8382",
+		"tn-static-padding-0-16px-16px-16px-f1aa998c",
+		"tn-static-padding-0-41d7d7e2",
+		"tn-static-padding-12px-43bef435",
+		"tn-static-padding-16px-287f770e",
+		"tn-static-padding-20px-769fed37",
+		"tn-static-padding-20px-7a035d95",
+		"tn-static-padding-20px-ebe8e48c",
+		"tn-static-padding-2px-8px-c8eea84a"
+	);
+	loadingContent.classList.add("tn-static-padding-2rem-42aa6d9c");
+	loadingContent.classList.remove(
+		"tn-static-color-var-color-accent-d2cad743",
+		"tn-static-color-var-text-accent-65b47ee3",
+		"tn-static-color-var-text-on-accent-f3e1679d",
+		"tn-static-color-var-text-warning-783d5f03",
+		"tn-static-color-var-tn-text-muted-a90fb6f3",
+		"tn-static-color-white-0a43e56a",
+		"tn-static-cursor-pointer-2723efcc",
+		"tn-static-font-size-12px-65574819",
+		"tn-static-font-weight-bold-0fe8c30d",
+		"tn-static-font-weight-bold-e0b452bd",
+		"tn-static-margin-2px-0-edce9b14",
+		"tn-static-padding-20px-7a035d95",
+		"tn-static-padding-20px-ebe8e48c"
+	);
+	loadingContent.classList.add("tn-static-color-var-text-muted-5872de20");
 	loadingContent.textContent = message;
 }
 
@@ -788,7 +1031,19 @@ export function showCardEmptyState(
 			text: actionText,
 			cls: "tn-btn tn-btn--primary",
 		});
-		actionButton.style.marginTop = "1rem";
+		actionButton.classList.remove(
+			"tn-static-font-size-12px-b0cc7e05",
+			"tn-static-margin-top-0-5rem-3dc98b5e",
+			"tn-static-margin-top-0-d462248a",
+			"tn-static-margin-top-12px-91e0f558",
+			"tn-static-margin-top-16px-1b0f4999",
+			"tn-static-margin-top-20px-a26bda7d",
+			"tn-static-margin-top-30px-2fbbbcd4",
+			"tn-static-margin-top-4px-96ad6099",
+			"tn-static-margin-top-8px-8a77e5a3",
+			"tn-static-margin-top-8px-f4f01e68"
+		);
+		actionButton.classList.add("tn-static-margin-top-1rem-2239d6d5");
 		actionButton.onclick = onAction;
 	}
 }

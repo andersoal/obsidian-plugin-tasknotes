@@ -1,7 +1,9 @@
+import { uiData } from "../i18n/dataText";
 import { TaskInfo } from "../types";
 import { format, parseISO } from "date-fns";
-import { Notice } from "obsidian";
-import { TranslationKey } from "../i18n";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Services/CalendarExportService" });
 
 export interface CalendarURLOptions {
 	type: "google" | "outlook" | "yahoo" | "ics";
@@ -11,14 +13,27 @@ export interface CalendarURLOptions {
 
 export interface ICSExportOptions {
 	useDurationForExport?: boolean; // Use timeEstimate (duration) instead of due date for DTEND
+	excludeArchived?: boolean; // Exclude archived tasks from multi-task exports
+	excludeCompleted?: boolean; // Exclude completed tasks from multi-task exports
+	completedStatuses?: string[]; // Status values considered completed when excludeCompleted is enabled
+	requireDueDate?: boolean; // Only include tasks with a due date in multi-task exports
+	requireScheduledDate?: boolean; // Only include tasks with a scheduled date in multi-task exports
+	includeObsidianLink?: boolean; // Include an obsidian:// link back to the source task note
+	vaultName?: string; // Vault name used when includeObsidianLink is enabled
 }
 
-type TranslateFn = (key: TranslationKey, variables?: Record<string, any>) => string;
+export interface ICSDownloadFile {
+	content: string;
+	filename: string;
+	taskCount: number;
+}
 
 interface ICSDateProperties {
 	startLine: string | null;
 	endLine: string | null;
 }
+
+type VEventStatus = "TENTATIVE" | "CONFIRMED" | "CANCELLED";
 
 export class CalendarExportService {
 	/**
@@ -37,24 +52,7 @@ export class CalendarExportService {
 			case "ics":
 				return this.generateICSDownloadURL(task);
 			default:
-				throw new Error(`Unsupported calendar type: ${type}`);
-		}
-	}
-
-	/**
-	 * Open calendar URL in browser
-	 */
-	static openCalendarURL(options: CalendarURLOptions, translate?: TranslateFn): void {
-		try {
-			const url = this.generateCalendarURL(options);
-			window.open(url, "_blank");
-		} catch (error) {
-			console.error("Failed to generate calendar URL:", error);
-			new Notice(
-				translate
-					? translate("services.calendarExport.notices.generateLinkFailed")
-					: "Failed to generate calendar link"
-			);
+				throw new Error("Unsupported calendar type");
 		}
 	}
 
@@ -202,7 +200,7 @@ export class CalendarExportService {
 		}
 
 		// Add description
-		const description = this.buildDescription(task);
+		const description = this.buildDescription(task, options);
 		if (description) {
 			lines.push(`DESCRIPTION:${this.escapeICSText(description)}`);
 		}
@@ -232,14 +230,7 @@ export class CalendarExportService {
 
 		// Map status
 		if (task.status) {
-			const statusMap: Record<string, string> = {
-				done: "COMPLETED",
-				"in-progress": "IN-PROCESS",
-				todo: "NEEDS-ACTION",
-				cancelled: "CANCELLED",
-			};
-			const icsStatus = statusMap[task.status] || "NEEDS-ACTION";
-			lines.push(`STATUS:${icsStatus}`);
+			lines.push(`STATUS:${this.getVEventStatus(task.status)}`);
 		}
 
 		lines.push("END:VEVENT");
@@ -251,7 +242,7 @@ export class CalendarExportService {
 	/**
 	 * Build description text from task
 	 */
-	private static buildDescription(task: TaskInfo): string {
+	private static buildDescription(task: TaskInfo, options?: ICSExportOptions): string {
 		const parts: string[] = [];
 
 		// Add metadata
@@ -289,7 +280,22 @@ export class CalendarExportService {
 		if (parts.length > 0) parts.push("");
 		parts.push(`Exported from TaskNotes: ${task.path}`);
 
-		return parts.join("\n");
+		const obsidianUri = this.buildObsidianOpenUri(task, options);
+		if (obsidianUri) {
+			parts.push(`Open in Obsidian: ${obsidianUri}`);
+		}
+
+		return uiData(parts.join("\n"), "Pre-port ICS DESCRIPTION contract; exported data stays stable English");
+	}
+
+	private static buildObsidianOpenUri(task: TaskInfo, options?: ICSExportOptions): string | null {
+		if (!options?.includeObsidianLink || !options.vaultName) {
+			return null;
+		}
+
+		return uiData(`obsidian://open?vault=${encodeURIComponent(options.vaultName)}&file=${encodeURIComponent(
+			task.path
+		)}`, "Obsidian deep-link URI; preserve the protocol and encoded vault/file data");
 	}
 
 	/**
@@ -328,14 +334,23 @@ export class CalendarExportService {
 			try {
 				const scheduledDate = this.parseTaskDate(task.scheduled);
 				startISO = scheduledDate.toISOString();
-			} catch (e) {
-				console.warn("Invalid scheduled date:", task.scheduled);
+			} catch {
+				tasknotesLogger.warn("Invalid scheduled date:", {
+					category: "provider",
+					operation: "invalid-scheduled-date",
+					details: { value: task.scheduled },
+				});
 			}
 		}
 
 		// When useDurationForExport is enabled, use timeEstimate to calculate end time
 		// instead of using due date
-		if (options?.useDurationForExport && startISO && task.timeEstimate && task.timeEstimate > 0) {
+		if (
+			options?.useDurationForExport &&
+			startISO &&
+			task.timeEstimate &&
+			task.timeEstimate > 0
+		) {
 			// Use scheduled + timeEstimate (in minutes) as end time
 			const start = new Date(startISO);
 			const end = new Date(start.getTime() + task.timeEstimate * 60 * 1000);
@@ -344,8 +359,12 @@ export class CalendarExportService {
 			try {
 				const dueDate = this.parseTaskDate(task.due);
 				endISO = dueDate.toISOString();
-			} catch (e) {
-				console.warn("Invalid due date:", task.due);
+			} catch {
+				tasknotesLogger.warn("Invalid due date:", {
+					category: "provider",
+					operation: "invalid-due-date",
+					details: { value: task.due },
+				});
 			}
 		} else if (useScheduledAsDue && startISO) {
 			// Use scheduled + 1 hour as end time (default fallback)
@@ -409,12 +428,33 @@ export class CalendarExportService {
 	): ICSDateProperties {
 		if (task.scheduled && !this.hasTimeComponent(task.scheduled)) {
 			const startDate = task.scheduled;
-			const endDateExclusive = this.getAllDayEndDate(task, useScheduledAsDue, options) || startDate;
+			const endDateExclusive =
+				this.getAllDayEndDate(task, useScheduledAsDue, options) || startDate;
 
 			return {
 				startLine: `DTSTART;VALUE=DATE:${this.formatDateOnlyToICS(startDate)}`,
 				endLine: `DTEND;VALUE=DATE:${this.formatDateOnlyToICS(endDateExclusive)}`,
 			};
+		}
+
+		// A task with only a due date is an event on that date, not a span
+		// ending at it.
+		if (!task.scheduled && task.due) {
+			if (!this.hasTimeComponent(task.due)) {
+				return {
+					startLine: `DTSTART;VALUE=DATE:${this.formatDateOnlyToICS(task.due)}`,
+					endLine: `DTEND;VALUE=DATE:${this.formatDateOnlyToICS(this.addDaysToDateString(task.due, 1))}`,
+				};
+			}
+			try {
+				const due = this.parseTaskDate(task.due);
+				return {
+					startLine: `DTSTART:${this.formatDateToICS(due)}`,
+					endLine: `DTEND:${this.formatDateToICS(new Date(due.getTime() + 60 * 60 * 1000))}`,
+				};
+			} catch {
+				// fall through to the range below
+			}
 		}
 
 		const { startICS, endICS } = this.getICSDateFormat(task, useScheduledAsDue, options);
@@ -440,12 +480,12 @@ export class CalendarExportService {
 	 */
 	private static parseICSDate(icsDate: string): Date {
 		// YYYYMMDDTHHMMSSZ -> YYYY-MM-DDTHH:MM:SSZ
-		const year = icsDate.substr(0, 4);
-		const month = icsDate.substr(4, 2);
-		const day = icsDate.substr(6, 2);
-		const hour = icsDate.substr(9, 2);
-		const minute = icsDate.substr(11, 2);
-		const second = icsDate.substr(13, 2);
+		const year = icsDate.slice(0, 4);
+		const month = icsDate.slice(4, 6);
+		const day = icsDate.slice(6, 8);
+		const hour = icsDate.slice(9, 11);
+		const minute = icsDate.slice(11, 13);
+		const second = icsDate.slice(13, 15);
 
 		return new Date(`${year}-${month}-${day}T${hour}:${minute}:${second}Z`);
 	}
@@ -454,22 +494,23 @@ export class CalendarExportService {
 	 * Parse task date string to Date object
 	 */
 	private static parseTaskDate(dateStr: string): Date {
+		const normalizedDate = dateStr.trim().replace(" ", "T");
 		// Handle different date formats
-		if (dateStr.includes("T")) {
+		if (this.hasTimeComponent(normalizedDate)) {
 			// ISO format or local datetime
-			return parseISO(dateStr);
+			return parseISO(normalizedDate);
 		} else {
 			// Date only - assume start of day
-			return parseISO(`${dateStr}T00:00:00`);
+			return parseISO(`${normalizedDate}T00:00:00`);
 		}
 	}
 
 	private static hasTimeComponent(dateStr: string): boolean {
-		return dateStr.includes("T");
+		return /\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}/.test(dateStr);
 	}
 
 	private static formatDateOnlyToICS(dateStr: string): string {
-		return dateStr.split("T")[0].replace(/-/g, "");
+		return dateStr.split(/[T\s]/)[0].replace(/-/g, "");
 	}
 
 	private static getAllDayEndDate(
@@ -496,7 +537,7 @@ export class CalendarExportService {
 	}
 
 	private static addDaysToDateString(dateStr: string, days: number): string {
-		const baseDate = parseISO(`${dateStr.split("T")[0]}T00:00:00`);
+		const baseDate = parseISO(`${dateStr.split(/[T\s]/)[0]}T00:00:00`);
 		baseDate.setDate(baseDate.getDate() + days);
 		return format(baseDate, "yyyy-MM-dd");
 	}
@@ -547,6 +588,7 @@ export class CalendarExportService {
 			.toISOString()
 			.replace(/[-:]/g, "")
 			.replace(/\.\d{3}/, "");
+		const exportTasks = this.filterTasksForExport(tasks, options);
 
 		const lines = [
 			"BEGIN:VCALENDAR",
@@ -556,7 +598,7 @@ export class CalendarExportService {
 		];
 
 		// Add each task as a VEVENT
-		tasks.forEach((task, index) => {
+		exportTasks.forEach((task, index) => {
 			const uid = `${task.path.replace(/[^a-zA-Z0-9]/g, "-")}-${index}-${Date.now()}@tasknotes`;
 
 			lines.push("BEGIN:VEVENT");
@@ -607,7 +649,7 @@ export class CalendarExportService {
 			lines.push(endLine);
 
 			// Add description
-			const description = this.buildDescription(task);
+			const description = this.buildDescription(task, options);
 			if (description) {
 				lines.push(`DESCRIPTION:${this.escapeICSText(description)}`);
 			}
@@ -637,14 +679,7 @@ export class CalendarExportService {
 
 			// Map status
 			if (task.status) {
-				const statusMap: Record<string, string> = {
-					done: "COMPLETED",
-					"in-progress": "IN-PROCESS",
-					todo: "NEEDS-ACTION",
-					cancelled: "CANCELLED",
-				};
-				const icsStatus = statusMap[task.status] || "NEEDS-ACTION";
-				lines.push(`STATUS:${icsStatus}`);
+				lines.push(`STATUS:${this.getVEventStatus(task.status)}`);
 			}
 
 			lines.push("END:VEVENT");
@@ -656,86 +691,73 @@ export class CalendarExportService {
 		return this.foldICSLines(lines.join("\r\n"));
 	}
 
-	/**
-	 * Download ICS file for all tasks
-	 */
-	static downloadAllTasksICSFile(tasks: TaskInfo[], translate?: TranslateFn, options?: ICSExportOptions): void {
-		try {
-			if (!tasks || tasks.length === 0) {
-				new Notice(
-					translate
-						? translate("services.calendarExport.notices.noTasksToExport")
-						: "No tasks found to export"
-				);
-				return;
-			}
-
-			const icsContent = this.generateMultipleTasksICSContent(tasks, options);
-			const blob = new Blob([icsContent], { type: "text/calendar" });
-			const url = URL.createObjectURL(blob);
-
-			const date = new Date().toISOString().split("T")[0];
-			const filename = `tasknotes-all-tasks-${date}.ics`;
-
-			const a = document.createElement("a");
-			a.href = url;
-			a.download = filename;
-			a.click();
-
-			URL.revokeObjectURL(url);
-
-			const pluralSuffix = tasks.length === 1 ? "" : "s";
-			new Notice(
-				translate
-					? translate("services.calendarExport.notices.downloadSuccess", {
-							filename,
-							count: tasks.length,
-							plural: pluralSuffix,
-						})
-					: `Downloaded ${filename} with ${tasks.length} task${pluralSuffix}`
-			);
-		} catch (error) {
-			console.error("Failed to download all tasks ICS file:", error);
-			new Notice(
-				translate
-					? translate("services.calendarExport.notices.downloadFailed")
-					: "Failed to download calendar file"
-			);
+	private static filterTasksForExport(tasks: TaskInfo[], options?: ICSExportOptions): TaskInfo[] {
+		if (
+			!options?.excludeArchived &&
+			!options?.excludeCompleted &&
+			!options?.requireDueDate &&
+			!options?.requireScheduledDate
+		) {
+			return tasks;
 		}
+
+		const completedStatuses = new Set(
+			options.completedStatuses?.length ? options.completedStatuses : ["done"]
+		);
+		return tasks.filter((task) => {
+			if (options.excludeArchived && task.archived) {
+				return false;
+			}
+			if (options.excludeCompleted && completedStatuses.has(task.status)) {
+				return false;
+			}
+			if (options.requireDueDate && !task.due) {
+				return false;
+			}
+			if (options.requireScheduledDate && !task.scheduled) {
+				return false;
+			}
+			return true;
+		});
 	}
 
-	/**
-	 * Download ICS file for a task
-	 */
-	static downloadICSFile(task: TaskInfo, translate?: TranslateFn, options?: ICSExportOptions): void {
-		try {
-			const icsContent = this.generateICSContent(task, options);
-			const blob = new Blob([icsContent], { type: "text/calendar" });
-			const url = URL.createObjectURL(blob);
-
-			const filename = `${task.title.replace(/[^a-zA-Z0-9]/g, "-")}.ics`;
-
-			const a = document.createElement("a");
-			a.href = url;
-			a.download = filename;
-			a.click();
-
-			URL.revokeObjectURL(url);
-
-			new Notice(
-				translate
-					? translate("services.calendarExport.notices.singleDownloadSuccess", {
-							filename,
-						})
-					: `Downloaded ${filename}`
-			);
-		} catch (error) {
-			console.error("Failed to download ICS file:", error);
-			new Notice(
-				translate
-					? translate("services.calendarExport.notices.downloadFailed")
-					: "Failed to download calendar file"
-			);
+	private static getVEventStatus(status: string): VEventStatus {
+		const normalizedStatus = status.trim().toLowerCase();
+		if (normalizedStatus === "cancelled" || normalizedStatus === "canceled") {
+			return "CANCELLED";
 		}
+		if (normalizedStatus === "tentative") {
+			return "TENTATIVE";
+		}
+		return "CONFIRMED";
+	}
+
+	static createMultipleTasksICSDownload(
+		tasks: TaskInfo[],
+		options?: ICSExportOptions
+	): ICSDownloadFile | null {
+		if (!tasks || tasks.length === 0) {
+			return null;
+		}
+
+		const exportTasks = this.filterTasksForExport(tasks, options);
+		if (exportTasks.length === 0) {
+			return null;
+		}
+
+		const date = new Date().toISOString().split("T")[0];
+		return {
+			content: this.generateMultipleTasksICSContent(exportTasks, options),
+			filename: `tasknotes-all-tasks-${date}.ics`,
+			taskCount: exportTasks.length,
+		};
+	}
+
+	static createTaskICSDownload(task: TaskInfo, options?: ICSExportOptions): ICSDownloadFile {
+		return {
+			content: this.generateICSContent(task, options),
+			filename: `${task.title.replace(/[^a-zA-Z0-9]/g, "-")}.ics`,
+			taskCount: 1,
+		};
 	}
 }

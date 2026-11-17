@@ -6,9 +6,9 @@
  * the same promise for identical requests.
  */
 export class RequestDeduplicator {
-	private inFlightRequests = new Map<string, Promise<any>>();
+	private inFlightRequests = new Map<string, Promise<unknown>>();
 	private prefetchQueue = new Set<string>();
-	private prefetchPromises = new Map<string, Promise<any>>();
+	private prefetchPromises = new Map<string, Promise<unknown>>();
 	private activeTimeouts = new Set<number>();
 
 	/**
@@ -39,11 +39,11 @@ export class RequestDeduplicator {
 			const result = await requestFn();
 
 			// Schedule cleanup after TTL
-			const timeout = setTimeout(() => {
+			const timeout = window.setTimeout(() => {
 				this.inFlightRequests.delete(key);
-				this.activeTimeouts.delete(timeout as unknown as number);
+				this.activeTimeouts.delete(timeout);
 			}, ttl);
-			this.activeTimeouts.add(timeout as unknown as number);
+			this.activeTimeouts.add(timeout);
 
 			return result;
 		} catch (error) {
@@ -64,7 +64,7 @@ export class RequestDeduplicator {
 
 		if (priority === "high") {
 			// Execute immediately for high priority
-			this.executePrefetch(key, requestFn);
+			void this.executePrefetch(key, requestFn);
 		} else {
 			// Queue for next idle period
 			this.prefetchQueue.add(key);
@@ -76,11 +76,12 @@ export class RequestDeduplicator {
 				});
 			} else {
 				// Fallback for browsers without requestIdleCallback
-				const timeout = setTimeout(() => {
+				const browserWindow = window as Window;
+				const timeout = browserWindow.setTimeout(() => {
 					this.processPrefetchQueue(key, requestFn);
-					this.activeTimeouts.delete(timeout as unknown as number);
+					this.activeTimeouts.delete(timeout);
 				}, 50);
-				this.activeTimeouts.add(timeout as unknown as number);
+				this.activeTimeouts.add(timeout);
 			}
 		}
 	}
@@ -96,12 +97,12 @@ export class RequestDeduplicator {
 			await prefetchPromise;
 
 			// Keep prefetch result available for a short time
-			const timeout = setTimeout(() => {
+			const timeout = window.setTimeout(() => {
 				this.prefetchPromises.delete(key);
-				this.activeTimeouts.delete(timeout as unknown as number);
+				this.activeTimeouts.delete(timeout);
 			}, 30000); // 30 seconds
-			this.activeTimeouts.add(timeout as unknown as number);
-		} catch (error) {
+			this.activeTimeouts.add(timeout);
+		} catch {
 			// Ignore prefetch errors
 			this.prefetchPromises.delete(key);
 		}
@@ -113,7 +114,7 @@ export class RequestDeduplicator {
 	private processPrefetchQueue<T>(key: string, requestFn: () => Promise<T>): void {
 		if (this.prefetchQueue.has(key)) {
 			this.prefetchQueue.delete(key);
-			this.executePrefetch(key, requestFn);
+			void this.executePrefetch(key, requestFn);
 		}
 	}
 
@@ -121,7 +122,7 @@ export class RequestDeduplicator {
 	 * Check if data is available from prefetch
 	 */
 	getPrefetchedData<T>(key: string): Promise<T> | null {
-		return this.prefetchPromises.get(key) || null;
+		return (this.prefetchPromises.get(key) as Promise<T> | undefined) || null;
 	}
 
 	/**
@@ -143,7 +144,7 @@ export class RequestDeduplicator {
 
 		// Clear all active timeouts
 		for (const timeout of this.activeTimeouts) {
-			clearTimeout(timeout);
+			window.clearTimeout(timeout);
 		}
 		this.activeTimeouts.clear();
 	}
@@ -181,7 +182,7 @@ export class PredictivePrefetcher {
 	recordAccess(
 		date: Date,
 		dataType: "tasks" | "notes" | "calendar",
-		requestFn: (date: Date) => Promise<any>
+		requestFn: (date: Date) => Promise<unknown>
 	): void {
 		const dateKey = this.getDateKey(date);
 		this.lastAccessTime.set(dateKey, Date.now());
@@ -196,7 +197,7 @@ export class PredictivePrefetcher {
 	private prefetchAdjacentDates(
 		currentDate: Date,
 		dataType: string,
-		requestFn: (date: Date) => Promise<any>
+		requestFn: (date: Date) => Promise<unknown>
 	): void {
 		const adjacentDates = this.getAdjacentDates(currentDate);
 

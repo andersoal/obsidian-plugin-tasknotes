@@ -129,8 +129,8 @@
     font-weight: 400;
     min-width: 120px;
     min-height: var(--tn-input-height-md);
-    cursor: var(--cursor, pointer);
-    transition: all var(--tn-transition-fast);
+    cursor: var(--cursor-link, pointer);
+    transition: background-color var(--tn-transition-fast), border-color var(--tn-transition-fast), color var(--tn-transition-fast);
 }
 
 .tasknotes-plugin .agenda-view__period-select:hover {
@@ -161,11 +161,11 @@
     font-weight: var(--tn-font-weight-medium);
     line-height: 1.25;
     height: var(--tn-button-height-md);
-    cursor: var(--cursor, pointer);
+    cursor: var(--cursor-link, pointer);
     user-select: none;
     text-decoration: none;
     white-space: nowrap;
-    transition: all var(--tn-transition-fast);
+    transition: background-color var(--tn-transition-fast), color var(--tn-transition-fast), box-shadow var(--tn-transition-fast);
     overflow: hidden;
     box-shadow: none;
 }
@@ -190,7 +190,7 @@
     display: flex;
     align-items: center;
     gap: var(--tn-spacing-sm);
-    cursor: var(--cursor, pointer);
+    cursor: var(--cursor-link, pointer);
     user-select: none;
     font-size: var(--tn-font-size-md);
     color: var(--tn-text-normal);
@@ -256,7 +256,7 @@
     margin-bottom: var(--tn-spacing-sm);
     border-bottom: 1px solid var(--tn-border-color);
     position: relative;
-    cursor: var(--cursor, pointer);
+    cursor: var(--cursor-link, pointer);
 }
 
 /* Day section container (like task groups) */
@@ -278,7 +278,7 @@
 
 /* Chevron/toggle styles for agenda day headers (consistent with TaskList view) */
 .tasknotes-plugin .agenda-view__day-header .task-group-toggle {
-    display: contents;
+    display: inline-flex;
     align-items: center;
     justify-content: center;
     width: 20px;

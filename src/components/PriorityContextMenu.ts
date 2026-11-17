@@ -1,6 +1,8 @@
+import { configLabel } from "../i18n/configLabels";
 import TaskNotesPlugin from "../main";
 import { PriorityConfig } from "../types";
 import { ContextMenu } from "./ContextMenu";
+import { showCoordinatedMenu, showCoordinatedMenuAtElement } from "./ContextMenuCoordinator";
 
 export interface PriorityContextMenuOptions {
 	currentValue?: string;
@@ -11,8 +13,8 @@ export interface PriorityContextMenuOptions {
 export class PriorityContextMenu {
 	private menu: ContextMenu;
 	private options: PriorityContextMenuOptions;
-	private sortedPriorities: PriorityConfig[];
-	private targetDoc: Document = document;
+	private sortedPriorities: PriorityConfig[] = [];
+	private targetDoc: Document = activeDocument;
 
 	constructor(options: PriorityContextMenuOptions) {
 		this.menu = new ContextMenu();
@@ -21,21 +23,19 @@ export class PriorityContextMenu {
 	}
 
 	private buildMenu(): void {
-		const priorities = this.options.plugin.settings.customPriorities;
-
-		// Sort by weight (higher weight = more important)
-		this.sortedPriorities = [...priorities].sort((a, b) => b.weight - a.weight);
+		// Match the order shown in Priority settings.
+		this.sortedPriorities = this.options.plugin.priorityManager.getPrioritiesByWeightAsc();
 
 		this.sortedPriorities.forEach((priority) => {
 			this.menu.addItem((item) => {
-				let title = priority.label;
+				let title = configLabel(priority);
 
 				// Use consistent icon for all items
 				item.setIcon("star");
 
 				// Highlight current selection with visual indicator
 				if (priority.value === this.options.currentValue) {
-					title = `✓ ${priority.label}`;
+					title = `✓ ${configLabel(priority)}`;
 				}
 
 				item.setTitle(title);
@@ -53,10 +53,10 @@ export class PriorityContextMenu {
 		if ((event.target as Node)?.instanceOf?.(HTMLElement)) {
 			this.targetDoc = (event.target as HTMLElement).ownerDocument;
 		}
-		this.menu.show(event);
+		showCoordinatedMenu(this.menu, event);
 
 		// Apply color styling after menu is shown
-		setTimeout(() => {
+		window.setTimeout(() => {
 			this.applyColorStyling();
 		}, 10);
 	}
@@ -64,13 +64,10 @@ export class PriorityContextMenu {
 	public showAtElement(element: HTMLElement): void {
 		// Store the document reference from the element to support pop-out windows
 		this.targetDoc = element.ownerDocument;
-		this.menu.showAtPosition({
-			x: element.getBoundingClientRect().left,
-			y: element.getBoundingClientRect().bottom + 4,
-		});
+		showCoordinatedMenuAtElement(this.menu, element);
 
 		// Apply color styling after menu is shown
-		setTimeout(() => {
+		window.setTimeout(() => {
 			this.applyColorStyling();
 		}, 10);
 	}

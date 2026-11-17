@@ -27,12 +27,16 @@ Body template settings are in the **Features** tab:
 
 - **Use body template**: Use a template file for task body content.
 - **Body template file**: Path to template file for task body content. Supports template variables like `{{title}}`, `{{date}}`, `{{time}}`, `{{priority}}`, `{{status}}`, etc.
+- **Use occurrence note template**: Use a separate fallback template for materialized occurrence notes when the recurring task does not set `occurrence_template`.
+- **Occurrence note template file**: Path to the fallback template file for materialized occurrence notes. Parent task `occurrence_template` values take priority.
 
 ## Instant Task Conversion
 
 Instant task conversion settings are in the **Features** tab:
 
 - **Use task defaults on instant convert**: Apply default task settings when converting text to tasks instantly.
+
+The **Convert current note to task** command also uses the configured default scheduled date when the note being converted does not already have `scheduled` frontmatter. Set the Scheduled Date default to **None** to leave converted notes unscheduled.
 
 ## Related Documentation
 

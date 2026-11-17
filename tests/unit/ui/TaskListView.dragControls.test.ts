@@ -1,10 +1,10 @@
-import { App, MockObsidian } from "../../__mocks__/obsidian";
+import { observeTranslation as mockObserveTranslation, englishText as mockEnglishText, conceptDescriptor as mockConceptDescriptor } from "../../helpers/real-i18n";
+import { App, MockObsidian } from "../../helpers/obsidian-runtime";
 import { TaskListView } from "../../../src/bases/TaskListView";
 import { FieldMapper } from "../../../src/services/FieldMapper";
 import { DEFAULT_FIELD_MAPPING } from "../../../src/settings/defaults";
 import { TaskFactory } from "../../helpers/mock-factories";
 
-jest.mock("obsidian");
 jest.mock("tasknotes-nlp-core", () => ({
 	NaturalLanguageParserCore: class {},
 }), { virtual: true });
@@ -14,6 +14,11 @@ describe("TaskListView drag controls", () => {
 		const plugin = {
 			app: new App(),
 			fieldMapper: new FieldMapper(DEFAULT_FIELD_MAPPING),
+			i18n: {
+				translate: mockObserveTranslation(),
+			},
+			statusManager: { getAllStatuses: () => [] },
+			priorityManager: { getAllPriorities: () => [] },
 			settings: {
 				fieldMapping: DEFAULT_FIELD_MAPPING,
 			},
@@ -25,10 +30,12 @@ describe("TaskListView drag controls", () => {
 
 	beforeEach(() => {
 		MockObsidian.reset();
+		document.body.className = "";
 		document.body.innerHTML = "";
 	});
 
 	afterEach(() => {
+		document.body.className = "";
 		document.body.innerHTML = "";
 	});
 
@@ -60,6 +67,65 @@ describe("TaskListView drag controls", () => {
 		expect((view as any).draggedTaskPath).toBeNull();
 		expect(card.classList.contains("task-card--dragging")).toBe(false);
 		expect(card.getAttribute("draggable")).toBe("true");
+	});
+
+	it("starts mobile list reordering only from the dedicated drag handle", () => {
+		document.body.classList.add("is-mobile");
+		const view = createView();
+		const task = TaskFactory.createTask({ path: "tasks/mobile-drag.md" });
+		const card = document.createElement("div");
+		const mainRow = document.createElement("div");
+
+		card.className = "task-card";
+		card.setAttribute("draggable", "true");
+		mainRow.className = "task-card__main-row";
+		card.appendChild(mainRow);
+
+		(view as any).setupCardDragHandlers(card, task, null);
+
+		const handle = card.querySelector("[data-tn-drag-handle='true']") as HTMLElement;
+		expect(handle).toBeTruthy();
+		expect(handle.classList.contains("task-card__drag-handle")).toBe(true);
+		expect(handle.getAttribute("draggable")).toBe("true");
+		expect(handle.getAttribute("aria-label")).toBe("Move task");
+		expect(card.getAttribute("draggable")).toBe("false");
+		expect(card.classList.contains("task-card--drag-handle-only")).toBe(true);
+
+		let cardClickCount = 0;
+		card.addEventListener("click", () => {
+			cardClickCount++;
+		});
+		handle.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+		expect(cardClickCount).toBe(0);
+
+		const blockedDragStart = new Event("dragstart", {
+			bubbles: true,
+			cancelable: true,
+		}) as DragEvent;
+		card.dispatchEvent(blockedDragStart);
+
+		expect(blockedDragStart.defaultPrevented).toBe(true);
+		expect((view as any).draggedTaskPath).toBeNull();
+
+		const originalRequestAnimationFrame = window.requestAnimationFrame;
+		window.requestAnimationFrame = ((callback: FrameRequestCallback) => {
+			callback(0);
+			return 1;
+		}) as typeof window.requestAnimationFrame;
+
+		try {
+			const handleDragStart = new Event("dragstart", {
+				bubbles: true,
+				cancelable: true,
+			}) as DragEvent;
+			handle.dispatchEvent(handleDragStart);
+
+			expect(handleDragStart.defaultPrevented).toBe(false);
+			expect((view as any).draggedTaskPath).toBe("tasks/mobile-drag.md");
+			expect(card.classList.contains("task-card--dragging")).toBe(true);
+		} finally {
+			window.requestAnimationFrame = originalRequestAnimationFrame;
+		}
 	});
 
 	it("opens the preview slot after the hovered card when dropping below the last item in a group", () => {
@@ -292,12 +358,163 @@ describe("TaskListView drag controls", () => {
 		});
 	});
 
-	it("flushes the latest dragover insertion slot instead of recomputing from the drop event coordinates", () => {
+	it("changes the card render signature when visible Bases properties change", () => {
+		const view = createView();
+		const targetDate = new Date(Date.UTC(2026, 4, 18));
+		const initialSignature = (view as any).buildCardRenderSignature(["status"], {
+			targetDate,
+			propertyLabels: { status: "Status" },
+		});
+		const updatedSignature = (view as any).buildCardRenderSignature(
+			["status", "sort_order"],
+			{
+				targetDate,
+				propertyLabels: { status: "Status", sort_order: "sort_order" },
+			}
+		);
+
+		expect(updatedSignature).not.toBe(initialSignature);
+	});
+
+	it("recreates the virtual renderer when visible Bases properties change", () => {
+		const view = createView();
+		const targetDate = new Date(Date.UTC(2026, 4, 18));
+		const destroy = jest.fn();
+		const initialSignature = (view as any).buildCardRenderSignature(["status"], {
+			targetDate,
+			propertyLabels: { status: "Status" },
+		});
+		const updatedSignature = (view as any).buildCardRenderSignature(
+			["status", "sort_order"],
+			{
+				targetDate,
+				propertyLabels: { status: "Status", sort_order: "sort_order" },
+			}
+		);
+
+		(view as any).virtualScroller = { destroy };
+		(view as any).lastCardRenderSignature = initialSignature;
+
+		(view as any).resetVirtualScrollerIfCardRenderChanged(updatedSignature);
+
+		expect(destroy).toHaveBeenCalledTimes(1);
+		expect((view as any).virtualScroller).toBeNull();
+	});
+
+	it("optimistically reorders virtual task items after a sort-order write", () => {
+		const view = createView();
+		const taskA = TaskFactory.createTask({ path: "tasks/a.md", sortOrder: "0|hzzzzz:" } as any);
+		const taskB = TaskFactory.createTask({ path: "tasks/b.md", sortOrder: "0|i0000f:" } as any);
+		const taskC = TaskFactory.createTask({ path: "tasks/c.md", sortOrder: "0|i0000n:" } as any);
+		const updateItems = jest.fn();
+
+		(view as any).virtualScroller = { updateItems };
+		(view as any).lastVirtualItems = [
+			{
+				type: "primary-header",
+				groupKey: "todo",
+				groupTitle: "Todo",
+				taskCount: 3,
+				groupEntries: [],
+				isCollapsed: false,
+			},
+			{ type: "task", task: taskA, groupKey: "todo" },
+			{ type: "task", task: taskB, groupKey: "todo" },
+			{ type: "task", task: taskC, groupKey: "todo" },
+		];
+		(view as any).taskInfoCache.set(taskA.path, taskA);
+		(view as any).taskInfoCache.set(taskB.path, taskB);
+		(view as any).taskInfoCache.set(taskC.path, taskC);
+
+		const applied = (view as any).applyOptimisticSortOrderResult(
+			"tasks/c.md",
+			"tasks/a.md",
+			false,
+			"todo",
+			"todo",
+			{
+				sortOrder: "tnmzzzzzzzzz",
+				additionalWrites: [
+					{ path: "tasks/a.md", sortOrder: "tndgmzzzzzzz" },
+					{ path: "tasks/b.md", sortOrder: "tnwtmzzzzzzt" },
+				],
+				reason: "rebalance",
+			}
+		);
+
+		expect(applied).toBe(true);
+		expect(updateItems).toHaveBeenCalledTimes(1);
+		const updatedItems = updateItems.mock.calls[0][0] as any[];
+		expect(updatedItems.map((item) => item.task?.path ?? item.groupKey)).toEqual([
+			"todo",
+			"tasks/a.md",
+			"tasks/c.md",
+			"tasks/b.md",
+		]);
+		expect(taskA.sortOrder).toBe("tndgmzzzzzzz");
+		expect(taskB.sortOrder).toBe("tnwtmzzzzzzt");
+		expect(taskC.sortOrder).toBe("tnmzzzzzzzzz");
+		expect((view as any).getVisibleSortScopePaths("todo")).toEqual([
+			"tasks/a.md",
+			"tasks/c.md",
+			"tasks/b.md",
+		]);
+	});
+
+	it("changes the task render signature when sort order changes", () => {
+		const view = createView();
+		const task = TaskFactory.createTask({
+			path: "tasks/sort-order.md",
+			sortOrder: "0|hzzzzz:",
+		} as any);
+
+		expect((view as any).buildTaskSignature({ ...task, sortOrder: "0|i00000:" })).not.toBe(
+			(view as any).buildTaskSignature(task)
+		);
+	});
+
+	it("builds task signatures for link-valued formulas without serializing live Bases values (#2399)", () => {
+		const view = createView();
+		class LinkValue {
+			app: Record<string, unknown> = {};
+			constructor(private readonly target: string) {
+				this.app.app = this.app;
+			}
+			renderTo() {}
+			toString() {
+				return this.target;
+			}
+		}
+		const withBacklinks = (targets: string[]) =>
+			TaskFactory.createTask({
+				path: "tasks/backlinks.md",
+				basesData: {
+					getValue: (propertyId: string) =>
+						propertyId === "formula.backlinks"
+							? targets.map((target) => new LinkValue(target))
+							: null,
+				},
+			} as any);
+
+		const signature = (view as any).buildTaskSignature(withBacklinks(["notes/a.md"]), [
+			"formula.backlinks",
+		]);
+		expect(typeof signature).toBe("string");
+		expect(
+			(view as any).buildTaskSignature(withBacklinks(["notes/a.md", "notes/b.md"]), [
+				"formula.backlinks",
+			])
+		).not.toBe(signature);
+	});
+
+	it("resolves the final insertion slot from the drop event coordinate", () => {
 		const view = createView();
 		const updateResolvedInsertionSlot = jest
 			.spyOn(view as any, "updateResolvedInsertionSlot")
 			.mockReturnValue(true);
-		const cancelAnimationFrameSpy = jest.spyOn(window, "cancelAnimationFrame").mockImplementation(() => {});
+		const cancelAnimationFrameSpy = jest
+			.spyOn(window, "cancelAnimationFrame")
+			.mockImplementation(() => {});
 
 		(view as any).dragOverRafId = 42;
 		(view as any).pendingDragClientY = 135;
@@ -307,10 +524,27 @@ describe("TaskListView drag controls", () => {
 
 		expect((view as any).flushPendingInsertionSlot(400)).toBe(true);
 		expect(cancelAnimationFrameSpy).toHaveBeenCalledWith(42);
-		expect(updateResolvedInsertionSlot).toHaveBeenCalledWith(135);
+		expect(updateResolvedInsertionSlot).toHaveBeenCalledWith(400);
 		expect((view as any).dragOverRafId).toBe(0);
+		expect((view as any).pendingDragClientY).toBeNull();
 
 		cancelAnimationFrameSpy.mockRestore();
+		updateResolvedInsertionSlot.mockRestore();
+	});
+
+	it("uses the drop event coordinates after the queued dragover has already rendered", () => {
+		const view = createView();
+		const updateResolvedInsertionSlot = jest
+			.spyOn(view as any, "updateResolvedInsertionSlot")
+			.mockReturnValue(true);
+
+		(view as any).dragOverRafId = 0;
+		(view as any).pendingDragClientY = 135;
+
+		expect((view as any).flushPendingInsertionSlot(400)).toBe(true);
+		expect(updateResolvedInsertionSlot).toHaveBeenCalledWith(400);
+		expect((view as any).pendingDragClientY).toBeNull();
+
 		updateResolvedInsertionSlot.mockRestore();
 	});
 

@@ -1,11 +1,15 @@
-/* eslint-disable no-console, @typescript-eslint/no-non-null-assertion */
-import { TFile } from "obsidian";
+/* eslint-disable @typescript-eslint/no-non-null-assertion -- Project graph construction validates parent links before dereferencing. */
+import { EventRef, TFile } from "obsidian";
 import TaskNotesPlugin from "../main";
 import { TaskInfo } from "../types";
 import { parseLinkToPath } from "../utils/linkUtils";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Services/ProjectSubtasksService" });
 
 export class ProjectSubtasksService {
 	private plugin: TaskNotesPlugin;
+	private cacheEventRefs: EventRef[] = [];
 
 	// Pre-computed reverse index: taskPath -> isUsedAsProject
 	private projectIndex = new Map<string, boolean>();
@@ -21,6 +25,20 @@ export class ProjectSubtasksService {
 
 	constructor(plugin: TaskNotesPlugin) {
 		this.plugin = plugin;
+		this.registerCacheInvalidation();
+	}
+
+	private registerCacheInvalidation(): void {
+		if (!this.plugin.cacheManager?.on) {
+			return;
+		}
+
+		const invalidate = () => this.invalidateIndex();
+		this.cacheEventRefs = [
+			this.plugin.cacheManager.on("file-updated", invalidate),
+			this.plugin.cacheManager.on("file-renamed", invalidate),
+			this.plugin.cacheManager.on("file-deleted", invalidate),
+		];
 	}
 
 	/**
@@ -80,7 +98,11 @@ export class ProjectSubtasksService {
 
 			return linkedTasks;
 		} catch (error) {
-			console.error("Error getting tasks linked to project:", error);
+			tasknotesLogger.error("Error getting tasks linked to project:", {
+				category: "persistence",
+				operation: "getting-tasks-linked-project",
+				error: error,
+			});
 			return [];
 		}
 	}
@@ -138,7 +160,11 @@ export class ProjectSubtasksService {
 
 			return false;
 		} catch (error) {
-			console.error("Error checking if link is from projects field:", error);
+			tasknotesLogger.error("Error checking if link is from projects field:", {
+				category: "persistence",
+				operation: "checking-if-link-projects-field",
+				error: error,
+			});
 			return false;
 		}
 	}
@@ -162,7 +188,6 @@ export class ProjectSubtasksService {
 	 * Build reverse index of all project files (one scan instead of per-task scans)
 	 */
 	private buildProjectIndex(): void {
-		const startTime = Date.now();
 		this.projectIndex.clear();
 		this.stats.indexBuilds++;
 
@@ -205,7 +230,6 @@ export class ProjectSubtasksService {
 						linkPath,
 						sourcePath
 					);
-					// After line 207:
 
 					if (resolvedFile) {
 						projectPaths.add(resolvedFile.path);
@@ -219,12 +243,12 @@ export class ProjectSubtasksService {
 			}
 
 			this.indexLastBuilt = Date.now();
-			const duration = Date.now() - startTime;
-			console.log(
-				`[ProjectSubtasksService] Built project index: ${this.projectIndex.size} projects from ${Object.keys(resolvedLinks).length} files in ${duration}ms`
-			);
 		} catch (error) {
-			console.error("Error building project index:", error);
+			tasknotesLogger.error("Error building project index:", {
+				category: "persistence",
+				operation: "building-project-index",
+				error: error,
+			});
 		}
 	}
 
@@ -238,12 +262,20 @@ export class ProjectSubtasksService {
 		}
 	}
 
+	invalidateIndex(): void {
+		this.projectIndex.clear();
+		this.indexLastBuilt = 0;
+	}
+
 	/**
 	 * Cleanup when service is destroyed
 	 */
 	destroy(): void {
-		// Clear index and reset stats
-		this.projectIndex.clear();
+		for (const ref of this.cacheEventRefs) {
+			this.plugin.cacheManager.offref(ref);
+		}
+		this.cacheEventRefs = [];
+		this.invalidateIndex();
 		this.stats = {
 			indexBuilds: 0,
 			indexHits: 0,
@@ -286,3 +318,5 @@ export class ProjectSubtasksService {
 		});
 	}
 }
+
+/* eslint-enable @typescript-eslint/no-non-null-assertion -- Re-enable after the project service implementation. */

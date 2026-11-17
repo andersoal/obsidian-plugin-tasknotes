@@ -1,13 +1,19 @@
 import { TaskManager } from "../../utils/TaskManager";
 import { FilterCondition, FilterQuery } from "../../types";
+import { stringifyUnknown } from "../../utils/stringUtils";
+import { resolveNaturalLanguageDate } from "../../utils/dateUtils";
 
 export interface FilterQueryPlannerDependencies {
 	cacheManager: TaskManager;
+	timer: {
+		setTimeout(callback: () => void, delayMs: number): number;
+		clearTimeout(timeoutId: number): void;
+	};
 }
 
 export class FilterQueryPlanner {
 	private readonly indexQueryCache = new Map<string, Set<string>>();
-	private readonly cacheTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	private readonly cacheTimers = new Map<string, number>();
 	private readonly cacheTimeout = 30000;
 
 	constructor(private deps: FilterQueryPlannerDependencies) {}
@@ -39,7 +45,7 @@ export class FilterQueryPlanner {
 
 	clearIndexQueryCache(): void {
 		for (const timer of this.cacheTimers.values()) {
-			clearTimeout(timer);
+			this.deps.timer.clearTimeout(timer);
 		}
 		this.indexQueryCache.clear();
 		this.cacheTimers.clear();
@@ -170,6 +176,9 @@ export class FilterQueryPlanner {
 		if (property === "status" && operator === "is" && value) {
 			return true;
 		}
+		if (property === "priority" && operator === "is" && value) {
+			return true;
+		}
 		if (
 			property === "due" &&
 			(operator === "is" || operator === "is-before" || operator === "is-after") &&
@@ -199,10 +208,10 @@ export class FilterQueryPlanner {
 
 		const existingTimer = this.cacheTimers.get(cacheKey);
 		if (existingTimer) {
-			clearTimeout(existingTimer);
+			this.deps.timer.clearTimeout(existingTimer);
 		}
 
-		const timer = setTimeout(() => {
+		const timer = this.deps.timer.setTimeout(() => {
 			this.indexQueryCache.delete(cacheKey);
 			this.cacheTimers.delete(cacheKey);
 		}, this.cacheTimeout);
@@ -213,11 +222,20 @@ export class FilterQueryPlanner {
 
 	private getPathsForIndexableCondition(condition: FilterCondition): Set<string> {
 		const { property, operator, value } = condition;
-		const cacheKey = `${property}:${operator}:${value}`;
+		const cacheKey = `${property}:${operator}:${stringifyUnknown(value)}`;
 
 		return this.getCachedIndexResult(cacheKey, () => {
 			if (property === "status" && operator === "is" && value && typeof value === "string") {
 				return new Set(this.deps.cacheManager.getTaskPathsByStatus(value));
+			}
+
+			if (
+				property === "priority" &&
+				operator === "is" &&
+				value &&
+				typeof value === "string"
+			) {
+				return new Set(this.deps.cacheManager.getTaskPathsByPriority(value));
 			}
 
 			if (
@@ -226,7 +244,7 @@ export class FilterQueryPlanner {
 				value &&
 				typeof value === "string"
 			) {
-				return new Set(this.deps.cacheManager.getTasksForDate(value));
+				return new Set(this.deps.cacheManager.getTasksForDate(resolveNaturalLanguageDate(value)));
 			}
 
 			if (
@@ -235,7 +253,7 @@ export class FilterQueryPlanner {
 				value &&
 				typeof value === "string"
 			) {
-				return this.getTaskPathsForDateRange(property, operator, value);
+				return this.getTaskPathsForDateRange(property, operator, resolveNaturalLanguageDate(value));
 			}
 
 			return this.deps.cacheManager.getAllTaskPaths();
@@ -243,10 +261,17 @@ export class FilterQueryPlanner {
 	}
 
 	private getTaskPathsForDateRange(
-		_property: string,
-		_operator: string,
-		_value: string
+		property: string,
+		operator: string,
+		value: string
 	): Set<string> {
+		if (
+			(property === "due" || property === "scheduled") &&
+			(operator === "is-before" || operator === "is-after")
+		) {
+			return this.deps.cacheManager.getTaskPathsForDateRange(property, operator, value);
+		}
+
 		return this.deps.cacheManager.getAllTaskPaths();
 	}
 

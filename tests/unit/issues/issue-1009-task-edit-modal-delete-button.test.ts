@@ -1,0 +1,132 @@
+import { observeTranslation as mockObserveTranslation, englishText as mockEnglishText, conceptDescriptor as mockConceptDescriptor } from "../../helpers/real-i18n";
+import { TaskEditModal } from '../../../src/modals/TaskEditModal';
+import { showConfirmationModal } from '../../../src/modals/ConfirmationModal';
+import { MockObsidian, Notice } from '../../helpers/obsidian-runtime';
+import { makeContainer } from '../../helpers/dom-helpers';
+import type { App } from 'obsidian';
+import type { TaskInfo } from '../../../src/types';
+
+jest.mock('../../../src/modals/ConfirmationModal', () => ({
+	ConfirmationModal: jest.fn().mockImplementation(() => ({
+		show: jest.fn().mockResolvedValue(false),
+		open: jest.fn(),
+		close: jest.fn(),
+	})),
+	showConfirmationModal: jest.fn(),
+}));
+
+const mockShowConfirmationModal = showConfirmationModal as jest.MockedFunction<
+	typeof showConfirmationModal
+>;
+
+function createMockApp(mockApp: unknown): App {
+	return mockApp as App;
+}
+
+function translate(...args: Parameters<typeof mockEnglishText>): string { return mockEnglishText(...args); }
+
+function createMockPlugin(app: App) {
+	return {
+		app,
+		i18n: {
+			translate: mockObserveTranslation(),
+		},
+		settings: {
+			enableModalSplitLayout: false,
+			taskTag: 'task',
+			taskIdentificationMethod: 'tag',
+			hideIdentifyingTagsMode: 'exact',
+			defaultTaskStatus: 'open',
+			userFields: [],
+		},
+		taskService: {
+			deleteTask: jest.fn().mockResolvedValue(undefined),
+			toggleArchive: jest.fn(),
+			updateTask: jest.fn(),
+		},
+		statusManager: {
+			isCompletedStatus: jest.fn(() => false),
+		},
+		cacheManager: {
+			getTaskInfo: jest.fn(),
+			isTaskFile: jest.fn(() => true),
+		},
+		fieldMapper: {
+			toUserField: jest.fn((key: string) => key),
+		},
+	};
+}
+
+function createTask(): TaskInfo {
+	return {
+		title: 'Delete me',
+		status: 'open',
+		priority: 'normal',
+		path: 'TaskNotes/Tasks/delete-me.md',
+		archived: false,
+		tags: ['task'],
+		contexts: [],
+		projects: [],
+	} as TaskInfo;
+}
+
+function chooseDelete(modal: TaskEditModal): void {
+	(modal as any)
+		.getOverflowActions()
+		.find((action: { warning?: boolean }) => action.warning)
+		.onClick();
+}
+
+function flushPromises(): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+describe('Issue #1009 - Edit Task modal delete action', () => {
+	let app: App;
+	let plugin: ReturnType<typeof createMockPlugin>;
+	let task: TaskInfo;
+	let modal: TaskEditModal;
+	let container: HTMLElement;
+
+	beforeEach(() => {
+		jest.clearAllMocks();
+		MockObsidian.reset();
+		app = createMockApp(MockObsidian.createMockApp());
+		plugin = createMockPlugin(app);
+		task = createTask();
+		modal = new TaskEditModal(app, plugin as any, { task });
+		jest.spyOn(modal, 'forceClose').mockImplementation(jest.fn());
+		container = makeContainer();
+		(modal as unknown as { createActionButtons(container: HTMLElement): void })
+			.createActionButtons(container);
+	});
+
+	it('confirms before deleting the task file from the modal', async () => {
+		mockShowConfirmationModal.mockResolvedValue(true);
+
+		chooseDelete(modal);
+		await flushPromises();
+
+		expect(mockShowConfirmationModal).toHaveBeenCalledWith(app, {
+			title: 'Delete task',
+			message:
+				'Are you sure you want to delete "Delete me"? This moves the task note to Obsidian trash.',
+			confirmText: 'Delete task',
+			cancelText: 'Cancel',
+			isDestructive: true,
+		});
+		expect(plugin.taskService.deleteTask).toHaveBeenCalledWith(task);
+		expect(Notice).toHaveBeenCalledWith('Task "Delete me" deleted successfully');
+		expect(modal.forceClose).toHaveBeenCalled();
+	});
+
+	it('does not delete when the confirmation is cancelled', async () => {
+		mockShowConfirmationModal.mockResolvedValue(false);
+
+		chooseDelete(modal);
+		await flushPromises();
+
+		expect(plugin.taskService.deleteTask).not.toHaveBeenCalled();
+		expect(modal.forceClose).not.toHaveBeenCalled();
+	});
+});

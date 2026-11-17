@@ -1,4 +1,11 @@
-import { FilterOperator, FilterProperty, FilterCondition, FilterGroup, TaskInfo } from "../types";
+import {
+	FilterOperator,
+	FilterProperty,
+	FilterCondition,
+	FilterGroup,
+	TaskInfo,
+	PropertyDefinition,
+} from "../types";
 import {
 	isBeforeDateTimeAware,
 	getDatePart,
@@ -60,7 +67,11 @@ export class FilterUtils {
 	/**
 	 * Validate a filter node (group or condition)
 	 */
-	static validateFilterNode(node: FilterGroup | FilterCondition, strict = true): void {
+	static validateFilterNode(
+		node: FilterGroup | FilterCondition,
+		strict = true,
+		propertyDefinitions?: readonly PropertyDefinition[]
+	): void {
 		if (!node || typeof node !== "object") {
 			throw new FilterValidationError("Filter node must be an object");
 		}
@@ -74,22 +85,27 @@ export class FilterUtils {
 		}
 
 		if (node.type === "condition") {
-			this.validateCondition(node, strict);
+			this.validateCondition(node, strict, propertyDefinitions);
 		} else if (node.type === "group") {
-			this.validateGroup(node, strict);
-		} else {
-			throw new FilterValidationError(
-				`Unknown filter node type: ${(node as any).type}`,
-				undefined,
-				(node as any).id
-			);
-		}
+			this.validateGroup(node, strict, propertyDefinitions);
+			} else {
+				const invalidNode = node as Record<string, unknown>;
+				throw new FilterValidationError(
+					`Unknown filter node type: ${String(invalidNode.type)}`,
+					undefined,
+					typeof invalidNode.id === "string" ? invalidNode.id : undefined
+				);
+			}
 	}
 
 	/**
 	 * Validate a filter condition
 	 */
-	private static validateCondition(condition: FilterCondition, strict = true): void {
+	private static validateCondition(
+		condition: FilterCondition,
+		strict = true,
+		propertyDefinitions?: readonly PropertyDefinition[]
+	): void {
 		if (typeof condition.property !== "string") {
 			throw new FilterValidationError(
 				"Condition must have a valid property",
@@ -108,6 +124,17 @@ export class FilterUtils {
 			return; // Skip further validation for placeholder
 		}
 
+		const definition = propertyDefinitions?.find(
+			(property) => property.id === condition.property
+		);
+		if (propertyDefinitions && !definition) {
+			throw new FilterValidationError(
+				`Unknown property: ${condition.property} (condition '${condition.id}')`,
+				"property",
+				condition.id
+			);
+		}
+
 		if (!condition.operator || typeof condition.operator !== "string") {
 			throw new FilterValidationError(
 				"Condition must have a valid operator",
@@ -117,10 +144,9 @@ export class FilterUtils {
 		}
 
 		// Validate that operator is supported for the property
-		const validOperators = this.getValidOperatorsForProperty(
-			condition.property as FilterProperty
-		);
-		if (!validOperators.includes(condition.operator as FilterOperator)) {
+		const validOperators =
+			definition?.supportedOperators ?? this.getValidOperatorsForProperty(condition.property);
+		if (!validOperators.includes(condition.operator)) {
 			throw new FilterValidationError(
 				`Operator '${condition.operator}' is not valid for property '${condition.property}'`,
 				"operator",
@@ -131,7 +157,7 @@ export class FilterUtils {
 		// Validate value based on operator requirements
 		// In non-strict mode, skip value validation to allow incomplete conditions during filter building
 		if (strict) {
-			const requiresValue = this.operatorRequiresValue(condition.operator as FilterOperator);
+			const requiresValue = this.operatorRequiresValue(condition.operator);
 			if (
 				requiresValue &&
 				(condition.value === null ||
@@ -150,7 +176,11 @@ export class FilterUtils {
 	/**
 	 * Validate a filter group
 	 */
-	private static validateGroup(group: FilterGroup, strict = true): void {
+	private static validateGroup(
+		group: FilterGroup,
+		strict = true,
+		propertyDefinitions?: readonly PropertyDefinition[]
+	): void {
 		if (!group.conjunction || !["and", "or"].includes(group.conjunction)) {
 			throw new FilterValidationError(
 				"Group must have a valid conjunction (and/or)",
@@ -170,13 +200,13 @@ export class FilterUtils {
 		// Recursively validate children
 		group.children.forEach((child, index) => {
 			try {
-				this.validateFilterNode(child, strict);
+				this.validateFilterNode(child, strict, propertyDefinitions);
 			} catch (error) {
 				if (error instanceof FilterValidationError) {
 					throw new FilterValidationError(
 						`Child ${index}: ${error.message}`,
 						error.field,
-						group.id
+						propertyDefinitions ? error.nodeId : group.id
 					);
 				}
 				throw error;
@@ -281,6 +311,7 @@ export class FilterUtils {
 
 			// Boolean properties
 			archived: ["is-checked", "is-not-checked"],
+			hasSubtasks: ["is-checked", "is-not-checked"],
 			"dependencies.isBlocked": ["is-checked", "is-not-checked"],
 			"dependencies.isBlocking": ["is-checked", "is-not-checked"],
 
@@ -309,7 +340,7 @@ export class FilterUtils {
 		try {
 			this.validateFilterNode(node, true); // Use strict validation
 			return true;
-		} catch (error) {
+		} catch {
 			return false;
 		}
 	}
@@ -362,10 +393,12 @@ export class FilterUtils {
 				return task.dateModified;
 			case "archived":
 				return task.archived;
+			case "hasSubtasks":
+				return task.hasSubtasks === true;
 			case "timeEstimate":
 				return task.timeEstimate;
 			case "recurrence":
-				return task.recurrence as TaskPropertyValue;
+				return task.recurrence;
 			case "status.isCompleted":
 				// This requires StatusManager - will be handled by caller
 				return undefined;
@@ -423,7 +456,7 @@ export class FilterUtils {
 				case "is-less-than-or-equal":
 					return this.isLessThanOrEqual(taskValue, conditionValue);
 				default:
-					throw new FilterEvaluationError(`Unknown operator: ${operator}`, nodeId);
+					throw new FilterEvaluationError("Unknown operator", nodeId);
 			}
 		} catch (error) {
 			if (error instanceof FilterEvaluationError) {
@@ -455,23 +488,62 @@ export class FilterUtils {
 			return this.isEqualDate(taskValue, conditionValue);
 		}
 
+		const valuesEqual = (left: TaskPropertyValue, right: TaskPropertyValue): boolean => {
+			if (this.hasNumericComparison(left, right)) {
+				return this.toFiniteNumber(left) === this.toFiniteNumber(right);
+			}
+			return left === right;
+		};
+
 		if (Array.isArray(taskValue)) {
 			if (Array.isArray(conditionValue)) {
 				// Both arrays: check if any task value matches any condition value
-				return taskValue.some((tv) => conditionValue.includes(tv));
+				return taskValue.some((tv) => conditionValue.some((cv) => valuesEqual(tv, cv)));
 			} else {
 				// Task has array, condition is single value
-				return taskValue.includes(conditionValue as string);
+				return taskValue.some((tv) => valuesEqual(tv, conditionValue));
 			}
 		} else {
 			if (Array.isArray(conditionValue)) {
 				// Task has single value, condition is array
-				return conditionValue.includes(taskValue as string);
+				return conditionValue.some((cv) => valuesEqual(taskValue, cv));
 			} else {
 				// Both single values
-				return taskValue === conditionValue;
+				return valuesEqual(taskValue, conditionValue);
 			}
 		}
+	}
+
+	private static hasNumericComparison(
+		left: TaskPropertyValue,
+		right: TaskPropertyValue
+	): boolean {
+		const leftIsNumber = typeof left === "number";
+		const rightIsNumber = typeof right === "number";
+
+		if (!leftIsNumber && !rightIsNumber) {
+			return false;
+		}
+
+		return this.toFiniteNumber(left) !== undefined && this.toFiniteNumber(right) !== undefined;
+	}
+
+	private static toFiniteNumber(value: TaskPropertyValue): number | undefined {
+		if (typeof value === "number") {
+			return Number.isFinite(value) ? value : undefined;
+		}
+
+		if (typeof value !== "string") {
+			return undefined;
+		}
+
+		const trimmed = value.trim();
+		if (!trimmed) {
+			return undefined;
+		}
+
+		const parsed = Number(trimmed);
+		return Number.isFinite(parsed) ? parsed : undefined;
 	}
 
 	/**
@@ -497,7 +569,7 @@ export class FilterUtils {
 
 		// Check if taskTag is a child of conditionTag
 		// 't/ef/project' should match when searching for 't/ef'
-		if (taskTagLower.startsWith(conditionTagLower + '/')) {
+		if (taskTagLower.startsWith(conditionTagLower + "/")) {
 			return true; // Hierarchical child match
 		}
 
@@ -533,7 +605,7 @@ export class FilterUtils {
 
 		// Check if taskTag is a child of conditionTag
 		// 't/ef/project' should match when searching for 't/ef'
-		if (taskTagLower.startsWith(conditionTagLower + '/')) {
+		if (taskTagLower.startsWith(conditionTagLower + "/")) {
 			return true; // Hierarchical child match
 		}
 
@@ -557,19 +629,19 @@ export class FilterUtils {
 
 		// Separate inclusion and exclusion patterns
 		for (const condTag of conditionTags) {
-			if (typeof condTag === 'string' && condTag.startsWith('-')) {
+			if (typeof condTag === "string" && condTag.startsWith("-")) {
 				const excludePattern = condTag.slice(1);
 				if (excludePattern) {
 					exclusions.push(excludePattern);
 				}
-			} else if (typeof condTag === 'string') {
+			} else if (typeof condTag === "string") {
 				inclusions.push(condTag);
 			}
 		}
 
 		// Check exclusions first - if any excluded tag is found, reject
 		for (const excludePattern of exclusions) {
-			const hasExcludedTag = taskTags.some(taskTag =>
+			const hasExcludedTag = taskTags.some((taskTag) =>
 				this.matchesHierarchicalTag(taskTag, excludePattern)
 			);
 			if (hasExcludedTag) {
@@ -579,10 +651,8 @@ export class FilterUtils {
 
 		// If there are inclusion patterns, at least one must match
 		if (inclusions.length > 0) {
-			return inclusions.some(includePattern =>
-				taskTags.some(taskTag =>
-					this.matchesHierarchicalTag(taskTag, includePattern)
-				)
+			return inclusions.some((includePattern) =>
+				taskTags.some((taskTag) => this.matchesHierarchicalTag(taskTag, includePattern))
 			);
 		}
 
@@ -605,7 +675,9 @@ export class FilterUtils {
 				if (property === "tags") {
 					// Use hierarchical tag matching for tags with proper exclusion handling
 					const taskTags = taskValue.filter((tv): tv is string => typeof tv === "string");
-					const condTags = conditionValue.filter((cv): cv is string => typeof cv === "string");
+					const condTags = conditionValue.filter(
+						(cv): cv is string => typeof cv === "string"
+					);
 					return FilterUtils.matchesTagConditions(taskTags, condTags);
 				} else {
 					// Use default substring matching for other properties
@@ -640,13 +712,16 @@ export class FilterUtils {
 				// Task has string, condition is array
 				if (property === "tags") {
 					// Use hierarchical tag matching for tags with proper exclusion handling
-					const condTags = conditionValue.filter((cv): cv is string => typeof cv === "string");
+					const condTags = conditionValue.filter(
+						(cv): cv is string => typeof cv === "string"
+					);
 					return FilterUtils.matchesTagConditions([taskValue], condTags);
 				} else {
 					// Use default substring matching for other properties
 					return conditionValue.some(
 						(cv) =>
-							typeof cv === "string" && taskValue.toLowerCase().includes(cv.toLowerCase())
+							typeof cv === "string" &&
+							taskValue.toLowerCase().includes(cv.toLowerCase())
 					);
 				}
 			} else {

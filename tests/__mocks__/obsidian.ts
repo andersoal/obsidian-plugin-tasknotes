@@ -10,6 +10,9 @@ export const Platform = {
 };
 
 import { EventEmitter } from 'events';
+import momentModule from 'moment';
+
+export const moment = momentModule;
 
 // Mock file system data structure
 interface MockFile {
@@ -385,6 +388,10 @@ export class MetadataCache {
 
 // FileManager mock class
 export class FileManager {
+  trashFile = jest.fn(async (file: TAbstractFile): Promise<void> => {
+    mockFileSystem.delete(file.path);
+  });
+
   generateMarkdownLink(file: TFile, sourcePath?: string, subpath?: string, alias?: string): string {
     // Simulate Obsidian's behavior of respecting user settings
     // For testing, we'll generate markdown link format when this is called
@@ -607,7 +614,7 @@ export class Modal extends Component {
           if (Array.isArray(attrs.cls)) {
             el.classList.add(...attrs.cls);
           } else {
-            el.classList.add(attrs.cls);
+            el.classList.add(...String(attrs.cls).split(/\s+/).filter(Boolean));
           }
         }
         if (attrs.text) {
@@ -820,6 +827,18 @@ export class Setting {
     return this;
   }
 
+  addTextArea(callback: (text: any) => void): Setting {
+    const mockTextArea = {
+      inputEl: document.createElement('textarea'),
+      setPlaceholder: (placeholder: string) => mockTextArea,
+      setValue: (value: string) => mockTextArea,
+      onChange: (callback: (value: string) => void) => mockTextArea,
+      setDisabled: (disabled: boolean) => mockTextArea,
+    };
+    callback(mockTextArea);
+    return this;
+  }
+
   addToggle(callback: (toggle: any) => void): Setting {
     const mockToggle = {
       toggleEl: document.createElement('div'),
@@ -946,25 +965,64 @@ export const Notice = jest.fn().mockImplementation((message: string, timeout?: n
   return {};
 });
 
+export const MarkdownRenderer = {
+  render: jest.fn(async (_app: App, markdown: string, el: HTMLElement): Promise<void> => {
+    el.textContent = markdown;
+  }),
+};
+
+export const requestUrl = jest.fn();
+
 // Menu mock class
-export const Menu = jest.fn().mockImplementation(() => ({
-  items: [],
-  addItem: jest.fn().mockImplementation(function(this: any, callback: (item: any) => void) {
-    const mockItem = {
-      setTitle: jest.fn().mockReturnThis(),
-      setIcon: jest.fn().mockReturnThis(),
-      onClick: jest.fn().mockReturnThis(),
-      setSection: jest.fn().mockReturnThis(),
-    };
-    callback(mockItem);
-    this.items.push(mockItem);
-  }),
-  addSeparator: jest.fn().mockImplementation(function(this: any) {
-    this.items.push({ type: 'separator' });
-  }),
-  showAtMouseEvent: jest.fn(),
-  showAtPosition: jest.fn(),
-}));
+export const Menu = jest.fn().mockImplementation(() => {
+  const onHideCallbacks: Array<() => void> = [];
+  const menu = {
+    items: [],
+    addItem: jest.fn().mockImplementation(function(this: any, callback: (item: any) => void) {
+      const mockItem = {
+        setTitle: jest.fn().mockReturnThis(),
+        setIcon: jest.fn().mockReturnThis(),
+        onClick: jest.fn().mockReturnThis(),
+        setSection: jest.fn().mockReturnThis(),
+        setDisabled: jest.fn().mockReturnThis(),
+        setChecked: jest.fn().mockReturnThis(),
+        setSubmenu: jest.fn().mockImplementation(() => Menu()),
+      };
+      callback(mockItem);
+      this.items.push(mockItem);
+    }),
+    addSeparator: jest.fn().mockImplementation(function(this: any) {
+      this.items.push({ type: 'separator' });
+    }),
+    showAtMouseEvent: jest.fn().mockReturnThis(),
+    showAtPosition: jest.fn().mockReturnThis(),
+    show: jest.fn().mockImplementation(function(this: any, event: UIEvent) {
+      if (event instanceof MouseEvent) {
+        this.showAtMouseEvent(event);
+      } else if (event instanceof KeyboardEvent) {
+        const element = event.currentTarget as HTMLElement | null;
+        if (element) {
+          this.showAtPosition({
+            x: element.getBoundingClientRect().left,
+            y: element.getBoundingClientRect().bottom + 4,
+          });
+        }
+      }
+      return this;
+    }),
+    hide: jest.fn().mockImplementation(function(this: any) {
+      onHideCallbacks.forEach((callback) => callback());
+      return this;
+    }),
+    close: jest.fn().mockImplementation(() => {
+      onHideCallbacks.forEach((callback) => callback());
+    }),
+    onHide: jest.fn().mockImplementation((callback: () => void) => {
+      onHideCallbacks.push(callback);
+    }),
+  };
+  return menu;
+});
 
 // Mock parseFrontMatterAliases function
 export function parseFrontMatterAliases(frontmatter: any): string[] | null {
@@ -973,6 +1031,21 @@ export function parseFrontMatterAliases(frontmatter: any): string[] | null {
   if (!aliases) return null;
   if (Array.isArray(aliases)) return aliases;
   if (typeof aliases === 'string') return [aliases];
+  return null;
+}
+
+// Mock parseFrontMatterTags function
+export function parseFrontMatterTags(frontmatter: any): string[] | null {
+  if (!frontmatter) return null;
+  const tags = frontmatter.tags || frontmatter.tag;
+  if (!tags) return null;
+  if (Array.isArray(tags)) return tags.flatMap((tag) => parseFrontMatterTags({ tags: tag }) ?? []);
+  if (typeof tags === 'string') {
+    return tags
+      .split(/[,\s]+/)
+      .map((tag) => tag.trim())
+      .filter(Boolean);
+  }
   return null;
 }
 
@@ -1009,6 +1082,12 @@ export function setTooltip(element: HTMLElement, tooltip: string, options?: { pl
     element.setAttribute('data-tooltip-placement', options.placement);
   }
   element.classList.add('has-tooltip');
+}
+
+export function sanitizeHTMLToDom(html: string): DocumentFragment {
+  const template = document.createElement('template');
+  template.innerHTML = html;
+  return template.content;
 }
 
 // API version check utilities (added in Obsidian 1.11.0)
@@ -1108,6 +1187,7 @@ export const MockObsidian = {
   Notice,
   setIcon,
   setTooltip,
+  sanitizeHTMLToDom,
 };
 
 // Simple debounce mock: return the original function for test determinism
@@ -1159,7 +1239,9 @@ export default {
   Events,
   setIcon,
   setTooltip,
+  sanitizeHTMLToDom,
   parseFrontMatterAliases,
+  parseFrontMatterTags,
   parseLinktext,
   MockObsidian,
   debounce,

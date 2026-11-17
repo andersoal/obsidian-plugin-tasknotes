@@ -2,13 +2,41 @@ import { jest } from "@jest/globals";
 import { TFile } from "obsidian";
 import {
 	applySortOrderPlan,
+	compareManualOrderValues,
+	getSortOrderDirection,
 	prepareSortOrderUpdate,
+	stripPropertyPrefix,
 	type SortOrderPlan,
 } from "../../../src/bases/sortOrderUtils";
 
-jest.mock("obsidian");
-
 type FrontmatterMap = Record<string, Record<string, any>>;
+
+const basesSortCollator = new Intl.Collator(undefined, {
+	numeric: true,
+	sensitivity: "base",
+});
+const alphaRankPattern = /^tn[a-z]{10}$/;
+
+function compareBasesOrder(left: string, right: string): number {
+	const collated = basesSortCollator.compare(left, right);
+	return collated !== 0 ? collated : left.localeCompare(right);
+}
+
+function expectAscendingDisplayOrder(ranks: string[]): void {
+	for (let index = 1; index < ranks.length; index++) {
+		expect(compareBasesOrder(ranks[index - 1], ranks[index])).toBeLessThan(0);
+	}
+}
+
+function expectDescendingDisplayOrder(ranks: string[]): void {
+	for (let index = 1; index < ranks.length; index++) {
+		expect(compareBasesOrder(ranks[index - 1], ranks[index])).toBeGreaterThan(0);
+	}
+}
+
+function expectAlphaRanks(ranks: string[]): void {
+	expect(ranks.every((rank) => alphaRankPattern.test(rank))).toBe(true);
+}
 
 function createPlugin(frontmatterByPath: FrontmatterMap, sortOrderField = "tasknotes_manual_order") {
 	const processFrontMatter = jest.fn(async (file: TFile, updater: (frontmatter: any) => void) => {
@@ -45,6 +73,33 @@ function createPlugin(frontmatterByPath: FrontmatterMap, sortOrderField = "taskn
 }
 
 describe("sortOrderUtils", () => {
+	it.each(["asc", "desc"] as const)("keeps missing manual ranks last in %s order", (direction) => {
+		for (const missing of [undefined, null, ""]) {
+			expect(compareManualOrderValues(missing, "tnmmmmmmmmmm", direction)).toBeGreaterThan(0);
+			expect(compareManualOrderValues("tnmmmmmmmmmm", missing, direction)).toBeLessThan(0);
+			for (const otherMissing of [undefined, null, ""]) {
+				expect(compareManualOrderValues(missing, otherMissing, direction)).toBe(0);
+			}
+		}
+	});
+
+	it("compares manual ranks in the configured direction with Bases numeric collation", () => {
+		for (const [left, right] of [["tnaaaaaaaaaa", "tnzzzzzzzzzz"], ["rank2", "rank10"], [2, 10]]) {
+			expect(compareManualOrderValues(left, right, "asc")).toBeLessThan(0);
+			expect(compareManualOrderValues(left, right, "desc")).toBeGreaterThan(0);
+			expect(compareManualOrderValues(left, left, "desc")).toBe(0);
+		}
+		expect(compareManualOrderValues("tnaaaaaaaaaa", "tnzzzzzzzzzz")).toBeLessThan(0);
+	});
+
+	it("strips repeated Bases property prefixes", () => {
+		expect(stripPropertyPrefix("status")).toBe("status");
+		expect(stripPropertyPrefix("task.status")).toBe("status");
+		expect(stripPropertyPrefix("note.task.status")).toBe("status");
+		expect(stripPropertyPrefix("file.name")).toBe("name");
+		expect(stripPropertyPrefix("formula.weekDay")).toBe("weekDay");
+	});
+
 	it("writes the configured sort-order field when applying a plan", async () => {
 		const frontmatterByPath = {
 			"alpha.md": { custom_order: "0|hzzzzz:" },
@@ -88,16 +143,21 @@ describe("sortOrderUtils", () => {
 		const rankB = plan.additionalWrites.find((write) => write.path === "unranked-b.md")?.sortOrder;
 		const rankC = plan.additionalWrites.find((write) => write.path === "unranked-c.md")?.sortOrder;
 
-		expect(plan.reason).toBe("sparse-init");
+		expect(plan.reason).toBe("rebalance");
+		expect(plan.additionalWrites.map((write) => write.path)).toEqual([
+			"ranked.md",
+			"unranked-a.md",
+			"unranked-b.md",
+			"unranked-c.md",
+		]);
 		expect(rankA).toBeDefined();
 		expect(rankB).toBeDefined();
 		expect(rankC).toBeDefined();
-		expect(rankA!.localeCompare(rankB!)).toBeLessThan(0);
-		expect(rankB!.localeCompare(plan.sortOrder!)).toBeLessThan(0);
-		expect(plan.sortOrder!.localeCompare(rankC!)).toBeLessThan(0);
+		expectAlphaRanks([rankA!, rankB!, plan.sortOrder!, rankC!]);
+		expectAscendingDisplayOrder([rankA!, rankB!, plan.sortOrder!, rankC!]);
 	});
 
-	it("uses a cheap boundary insert before the first unranked task in a sparse tail", async () => {
+	it("rebalances before the first unranked task in a sparse tail", async () => {
 		const plugin = createPlugin({
 			"ranked.md": { status: "todo", tasknotes_manual_order: "0|hzzzzz:" },
 			"unranked-a.md": { status: "todo" },
@@ -116,10 +176,17 @@ describe("sortOrderUtils", () => {
 			}
 		);
 
-		expect(plan.reason).toBe("boundary");
-		expect(plan.additionalWrites).toEqual([]);
+		expect(plan.reason).toBe("rebalance");
+		expect(plan.additionalWrites.map((write) => write.path)).toEqual([
+			"ranked.md",
+			"unranked-a.md",
+			"unranked-b.md",
+		]);
 		expect(plan.sortOrder).toBeDefined();
-		expect(plan.sortOrder!.localeCompare("0|hzzzzz:")).toBeGreaterThan(0);
+		const rankedRank = plan.additionalWrites.find((write) => write.path === "ranked.md")!.sortOrder;
+		const rankA = plan.additionalWrites.find((write) => write.path === "unranked-a.md")!.sortOrder;
+		expectAlphaRanks([rankedRank, plan.sortOrder!, rankA]);
+		expectAscendingDisplayOrder([rankedRank, plan.sortOrder!, rankA]);
 	});
 
 	it("isolates kanban reorder calculations to the active swimlane scope", async () => {
@@ -144,8 +211,8 @@ describe("sortOrderUtils", () => {
 
 		expect(plan.reason).toBe("midpoint");
 		expect(plan.additionalWrites).toEqual([]);
-		expect(plan.sortOrder!.localeCompare("0|hzzzzz:")).toBeGreaterThan(0);
-		expect(plan.sortOrder!.localeCompare("0|i00007:")).toBeLessThan(0);
+		expect(compareBasesOrder(plan.sortOrder!, "0|hzzzzz:")).toBeGreaterThan(0);
+		expect(compareBasesOrder(plan.sortOrder!, "0|i00007:")).toBeLessThan(0);
 	});
 
 	it("uses the visible list order as the authoritative drop scope", async () => {
@@ -167,9 +234,51 @@ describe("sortOrderUtils", () => {
 			}
 		);
 
-		expect(plan.reason).toBe("boundary");
-		expect(plan.additionalWrites).toEqual([]);
-		expect(plan.sortOrder!.localeCompare("0|i00007:")).toBeGreaterThan(0);
+		expect(plan.reason).toBe("rebalance");
+		expect(plan.additionalWrites.map((write) => write.path)).toEqual([
+			"alpha.md",
+			"visible-last.md",
+		]);
+		expect(plan.additionalWrites.some((write) => write.path === "hidden-after.md")).toBe(false);
+		const alphaRank = plan.additionalWrites.find((write) => write.path === "alpha.md")!.sortOrder;
+		const visibleLastRank = plan.additionalWrites.find((write) => write.path === "visible-last.md")!
+			.sortOrder;
+		expectAlphaRanks([alphaRank, visibleLastRank, plan.sortOrder!]);
+		expectAscendingDisplayOrder([alphaRank, visibleLastRank, plan.sortOrder!]);
+	});
+
+	it("rebalances old LexoRank gaps that are not between values under Bases natural sort", async () => {
+		const plugin = createPlugin({
+			"previous.md": { status: "todo", tasknotes_manual_order: "0|hzzzzz:" },
+			"target.md": { status: "todo", tasknotes_manual_order: "0|i0000f:" },
+			"next.md": { status: "todo", tasknotes_manual_order: "0|i0000n:" },
+		});
+
+		const plan = await prepareSortOrderUpdate(
+			"target.md",
+			true,
+			"todo",
+			"status",
+			"dragged.md",
+			plugin,
+			{
+				visibleTaskPaths: ["previous.md", "target.md", "next.md"],
+			}
+		);
+
+		expect(plan.reason).toBe("rebalance");
+		expect(plan.additionalWrites.map((write) => write.path)).toEqual([
+			"previous.md",
+			"target.md",
+			"next.md",
+		]);
+
+		const previousRank = plan.additionalWrites.find((write) => write.path === "previous.md")!.sortOrder;
+		const targetRank = plan.additionalWrites.find((write) => write.path === "target.md")!.sortOrder;
+		const nextRank = plan.additionalWrites.find((write) => write.path === "next.md")!.sortOrder;
+
+		expectAlphaRanks([previousRank, plan.sortOrder!, targetRank, nextRank]);
+		expectAscendingDisplayOrder([previousRank, plan.sortOrder!, targetRank, nextRank]);
 	});
 
 	it("respects descending visible sort order when inserting above a target", async () => {
@@ -193,8 +302,40 @@ describe("sortOrderUtils", () => {
 
 		expect(plan.reason).toBe("midpoint");
 		expect(plan.additionalWrites).toEqual([]);
-		expect(plan.sortOrder!.localeCompare("0|jc3j7d:")).toBeLessThan(0);
-		expect(plan.sortOrder!.localeCompare("0|jc2tkt:")).toBeGreaterThan(0);
+		expect(compareBasesOrder(plan.sortOrder!, "0|jc3j7d:")).toBeLessThan(0);
+		expect(compareBasesOrder(plan.sortOrder!, "0|jc2tkt:")).toBeGreaterThan(0);
+	});
+
+	it("uses the configured direction when a scope has only one other ranked task", async () => {
+		const plugin = createPlugin({
+			"peer.md": { status: "todo", tasknotes_manual_order: "0|i0000n:" },
+			"dragged.md": { status: "todo", tasknotes_manual_order: "0|hzzzzz:" },
+		});
+
+		const plan = await prepareSortOrderUpdate("peer.md", true, "todo", "status", "dragged.md", plugin, {
+			visibleTaskPaths: ["peer.md", "dragged.md"],
+			sortDirection: "desc",
+		});
+
+		// Above the peer in a descending view means a greater rank.
+		expect(compareBasesOrder(plan.sortOrder!, "0|i0000n:")).toBeGreaterThan(0);
+	});
+
+	it("reads the sort-order direction from the view configuration", () => {
+		const adapter = (config: unknown) => ({ getSortConfig: () => config as any });
+		expect(
+			getSortOrderDirection(
+				adapter([
+					{ property: "note.due", direction: "ASC" },
+					{ property: "note.tasknotes_manual_order", direction: "DESC" },
+				]),
+				"tasknotes_manual_order"
+			)
+		).toBe("desc");
+		expect(
+			getSortOrderDirection(adapter([{ property: "note.due", direction: "DESC" }]), "tasknotes_manual_order")
+		).toBeUndefined();
+		expect(getSortOrderDirection(adapter(null), "tasknotes_manual_order")).toBeUndefined();
 	});
 
 	it("rebalances descending duplicate boundaries instead of jumping above the previous task", async () => {
@@ -227,9 +368,8 @@ describe("sortOrderUtils", () => {
 		const targetRank = plan.additionalWrites.find((write) => write.path === "target.md")!.sortOrder;
 		const nextRank = plan.additionalWrites.find((write) => write.path === "next.md")!.sortOrder;
 
-		expect(previousRank.localeCompare(plan.sortOrder!)).toBeGreaterThan(0);
-		expect(plan.sortOrder!.localeCompare(targetRank)).toBeGreaterThan(0);
-		expect(targetRank.localeCompare(nextRank)).toBeGreaterThan(0);
+		expectAlphaRanks([previousRank, plan.sortOrder!, targetRank, nextRank]);
+		expectDescendingDisplayOrder([previousRank, plan.sortOrder!, targetRank, nextRank]);
 	});
 
 	it("rebalances oversized sparse scopes into compact ranks", async () => {
@@ -265,8 +405,7 @@ describe("sortOrderUtils", () => {
 		const rankB = plan.additionalWrites.find((write) => write.path === "unranked-b.md")!.sortOrder;
 		const allRanks = [seedRank, rankA, plan.sortOrder!, rankB];
 		expect(allRanks.every((rank) => rank.length <= 12)).toBe(true);
-		expect(seedRank.localeCompare(rankA)).toBeLessThan(0);
-		expect(rankA.localeCompare(plan.sortOrder!)).toBeLessThan(0);
-		expect(plan.sortOrder!.localeCompare(rankB)).toBeLessThan(0);
+		expectAlphaRanks(allRanks);
+		expectAscendingDisplayOrder(allRanks);
 	});
 });

@@ -1,13 +1,22 @@
-import { ItemView, WorkspaceLeaf, Setting } from "obsidian";
-import { format, startOfWeek, endOfWeek, startOfDay } from "date-fns";
+import { formatUIDate, uiNumber, uiPercent, uiDuration } from "../i18n/formatters";
+import type { MessageDescriptor } from "@lingui/core";
+import { msg } from "@lingui/core/macro";
+import { ItemView, Menu, Notice, WorkspaceLeaf, Setting, setIcon, setTooltip } from "obsidian";
+import { startOfWeek, endOfWeek } from "date-fns";
+import type { Day } from "date-fns";
 import TaskNotesPlugin from "../main";
 import { POMODORO_STATS_VIEW_TYPE, PomodoroHistoryStats, PomodoroSessionHistory } from "../types";
-import {
-	parseTimestamp,
-	getTodayLocal,
-	createUTCDateFromLocalCalendarDate,
-} from "../utils/dateUtils";
+import { showConfirmationModal } from "../modals/ConfirmationModal";
+import { getTodayLocal, createUTCDateFromLocalCalendarDate } from "../utils/dateUtils";
 import { getSessionDuration } from "../utils/pomodoroUtils";
+import { calculatePomodoroStats } from "../utils/pomodoroStats";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Views/PomodoroStatsView" });
+
+function isDay(value: number): value is Day {
+	return Number.isInteger(value) && value >= 0 && value <= 6;
+}
 
 export class PomodoroStatsView extends ItemView {
 	plugin: TaskNotesPlugin;
@@ -29,35 +38,20 @@ export class PomodoroStatsView extends ItemView {
 	}
 
 	getDisplayText(): string {
-		return this.plugin.i18n.translate("views.pomodoroStats.title");
+		return this.plugin.i18n.translate(msg({ message: "Pomodoro stats", context: "views.pomodoroStats.title" }));
 	}
 
 	getIcon(): string {
 		return "bar-chart";
 	}
 
-	private t(key: string, params?: Record<string, string | number>): string {
+	private t(key: MessageDescriptor, params?: Record<string, string | number>): string {
 		return this.plugin.i18n.translate(key, params);
-	}
-
-	/**
-	 * Calculate actual duration in minutes with backward compatibility
-	 */
-	private calculateActualDuration(
-		activePeriods: Array<{ startTime: string; endTime?: string }>
-	): number {
-		return activePeriods
-			.filter((period) => period.endTime) // Only completed periods
-			.reduce((total, period) => {
-				const start = new Date(period.startTime);
-				const end = period.endTime ? new Date(period.endTime) : new Date();
-				const durationMs = end.getTime() - start.getTime();
-				return total + Math.round(durationMs / (1000 * 60)); // Convert to minutes
-			}, 0);
 	}
 
 	async onOpen() {
 		await this.plugin.onReady();
+		await this.waitForPomodoroService();
 		await this.render();
 	}
 
@@ -66,6 +60,7 @@ export class PomodoroStatsView extends ItemView {
 	}
 
 	async render() {
+		this.contentEl.empty();
 		const container = this.contentEl.createDiv({
 			cls: "tasknotes-plugin tasknotes-container pomodoro-stats-container pomodoro-stats-view",
 		});
@@ -74,15 +69,20 @@ export class PomodoroStatsView extends ItemView {
 		const header = container.createDiv({
 			cls: "pomodoro-stats-header pomodoro-stats-view__header",
 		});
-		new Setting(header).setName(this.t("views.pomodoroStats.heading")).setHeading();
+		new Setting(header).setName(this.t(msg({ message: "Pomodoro statistics", context: "views.pomodoroStats.heading" }))).setHeading();
+
+		const headerActions = header.createDiv({
+			cls: "pomodoro-stats-view__header-actions",
+		});
+		this.renderBasesMigrationHelp(headerActions);
 
 		// Refresh button
-		const refreshButton = header.createEl("button", {
+		const refreshButton = headerActions.createEl("button", {
 			cls: "pomodoro-stats-refresh-button pomodoro-stats-view__refresh-button",
-			text: this.t("views.pomodoroStats.refresh"),
+			text: this.t(msg({ message: "Refresh", context: "views.pomodoroStats.refresh" })),
 		});
 		this.registerDomEvent(refreshButton, "click", () => {
-			this.refreshStats();
+			void this.refreshStats();
 		});
 
 		// Overview section (like TickTick)
@@ -90,7 +90,7 @@ export class PomodoroStatsView extends ItemView {
 			cls: "pomodoro-stats-section pomodoro-stats-view__section",
 		});
 		new Setting(overviewSection)
-			.setName(this.t("views.pomodoroStats.sections.overview"))
+			.setName(this.t(msg({ message: "Overview", context: "views.pomodoroStats.sections.overview" })))
 			.setHeading();
 		this.overviewStatsEl = overviewSection.createDiv({
 			cls: "pomodoro-overview-grid pomodoro-stats-view__overview-grid",
@@ -101,7 +101,7 @@ export class PomodoroStatsView extends ItemView {
 			cls: "pomodoro-stats-section pomodoro-stats-view__section",
 		});
 		new Setting(todaySection)
-			.setName(this.t("views.pomodoroStats.sections.today"))
+			.setName(this.t(msg({ message: "Today", context: "views.pomodoroStats.sections.today" })))
 			.setHeading();
 		this.todayStatsEl = todaySection.createDiv({
 			cls: "pomodoro-stats-grid pomodoro-stats-view__stats-grid",
@@ -111,7 +111,7 @@ export class PomodoroStatsView extends ItemView {
 		const weekSection = container.createDiv({
 			cls: "pomodoro-stats-section pomodoro-stats-view__section",
 		});
-		new Setting(weekSection).setName(this.t("views.pomodoroStats.sections.week")).setHeading();
+		new Setting(weekSection).setName(this.t(msg({ message: "This week", context: "views.pomodoroStats.sections.week" }))).setHeading();
 		this.weekStatsEl = weekSection.createDiv({
 			cls: "pomodoro-stats-grid pomodoro-stats-view__stats-grid",
 		});
@@ -121,7 +121,7 @@ export class PomodoroStatsView extends ItemView {
 			cls: "pomodoro-stats-section pomodoro-stats-view__section",
 		});
 		new Setting(overallSection)
-			.setName(this.t("views.pomodoroStats.sections.allTime"))
+			.setName(this.t(msg({ message: "All time", context: "views.pomodoroStats.sections.allTime" })))
 			.setHeading();
 		this.overallStatsEl = overallSection.createDiv({
 			cls: "pomodoro-stats-grid pomodoro-stats-view__stats-grid",
@@ -132,7 +132,7 @@ export class PomodoroStatsView extends ItemView {
 			cls: "pomodoro-stats-section pomodoro-stats-view__section",
 		});
 		new Setting(recentSection)
-			.setName(this.t("views.pomodoroStats.sections.recent"))
+			.setName(this.t(msg({ message: "Recent sessions", context: "views.pomodoroStats.sections.recent" })))
 			.setHeading();
 		this.recentSessionsEl = recentSection.createDiv({
 			cls: "pomodoro-recent-sessions pomodoro-stats-view__recent-sessions",
@@ -142,103 +142,120 @@ export class PomodoroStatsView extends ItemView {
 		await this.refreshStats();
 	}
 
-	private async refreshStats() {
-		try {
-			await Promise.all([
-				this.updateOverviewStats(),
-				this.updateTodayStats(),
-				this.updateWeekStats(),
-				this.updateOverallStats(),
-				this.updateRecentSessions(),
-			]);
-		} catch (error) {
-			console.error("Failed to refresh stats:", error);
+	private renderBasesMigrationHelp(container: HTMLElement): void {
+		if (this.plugin.settings.pomodoroStorageLocation === "daily-notes") {
+			return;
+		}
+
+		const helpButton = container.createEl("button", {
+			cls: "pomodoro-stats-view__bases-help",
+		});
+		const title = this.t(msg({ message: "Want a base view?", context: "views.pomodoroStats.basesMigration.title" }));
+		const description = this.t(msg({ message: "Pomodoro base views use daily notes frontmatter; to see this history in the generated Pomodoro statistics base, migrate Pomodoro data in settings, then set storage to daily notes.", context: "views.pomodoroStats.basesMigration.description" }));
+		setIcon(helpButton, "help-circle");
+		helpButton.setAttr("aria-label", `${title}: ${description}`);
+		setTooltip(helpButton, description, {
+			placement: "bottom",
+		});
+	}
+
+	private async waitForPomodoroService(): Promise<void> {
+		const startedAt = Date.now();
+		while (!this.plugin.pomodoroService && Date.now() - startedAt < 5000) {
+			await new Promise((resolve) => window.setTimeout(resolve, 50));
 		}
 	}
 
-	private async updateOverviewStats() {
-		if (!this.overviewStatsEl) return;
+	private async refreshStats() {
+		try {
+			if (!this.plugin.pomodoroService) {
+				return;
+			}
 
-		const todayStats = await this.plugin.pomodoroService.getTodayStats();
-		const overallStats = await this.calculateOverallStatsFromHistory();
+			const todayLocal = getTodayLocal();
+			const todayUTCAnchor = createUTCDateFromLocalCalendarDate(todayLocal);
+			const yesterdayLocal = new Date(todayLocal);
+			yesterdayLocal.setDate(yesterdayLocal.getDate() - 1);
+			const yesterdayUTCAnchor = createUTCDateFromLocalCalendarDate(yesterdayLocal);
+			const firstDaySetting = this.plugin.settings.calendarViewSettings.firstDay || 0;
+			const weekStartsOn = isDay(firstDaySetting) ? firstDaySetting : 0;
+			const weekStartOptions: { weekStartsOn: Day } = {
+				weekStartsOn,
+			};
+			const weekStart = startOfWeek(todayUTCAnchor, weekStartOptions);
+			const weekEnd = endOfWeek(todayUTCAnchor, weekStartOptions);
 
-		// Use UTC-anchored dates for consistent timezone handling
-		const todayLocal = getTodayLocal();
-		const yesterdayLocal = new Date(todayLocal);
-		yesterdayLocal.setDate(yesterdayLocal.getDate() - 1);
-		const yesterdayUTCAnchor = createUTCDateFromLocalCalendarDate(yesterdayLocal);
-		const yesterdayStats = await this.calculateStatsForRange(
-			yesterdayUTCAnchor,
-			yesterdayUTCAnchor
-		);
+			const [todayStats, yesterdayStats, weekStats, history] = await Promise.all([
+				this.plugin.pomodoroService.getTodayStats(),
+				this.plugin.pomodoroService.getStatsForDate(yesterdayUTCAnchor),
+				this.plugin.pomodoroService.getStatsForDateRange(weekStart, weekEnd),
+				this.plugin.pomodoroService.getSessionHistory(),
+			]);
+			const overallStats = calculatePomodoroStats(history);
 
-		this.renderOverviewStats(this.overviewStatsEl, todayStats, overallStats, yesterdayStats);
+			if (this.overviewStatsEl) {
+				this.renderOverviewStats(
+					this.overviewStatsEl,
+					todayStats,
+					overallStats,
+					yesterdayStats
+				);
+			}
+
+			if (this.todayStatsEl) {
+				this.renderStatsGrid(this.todayStatsEl, todayStats);
+			}
+
+			if (this.weekStatsEl) {
+				this.renderStatsGrid(this.weekStatsEl, weekStats);
+			}
+
+			if (this.overallStatsEl) {
+				this.renderStatsGrid(this.overallStatsEl, overallStats);
+			}
+
+			if (this.recentSessionsEl) {
+				this.renderRecentSessions(this.recentSessionsEl, history);
+			}
+		} catch (error) {
+			tasknotesLogger.error("Failed to refresh stats:", {
+				category: "stale-data",
+				operation: "refresh-stats",
+				error: error,
+			});
+		}
 	}
 
-	private async updateTodayStats() {
-		if (!this.todayStatsEl) return;
-
-		const stats = await this.plugin.pomodoroService.getTodayStats();
-		this.renderStatsGrid(this.todayStatsEl, stats);
-	}
-
-	private async updateWeekStats() {
-		if (!this.weekStatsEl) return;
-
-		// Use UTC-anchored today for consistent timezone handling
-		const todayLocal = getTodayLocal();
-		const todayUTCAnchor = createUTCDateFromLocalCalendarDate(todayLocal);
-		const firstDaySetting = this.plugin.settings.calendarViewSettings.firstDay || 0;
-		const weekStartOptions = { weekStartsOn: firstDaySetting as 0 | 1 | 2 | 3 | 4 | 5 | 6 };
-		const weekStart = startOfWeek(todayUTCAnchor, weekStartOptions);
-		const weekEnd = endOfWeek(todayUTCAnchor, weekStartOptions);
-
-		const stats = await this.calculateStatsForRange(weekStart, weekEnd);
-		this.renderStatsGrid(this.weekStatsEl, stats);
-	}
-
-	private async updateOverallStats() {
-		if (!this.overallStatsEl) return;
-
-		const history = await this.plugin.pomodoroService.getSessionHistory();
-		const stats = this.calculateOverallStats(history);
-		this.renderStatsGrid(this.overallStatsEl, stats);
-	}
-
-	private async calculateOverallStatsFromHistory(): Promise<PomodoroHistoryStats> {
-		const history = await this.plugin.pomodoroService.getSessionHistory();
-		return this.calculateOverallStats(history);
-	}
-
-	private async updateRecentSessions() {
-		if (!this.recentSessionsEl) return;
-
-		const history = await this.plugin.pomodoroService.getSessionHistory();
+	private renderRecentSessions(container: HTMLElement, history: PomodoroSessionHistory[]) {
 		const recentSessions = history
 			.filter((session: PomodoroSessionHistory) => session.type === "work")
 			.slice(-10)
 			.reverse();
 
-		this.recentSessionsEl.empty();
+		container.empty();
 
 		if (recentSessions.length === 0) {
-			this.recentSessionsEl.createDiv({
+			container.createDiv({
 				cls: "pomodoro-no-sessions pomodoro-stats-view__no-sessions",
-				text: this.t("views.pomodoroStats.recents.empty"),
+				text: this.t(msg({ message: "No sessions recorded yet", context: "views.pomodoroStats.recents.empty" })),
 			});
 			return;
 		}
 
 		for (const session of recentSessions) {
-			const sessionEl = this.recentSessionsEl.createDiv({
+			const sessionEl = container.createDiv({
 				cls: "pomodoro-session-item pomodoro-stats-view__session-item",
+			});
+			this.registerDomEvent(sessionEl, "contextmenu", (event: MouseEvent) => {
+				event.preventDefault();
+				this.showSessionContextMenu(event, session);
 			});
 
 			const dateEl = sessionEl.createSpan({
 				cls: "session-date pomodoro-stats-view__session-date",
 			});
 			const timeFormat = this.plugin.settings.calendarViewSettings.timeFormat;
-			dateEl.textContent = format(
+			dateEl.textContent = formatUIDate(
 				new Date(session.startTime),
 				timeFormat === "12" ? "MMM d, h:mm a" : "MMM d, HH:mm"
 			);
@@ -247,7 +264,7 @@ export class PomodoroStatsView extends ItemView {
 				cls: "session-duration pomodoro-stats-view__session-duration",
 			});
 			const actualDuration = getSessionDuration(session);
-			durationEl.textContent = this.t("views.pomodoroStats.recents.duration", {
+			durationEl.textContent = this.t(msg({ message: "{minutes} min", context: "views.pomodoroStats.recents.duration" }), {
 				minutes: actualDuration,
 			});
 
@@ -256,8 +273,8 @@ export class PomodoroStatsView extends ItemView {
 			});
 			statusEl.textContent = this.t(
 				session.completed
-					? "views.pomodoroStats.recents.status.completed"
-					: "views.pomodoroStats.recents.status.interrupted"
+					? msg({ message: "Completed", context: "views.pomodoroStats.recents.status.completed" })
+					: msg({ message: "Interrupted", context: "views.pomodoroStats.recents.status.interrupted" })
 			);
 			statusEl.addClass(session.completed ? "status-completed" : "status-interrupted");
 			statusEl.addClass(
@@ -273,6 +290,62 @@ export class PomodoroStatsView extends ItemView {
 				const taskName = session.taskPath.split("/").pop()?.replace(".md", "") || "";
 				taskEl.textContent = taskName;
 			}
+
+			const deleteButton = sessionEl.createEl("button", {
+				cls: "pomodoro-stats-view__session-delete-button",
+				attr: {
+					type: "button",
+					"aria-label": this.t(msg({ message: "Delete Pomodoro session", context: "views.pomodoroStats.recents.deleteAria" })),
+				},
+			});
+			setIcon(deleteButton, "trash-2");
+			setTooltip(deleteButton, this.t(msg({ message: "Delete session", context: "views.pomodoroStats.recents.delete" })), {
+				placement: "top",
+			});
+			this.registerDomEvent(deleteButton, "click", (event: MouseEvent) => {
+				event.preventDefault();
+				event.stopPropagation();
+				void this.confirmDeleteSession(session);
+			});
+		}
+	}
+
+	private showSessionContextMenu(event: MouseEvent, session: PomodoroSessionHistory): void {
+		const menu = new Menu();
+		menu.addItem((item) => {
+			item.setTitle(this.t(msg({ message: "Delete session", context: "views.pomodoroStats.recents.delete" })));
+			item.setIcon("trash");
+			item.onClick(() => {
+				void this.confirmDeleteSession(session);
+			});
+		});
+		menu.showAtMouseEvent(event);
+	}
+
+	private async confirmDeleteSession(session: PomodoroSessionHistory): Promise<void> {
+		const confirmed = await showConfirmationModal(this.plugin.app, {
+			title: this.t(msg({ message: "Delete Pomodoro session?", context: "views.pomodoroStats.recents.deleteConfirmTitle" })),
+			message: this.t(msg({ message: "This removes the session from Pomodoro history. Existing task time entries are not changed.", context: "views.pomodoroStats.recents.deleteConfirmMessage" })),
+			confirmText: this.t(msg({ message: "Delete", context: "views.pomodoroStats.recents.deleteConfirmButton" })),
+			cancelText: this.t(msg({ message: "Cancel", context: "common.cancel" })),
+			isDestructive: true,
+		});
+
+		if (!confirmed || !this.plugin.pomodoroService) {
+			return;
+		}
+
+		const deleted = await this.plugin.pomodoroService.deleteSessionFromHistory(session);
+		new Notice(
+			this.t(
+				deleted
+					? msg({ message: "Pomodoro session deleted", context: "views.pomodoroStats.recents.deleteSuccess" })
+					: msg({ message: "Pomodoro session was not found", context: "views.pomodoroStats.recents.deleteNotFound" })
+			)
+		);
+
+		if (deleted) {
+			await this.refreshStats();
 		}
 	}
 
@@ -285,12 +358,7 @@ export class PomodoroStatsView extends ItemView {
 		container.empty();
 
 		// Format time duration in hours and minutes
-		const formatTime = (minutes: number): string => {
-			if (minutes < 60) return `${minutes}m`;
-			const hours = Math.floor(minutes / 60);
-			const mins = minutes % 60;
-			return mins > 0 ? `${hours}h${mins}m` : `${hours}h`;
-		};
+		const formatTime = (minutes: number): string => uiDuration(minutes);
 
 		// Calculate changes from yesterday
 		const pomodoroChange = todayStats.pomodorosCompleted - yesterdayStats.pomodorosCompleted;
@@ -303,10 +371,10 @@ export class PomodoroStatsView extends ItemView {
 		const todayPomosValue = todayPomosCard.createDiv({
 			cls: "overview-value pomodoro-stats-view__overview-value",
 		});
-		todayPomosValue.textContent = todayStats.pomodorosCompleted.toString();
+		todayPomosValue.textContent = uiNumber(todayStats.pomodorosCompleted);
 		todayPomosCard.createDiv({
 			cls: "overview-label pomodoro-stats-view__overview-label",
-			text: this.t("views.pomodoroStats.overviewCards.todayPomos.label"),
+			text: this.t(msg({ message: "Today''s pomos", context: "views.pomodoroStats.overviewCards.todayPomos.label" })),
 		});
 		if (pomodoroChange !== 0) {
 			const changeEl = todayPomosCard.createDiv({
@@ -314,10 +382,10 @@ export class PomodoroStatsView extends ItemView {
 			});
 			changeEl.textContent =
 				pomodoroChange > 0
-					? this.t("views.pomodoroStats.overviewCards.todayPomos.change.more", {
+					? this.t(msg({ message: "{count} more than yesterday", context: "views.pomodoroStats.overviewCards.todayPomos.change.more" }), {
 							count: pomodoroChange,
 						})
-					: this.t("views.pomodoroStats.overviewCards.todayPomos.change.less", {
+					: this.t(msg({ message: "{count} fewer than yesterday", context: "views.pomodoroStats.overviewCards.todayPomos.change.less" }), {
 							count: Math.abs(pomodoroChange),
 						});
 			changeEl.addClass(pomodoroChange > 0 ? "positive" : "negative");
@@ -330,10 +398,10 @@ export class PomodoroStatsView extends ItemView {
 		const totalPomosValue = totalPomosCard.createDiv({
 			cls: "overview-value pomodoro-stats-view__overview-value",
 		});
-		totalPomosValue.textContent = overallStats.pomodorosCompleted.toString();
+		totalPomosValue.textContent = uiNumber(overallStats.pomodorosCompleted);
 		totalPomosCard.createDiv({
 			cls: "overview-label pomodoro-stats-view__overview-label",
-			text: this.t("views.pomodoroStats.overviewCards.totalPomos.label"),
+			text: this.t(msg({ message: "Total pomos", context: "views.pomodoroStats.overviewCards.totalPomos.label" })),
 		});
 
 		// Today's Focus
@@ -346,7 +414,7 @@ export class PomodoroStatsView extends ItemView {
 		todayFocusValue.textContent = formatTime(todayStats.totalMinutes);
 		todayFocusCard.createDiv({
 			cls: "overview-label pomodoro-stats-view__overview-label",
-			text: this.t("views.pomodoroStats.overviewCards.todayFocus.label"),
+			text: this.t(msg({ message: "Today''s focus", context: "views.pomodoroStats.overviewCards.todayFocus.label" })),
 		});
 		if (timeChange !== 0) {
 			const changeEl = todayFocusCard.createDiv({
@@ -354,10 +422,10 @@ export class PomodoroStatsView extends ItemView {
 			});
 			changeEl.textContent =
 				timeChange > 0
-					? this.t("views.pomodoroStats.overviewCards.todayFocus.change.more", {
+					? this.t(msg({ message: "{duration} more than yesterday", context: "views.pomodoroStats.overviewCards.todayFocus.change.more" }), {
 							duration: formatTime(Math.abs(timeChange)),
 						})
-					: this.t("views.pomodoroStats.overviewCards.todayFocus.change.less", {
+					: this.t(msg({ message: "{duration} less than yesterday", context: "views.pomodoroStats.overviewCards.todayFocus.change.less" }), {
 							duration: formatTime(Math.abs(timeChange)),
 						});
 			changeEl.addClass(timeChange > 0 ? "positive" : "negative");
@@ -373,7 +441,7 @@ export class PomodoroStatsView extends ItemView {
 		totalFocusValue.textContent = formatTime(overallStats.totalMinutes);
 		totalFocusCard.createDiv({
 			cls: "overview-label pomodoro-stats-view__overview-label",
-			text: this.t("views.pomodoroStats.overviewCards.totalFocus.label"),
+			text: this.t(msg({ message: "Total focus duration", context: "views.pomodoroStats.overviewCards.totalFocus.label" })),
 		});
 	}
 
@@ -386,11 +454,11 @@ export class PomodoroStatsView extends ItemView {
 		});
 		pomodorosCard.createDiv({
 			cls: "stat-value pomodoro-stats-view__stat-value",
-			text: stats.pomodorosCompleted.toString(),
+			text: uiNumber(stats.pomodorosCompleted),
 		});
 		pomodorosCard.createDiv({
 			cls: "stat-label pomodoro-stats-view__stat-label",
-			text: this.t("views.pomodoroStats.stats.pomodoros"),
+			text: this.t(msg({ message: "Pomodoros", context: "views.pomodoroStats.stats.pomodoros" })),
 		});
 
 		// Current streak
@@ -399,11 +467,11 @@ export class PomodoroStatsView extends ItemView {
 		});
 		streakCard.createDiv({
 			cls: "stat-value pomodoro-stats-view__stat-value",
-			text: stats.currentStreak.toString(),
+			text: uiNumber(stats.currentStreak),
 		});
 		streakCard.createDiv({
 			cls: "stat-label pomodoro-stats-view__stat-label",
-			text: this.t("views.pomodoroStats.stats.streak"),
+			text: this.t(msg({ message: "Streak", context: "views.pomodoroStats.stats.streak" })),
 		});
 
 		// Total minutes
@@ -412,11 +480,11 @@ export class PomodoroStatsView extends ItemView {
 		});
 		minutesCard.createDiv({
 			cls: "stat-value pomodoro-stats-view__stat-value",
-			text: stats.totalMinutes.toString(),
+			text: uiNumber(stats.totalMinutes),
 		});
 		minutesCard.createDiv({
 			cls: "stat-label pomodoro-stats-view__stat-label",
-			text: this.t("views.pomodoroStats.stats.minutes"),
+			text: this.t(msg({ message: "Minutes", context: "views.pomodoroStats.stats.minutes" })),
 		});
 
 		// Average session length
@@ -425,11 +493,11 @@ export class PomodoroStatsView extends ItemView {
 		});
 		avgCard.createDiv({
 			cls: "stat-value pomodoro-stats-view__stat-value",
-			text: stats.averageSessionLength.toString(),
+			text: uiNumber(stats.averageSessionLength),
 		});
 		avgCard.createDiv({
 			cls: "stat-label pomodoro-stats-view__stat-label",
-			text: this.t("views.pomodoroStats.stats.average"),
+			text: this.t(msg({ message: "Avg length", context: "views.pomodoroStats.stats.average" })),
 		});
 
 		// Completion rate
@@ -438,79 +506,11 @@ export class PomodoroStatsView extends ItemView {
 		});
 		rateCard.createDiv({
 			cls: "stat-value pomodoro-stats-view__stat-value",
-			text: `${stats.completionRate}%`,
+			text: uiPercent(stats.completionRate),
 		});
 		rateCard.createDiv({
 			cls: "stat-label pomodoro-stats-view__stat-label",
-			text: this.t("views.pomodoroStats.stats.completion"),
+			text: this.t(msg({ message: "Completion", context: "views.pomodoroStats.stats.completion" })),
 		});
-	}
-
-	private async calculateStatsForRange(
-		startDate: Date,
-		endDate: Date
-	): Promise<PomodoroHistoryStats> {
-		const history = await this.plugin.pomodoroService.getSessionHistory();
-
-		// Normalize range boundaries to start of day for safe comparison
-		const normalizedStartDate = startOfDay(startDate);
-		const normalizedEndDate = startOfDay(endDate);
-
-		// Filter sessions within date range
-		const rangeSessions = history.filter((session: PomodoroSessionHistory) => {
-			try {
-				// Parse the session timestamp safely and normalize to start of day
-				const sessionTimestamp = parseTimestamp(session.startTime);
-				const sessionDate = startOfDay(sessionTimestamp);
-
-				// Safe date comparison using normalized dates
-				return sessionDate >= normalizedStartDate && sessionDate <= normalizedEndDate;
-			} catch (error) {
-				console.error("Error parsing session timestamp for filtering:", {
-					sessionStartTime: session.startTime,
-					error,
-				});
-				return false; // Exclude sessions with invalid timestamps
-			}
-		});
-
-		return this.calculateStatsFromSessions(rangeSessions);
-	}
-
-	private calculateOverallStats(history: PomodoroSessionHistory[]): PomodoroHistoryStats {
-		return this.calculateStatsFromSessions(history);
-	}
-
-	private calculateStatsFromSessions(sessions: PomodoroSessionHistory[]): PomodoroHistoryStats {
-		// Filter work sessions only
-		const workSessions = sessions.filter((session) => session.type === "work");
-		const completedWork = workSessions.filter((session) => session.completed);
-
-		// Calculate streak from most recent sessions
-		let currentStreak = 0;
-		for (let i = workSessions.length - 1; i >= 0; i--) {
-			if (workSessions[i].completed) {
-				currentStreak++;
-			} else {
-				break;
-			}
-		}
-
-		const totalMinutes = completedWork.reduce(
-			(sum, session) => sum + getSessionDuration(session),
-			0
-		);
-		const averageSessionLength =
-			completedWork.length > 0 ? totalMinutes / completedWork.length : 0;
-		const completionRate =
-			workSessions.length > 0 ? (completedWork.length / workSessions.length) * 100 : 0;
-
-		return {
-			pomodorosCompleted: completedWork.length,
-			currentStreak,
-			totalMinutes,
-			averageSessionLength: Math.round(averageSessionLength),
-			completionRate: Math.round(completionRate),
-		};
 	}
 }

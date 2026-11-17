@@ -6,7 +6,7 @@ TaskNotes supports Google Calendar and Microsoft Calendar integration via OAuth 
 
 To connect calendars, create OAuth credentials with Google and/or Microsoft, then paste them into TaskNotes Integrations settings. The sections below walk through each provider.
 
-![Integrations calendar settings](../media/docs/settings-integrations-calendar.png)
+![Integrations calendar settings](assets/settings-integrations-calendar.png)
 
 ### Google Calendar
 
@@ -16,9 +16,23 @@ To connect calendars, create OAuth credentials with Google and/or Microsoft, the
 
 In [Google Cloud Console](https://console.cloud.google.com), create or select a project, enable the Google Calendar API, and create OAuth 2.0 credentials using the Desktop application type. Then copy the Client ID and Client Secret into TaskNotes (`Settings -> TaskNotes -> Integrations`) and click **Connect Google Calendar**.
 
+If your Google OAuth app is still in testing mode, add the Google account you will connect with under **Google Auth Platform -> Audience -> Test users**. Otherwise Google may block sign-in with a 403 `access_denied` error saying the app has not completed verification.
+
+Google expires the connection of an OAuth app in testing mode 7 days after you connect, so TaskNotes will ask you to reconnect about once a week. To keep the connection, open **Google Auth Platform -> Audience** and click **Publish app** to move it to **In production**. For a personal OAuth app you do not need to submit it for verification: when you next connect, Google shows a "Google hasn't verified this app" screen, where you can choose **Advanced** and continue to your app. Reconnect in TaskNotes after publishing, because connections made in testing mode keep their 7-day limit.
+
 ### Microsoft Calendar
 
-In [Azure Portal](https://portal.azure.com), create an App Registration and then configure loopback redirect support in the manifest by adding:
+In [Azure Portal](https://portal.azure.com), create an App Registration for your Microsoft account type. TaskNotes currently uses Microsoft's `common` OAuth authority, so the app registration must allow the account type you plan to connect through that authority. Tenant-specific single-tenant authorities are not configurable yet.
+
+Under **Authentication**, add the **Mobile and desktop applications** platform and add this redirect URI:
+
+```text
+http://localhost
+```
+
+Also turn on **Allow public client flows**. TaskNotes uses a local loopback callback with a dynamic port, which Microsoft matches against the registered loopback URI.
+
+If Azure does not accept the loopback redirect URI through the normal UI, configure loopback redirect support in the manifest by adding:
 
 ```json
 {
@@ -27,11 +41,13 @@ In [Azure Portal](https://portal.azure.com), create an App Registration and then
 }
 ```
 
-Azure may reject this URI in the normal UI, but accepts it via manifest editing; loopback ports are ignored during matching. Next, add API permissions (`Calendars.Read`, `Calendars.ReadWrite`, and `offline_access`), grant consent when required, and create a client secret. Copy the Application (client) ID and secret value into TaskNotes, then click **Connect Microsoft Calendar**.
+Next, add delegated Microsoft Graph API permissions (`Calendars.Read`, `Calendars.ReadWrite`, and `offline_access`) and grant consent when required by your organization. Copy the Application (client) ID into TaskNotes, then click **Connect Microsoft Calendar**. The client secret field can be left blank for public-client desktop setup.
 
 ## Security Notes
 
-Credentials and tokens are stored locally in your Obsidian data. Tokens refresh automatically, calendar data syncs directly between your vault and provider, and you can disconnect at any time to revoke access.
+OAuth client IDs, client secrets, and account tokens are stored locally in Obsidian Secret Storage, which is encrypted at rest when supported by the operating system. They are not written to TaskNotes' `data.json`. Tokens refresh automatically, calendar data syncs directly between your vault and provider, and you can disconnect at any time to revoke account access.
+
+Secret Storage is local to the Obsidian installation and vault. When setting up TaskNotes on another device, enter the OAuth app credentials and connect the calendar again. After disconnecting, use **Forget saved credentials** if you also want to remove the client ID and client secret.
 
 ## Troubleshooting
 
@@ -39,10 +55,22 @@ Credentials and tokens are stored locally in your Obsidian data. Tokens refresh 
 
 Verify credentials first, then confirm loopback redirect configuration. TaskNotes uses a local callback on `127.0.0.1` with a dynamically selected port. For Microsoft, ensure loopback redirect support is configured in the app registration. Also confirm required permissions/scopes are granted.
 
+For Google 403 `access_denied` errors during sign-in, confirm the account is listed as a test user in the Google Auth Platform audience settings while your OAuth app is in testing mode.
+
+**Google `400 redirect_uri_mismatch`**
+
+Check that the credentials entered in TaskNotes belong to an OAuth client of type **Desktop app**, not **Web application**. TaskNotes uses `http://127.0.0.1:<port>` and the operating system chooses the port for each connection attempt. A Web application client configured with a fixed `8080` redirect may work for one attempt but is not compatible with this dynamic-port setup. A `flowName` query parameter is not part of TaskNotes' callback URI and should not be added as a required redirect.
+
+If a Desktop app client still fails, report your TaskNotes and Obsidian versions, operating system, client application type, and only the `redirect_uri` from Google's error details. Do not post the full authorization URL, client secret, authorization code, state, tokens, or exported settings. Adding a test user addresses testing-mode `403 access_denied`, not a redirect mismatch.
+
 **"Failed to fetch events"**
 
 Disconnect and reconnect to refresh OAuth tokens, then re-check provider-side calendar permissions.
 
 **Connection lost after Obsidian restart**
 
-Tokens should persist between sessions. If reconnection is required each restart, investigate vault or plugin-data file permissions.
+Tokens should persist between sessions. If reconnection is required each restart, check whether Obsidian Secret Storage is available and retaining secrets for the vault.
+
+**Google connection expires after about a week**
+
+If TaskNotes reports that the Google connection expired and you need to reconnect every few days, your Google OAuth app is probably in testing mode. Google limits connections from testing-mode apps to 7 days. Publish the app to **In production** as described in [Google Calendar](#google-calendar), then reconnect.

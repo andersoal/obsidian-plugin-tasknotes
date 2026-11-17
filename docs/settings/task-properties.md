@@ -18,6 +18,8 @@ Each property card contains:
 - **Property-specific settings**: Additional configuration options specific to that property
 This tab defines the task schema used by creation flows, NLP parsing, views, and API payloads.
 
+Property keys are YAML/frontmatter keys. TaskNotes can read and write keys that contain spaces or punctuation, but hand-written Bases filters and formulas must reference those keys with bracket syntax, for example `note["TN-status"]`, rather than dot syntax such as `note.TN-status`.
+
 ## Core Properties
 
 ### Title
@@ -25,11 +27,12 @@ This tab defines the task schema used by creation flows, NLP parsing, views, and
 The task title property. Configuration options:
 
 - **Property key**: Frontmatter field name (default: `title`)
-- **Store title in filename**: When enabled, the task title is stored in the filename instead of frontmatter. The filename updates when the title changes.
+- **Store title in filename**: When enabled, the task title is stored in the filename instead of frontmatter when the filename can represent it. Long, sanitized, or duplicate filenames may require a title property to preserve the full text. Editing titles or other properties preserves the full title whenever the resulting filename cannot represent it exactly. The filename updates when the title changes; if the rename fails, the previous title and properties remain unchanged.
 - **Filename format**: When "Store title in filename" is disabled, choose how filenames are generated:
     - Title-based
     - Zettelkasten-style
     - Timestamp-based
+    - UUID v4
     - Custom template
 - **Custom template**: Define a custom filename pattern using variables (shown when "custom" format is selected)
 
@@ -49,9 +52,13 @@ Each status value has:
 - **Color**: Visual indicator color
 - **Icon**: Optional icon identifier
 - **Completed**: Whether this status represents a finished task
+- **Skip when cycling**: Exclude this status from the click-to-cycle order on task cards while keeping it available in menus, suggestions, and direct edits
+- **Next status**: Optional override for the status used when cycling forward from this status; leave it set to the status order to use the normal sequence. On the first status marked **Completed**, it is also the status a recurring series moves to once an occurrence is finished, and it lets recurring tasks follow the click cycle, when **Reset status after each occurrence** is on under [Features](features.md#recurring-tasks). In new setups, TaskNotes' built-in Done status moves on to Open. See [Recurring Tasks](../features/recurring-tasks.md#completion-tracking)
 - **Auto-archive**: Automatically archive tasks after a delay (1-1440 minutes)
 
 Status cards support drag-and-drop reordering.
+
+Use the **Value** field as the stable stored identifier and the **Label** field for display text with spaces or title casing. TaskNotes status menus and cycling use the configured order, and TaskNotes Kanban views can preserve dragged column order. Native Bases grouping/sorting may still order status values alphabetically by their stored **Value**, so use prefixes such as `1-open`, `2-doing`, `3-done` if you need predictable native Bases order.
 
 #### Boolean Status Values
 
@@ -86,7 +93,7 @@ Each priority value has:
 Priority cards support drag-and-drop reordering.
 Status and priority values are stored in frontmatter; renaming them later may require migration of existing task files.
 
-> **Note for Bases plugin users:** Obsidian's Bases plugin sorts priorities alphabetically by their **Value**. To control sort order, name values to sort alphabetically in the desired order:
+> **Note for Bases plugin users:** Obsidian's Bases plugin sorts the `priority` property alphabetically by its **Value**. To sort in the order of your priority cards, sort by `formula.priorityWeight` in descending order; see [Sort by priority](../guides/custom-bases.md#sort-by-priority). Alternatively, name values to sort alphabetically in the desired order:
 > - Example: `1-urgent`, `2-high`, `3-medium`, `4-normal`, `5-low`
 > - Or: `a-urgent`, `b-high`, `c-medium`, `d-normal`, `e-low`
 
@@ -105,6 +112,9 @@ When to work on the task. Configuration options:
 
 - **Property key**: Frontmatter field name (default: `scheduled`)
 - **Default**: Default scheduled date for new tasks (None, Today, Tomorrow, Next Week)
+
+When you use **Convert current note to task**, this default is also applied if the source note does not already have `scheduled` frontmatter. Choose **None** to keep converted notes unscheduled by default.
+
 `due` tracks commitment deadlines, while `scheduled` tracks intended execution time.
 
 ## Organization Properties
@@ -123,7 +133,8 @@ Projects the task belongs to. Configuration options:
 
 - **Property key**: Frontmatter field name (default: `projects`)
 - **Default projects**: Select project notes to automatically link to new tasks
-- **Use parent note as project**: Automatically link the parent note as a project during instant task conversion
+- **Use active note for new tasks**: Automatically link the active note as a project when opening task creation from the command palette or ribbon
+- **Use parent note for inline/instant conversion**: Automatically link the source note as a project when using inline task creation or instant task conversion
 - **NLP trigger**: Character that triggers project parsing (default: `+`)
 - **Autosuggest Filters**: Expandable section to filter which notes appear in project suggestions
 - **Customize Display**: Expandable section to configure how project suggestions appear
@@ -135,8 +146,12 @@ Control which notes appear when selecting projects:
 - **Required tags**: Comma-separated list of tags (shows notes with ANY of these tags)
 - **Include folders**: Comma-separated list of folder paths (shows notes in ANY of these folders)
 - **Required property key**: Frontmatter property that must exist
-- **Required property value**: Expected value for the property (optional)
-These filters reduce suggestion noise in large vaults.
+- **Required property value**: Optional comma-separated allow-list, such as `active, planned`, or an explicit `containsAny("active", "planned")` expression. Use `!containsAny("completed", "archived")` or `not containsAny("done")` to exclude values. Matching is case-insensitive, including list-valued properties.
+  - Quoted expression arguments can contain commas; escape quotes and backslashes with a backslash. Malformed `containsAny(...)` calls match no notes.
+  - Plain filters remain literal: `not started` and `"active"` keep their original meaning. Negation only applies to explicit `containsAny(...)` calls.
+  - With no value filter, the property only has to exist (empty strings and lists are allowed). With a value filter, missing or null properties, blank strings and empty lists are excluded, including under negation.
+
+These filters reduce suggestion noise in large vaults, including hiding completed or archived projects from the `+` suggestions and project picker. Folder exclusions and suggestion sort order are separate settings/features.
 
 A "Filters On" badge appears when any filters are configured.
 
@@ -172,6 +187,8 @@ Pattern for repeating tasks. Configuration options:
 - **Property key**: Frontmatter field name (default: `recurrence`)
 - **Default**: Default recurrence pattern (None, Daily, Weekly, Monthly, Yearly)
 
+Recurring tasks also use the **Recurrence anchor** metadata property to decide whether the series advances from the scheduled date or the completion date. Materialized occurrence note controls live on each recurring task's context menu under **Recurrence → Occurrence notes** rather than as a global default.
+
 ### Reminders
 
 Notifications before task deadlines. Configuration options:
@@ -204,7 +221,11 @@ These properties are system-managed and typically only require property key conf
 - **Archive Tag**: Tag used to mark archived tasks
 - **Time Entries**: Time tracking entries for the task
 - **Complete Instances**: Completion history for recurring tasks
+- **Skipped Instances**: Skip history for recurring tasks
+- **Recurrence Anchor**: Whether recurring progression is based on scheduled date or completion date
 - **Blocked By**: Tasks that must be completed first
+
+Materialized occurrence notes also use system-managed frontmatter fields such as `recurrence_parent`, `occurrence_date`, `occurrence_materialization`, `occurrence_next_trigger`, and optional occurrence template/horizon fields. Occurrence notes inherit parent planning metadata when they are created, but keep their own status, completion date, and time entries. These fields are documented in the [Property Types Reference](property-types-reference.md#materialized-occurrence-properties) and are normally changed through recurrence and occurrence-note controls instead of by hand.
 
 ## Feature Properties
 
@@ -225,6 +246,12 @@ Define custom frontmatter properties to appear as filter options across views. C
 - **NLP trigger**: Toggle and character for natural language parsing
 - **Autosuggest Filters**: Filter which files appear when using `[[` wikilink autocomplete
 Custom fields are most maintainable when they map to repeated workflow decisions (for example `effort`, `owner`, or `client`).
+
+### Link Values
+
+Use a **Text** custom field for a single link and a **List** custom field for multiple links. Task cards render `[[wikilinks]]`, `[label](https://example.com)`, `<https://example.com>`, and bare `https://example.com` values as clickable links.
+
+Autosuggest filters work with text and list fields when entering `[[` wikilinks, so a field such as `Related Note` can suggest only files from a chosen folder or tag.
 
 ### Default Values
 
@@ -250,7 +277,7 @@ Each custom field can configure filters to control which files appear in wikilin
 - **Required tags**: Comma-separated list of tags (shows files with ANY of these tags)
 - **Include folders**: Comma-separated list of folder paths (shows files in ANY of these folders)
 - **Required property key**: Frontmatter property that must exist
-- **Required property value**: Expected value for the property (optional)
+- **Required property value**: Optional comma-separated allow-list or `containsAny("a", "b")` expression. Prefix the expression with `!` to exclude values, for example `!containsAny("archived")`.
 
 A "Filters On" badge appears when filters are configured.
 

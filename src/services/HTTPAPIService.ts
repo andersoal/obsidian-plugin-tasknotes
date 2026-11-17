@@ -1,16 +1,14 @@
-/* eslint-disable no-console */
-import { createServer, IncomingMessage, ServerResponse, Server } from "http";
-import { parse } from "url";
-import { IWebhookNotifier } from "../types";
+import { IWebhookNotifier, WebhookEvent } from "../types";
 import { TaskService } from "./TaskService";
 import { FilterService } from "./FilterService";
 import { TaskManager } from "../utils/TaskManager";
-import { NaturalLanguageParser } from "./NaturalLanguageParser";
+import { createLivePluginParser } from "./NaturalLanguageParser";
 import { StatusManager } from "./StatusManager";
 import { TaskStatsService } from "./TaskStatsService";
 import TaskNotesPlugin from "../main";
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-import { OpenAPIController } from "../utils/OpenAPIDecorators";
+
+import { generateOpenAPISpec, OpenAPIController } from "../utils/OpenAPIDecorators";
+import type { OpenAPISpec } from "../utils/OpenAPIDecorators";
 import { APIRouter } from "../api/APIRouter";
 import { TasksController } from "../api/TasksController";
 import { TimeTrackingController } from "../api/TimeTrackingController";
@@ -18,13 +16,29 @@ import { PomodoroController } from "../api/PomodoroController";
 import { SystemController } from "../api/SystemController";
 import { WebhookController } from "../api/WebhookController";
 import { CalendarsController } from "../api/CalendarsController";
+import { BasesController } from "../api/BasesController";
 import { MCPService } from "./MCPService";
-import { parseJSONBody, sendJSONResponse, setCORSHeaders } from "../api/httpUtils";
+import {
+	parseJSONBody,
+	resolveLocalCORSOrigin,
+	sendJSONResponse,
+	setCORSHeaders,
+} from "../api/httpUtils";
+import type { HTTPRequestLike, HTTPResponseLike, HTTPServerLike } from "../api/httpTypes";
+import { parseRequestUrl } from "../api/httpTypes";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+import { Platform } from "obsidian";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Services/HTTPAPIService" });
+export const API_BIND_HOST = "127.0.0.1";
+
+type HttpModuleLike = {
+	createServer(handler: (req: HTTPRequestLike, res: HTTPResponseLike) => void): HTTPServerLike;
+};
 
 @OpenAPIController
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
 export class HTTPAPIService implements IWebhookNotifier {
-	private server?: Server;
+	private server?: HTTPServerLike;
 	private plugin: TaskNotesPlugin;
 	private router: APIRouter;
 	private tasksController: TasksController;
@@ -33,6 +47,7 @@ export class HTTPAPIService implements IWebhookNotifier {
 	private systemController: SystemController;
 	private webhookController: WebhookController;
 	private calendarsController: CalendarsController;
+	private basesController: BasesController;
 	private mcpService?: MCPService;
 
 	constructor(
@@ -44,15 +59,11 @@ export class HTTPAPIService implements IWebhookNotifier {
 		this.plugin = plugin;
 
 		// Initialize dependencies
-		const nlParser = new NaturalLanguageParser(
+		const nlParser = createLivePluginParser(plugin);
+		const statusManager = new StatusManager(
 			plugin.settings.customStatuses,
-			plugin.settings.customPriorities,
-			plugin.settings.nlpDefaultToScheduled,
-			plugin.settings.nlpLanguage,
-			plugin.settings.nlpTriggers,
-			plugin.settings.userFields
+			plugin.settings.defaultTaskStatus
 		);
-		const statusManager = new StatusManager(plugin.settings.customStatuses, plugin.settings.defaultTaskStatus);
 		const taskStatsService = new TaskStatsService(cacheManager, statusManager);
 
 		// Initialize controllers
@@ -78,6 +89,7 @@ export class HTTPAPIService implements IWebhookNotifier {
 			plugin.icsSubscriptionService,
 			plugin.calendarProviderRegistry
 		);
+		this.basesController = new BasesController(plugin);
 
 		// Initialize MCP service if enabled
 		if (plugin.settings.enableMCP) {
@@ -105,15 +117,13 @@ export class HTTPAPIService implements IWebhookNotifier {
 		this.router.registerController(this.systemController);
 		this.router.registerController(this.webhookController);
 		this.router.registerController(this.calendarsController);
+		this.router.registerController(this.basesController);
 	}
 
 	/**
 	 * Generate OpenAPI spec from all registered controllers
 	 */
-	generateOpenAPISpec(): any {
-		// eslint-disable-next-line @typescript-eslint/no-require-imports
-		const { generateOpenAPISpec } = require("../utils/OpenAPIDecorators");
-
+	generateOpenAPISpec(): OpenAPISpec {
 		// Get base spec structure
 		const spec = generateOpenAPISpec(this.systemController);
 
@@ -125,6 +135,7 @@ export class HTTPAPIService implements IWebhookNotifier {
 			this.systemController,
 			this.webhookController,
 			this.calendarsController,
+			this.basesController,
 		];
 
 		// Merge paths from all controllers
@@ -147,30 +158,52 @@ export class HTTPAPIService implements IWebhookNotifier {
 		return spec;
 	}
 
-	private async handleCORSPreflight(req: IncomingMessage, res: ServerResponse): Promise<void> {
+	private async handleCORSPreflight(req: HTTPRequestLike, res: HTTPResponseLike): Promise<void> {
 		res.statusCode = 200;
 		setCORSHeaders(res);
 		res.end();
 	}
 
-	private authenticate(req: IncomingMessage): boolean {
-		const authToken = this.plugin.settings.apiAuthToken;
+	private getFallbackCORSOrigin(): string {
+		return `http://${API_BIND_HOST}:${this.plugin.settings.apiPort}`;
+	}
 
-		// Skip auth if no token is configured
-		if (!authToken) {
-			return true;
-		}
+	private getRequestOrigin(req: HTTPRequestLike): string | undefined {
+		const originHeader = req.headers.origin;
+		return Array.isArray(originHeader) ? originHeader[0] : originHeader;
+	}
 
-		const authHeader = req.headers.authorization;
-		if (!authHeader || !authHeader.startsWith("Bearer ")) {
+	private applyCORSPolicy(req: HTTPRequestLike, res: HTTPResponseLike): boolean {
+		const requestOrigin = this.getRequestOrigin(req);
+		const allowOrigin = resolveLocalCORSOrigin(requestOrigin, this.getFallbackCORSOrigin());
+
+		if (!allowOrigin) {
 			return false;
 		}
 
-		const token = authHeader.substring(7);
+		setCORSHeaders(res, { allowOrigin });
+		return true;
+	}
+
+	private authenticate(req: HTTPRequestLike): boolean {
+		const authToken = this.plugin.settings.apiAuthToken;
+
+		// A missing credential never opens an unauthenticated listener.
+		if (!authToken) {
+			return false;
+		}
+
+		const authHeader = req.headers.authorization;
+		const bearerToken = Array.isArray(authHeader) ? authHeader[0] : authHeader;
+		if (!bearerToken || !bearerToken.startsWith("Bearer ")) {
+			return false;
+		}
+
+		const token = bearerToken.substring(7);
 		return token === authToken;
 	}
 
-	private sendResponse(res: ServerResponse, statusCode: number, data: any): void {
+	private sendResponse(res: HTTPResponseLike, statusCode: number, data: unknown): void {
 		sendJSONResponse(res, statusCode, data);
 	}
 
@@ -185,8 +218,15 @@ export class HTTPAPIService implements IWebhookNotifier {
 		return { success: false, error };
 	}
 
-	private async handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+	private async handleRequest(req: HTTPRequestLike, res: HTTPResponseLike): Promise<void> {
 		try {
+			if (!this.applyCORSPolicy(req, res)) {
+				res.statusCode = 403;
+				res.setHeader("Content-Type", "application/json");
+				res.end(JSON.stringify(this.errorResponse("CORS origin is not allowed")));
+				return;
+			}
+
 			// Handle CORS preflight requests
 			if (req.method === "OPTIONS") {
 				await this.handleCORSPreflight(req, res);
@@ -194,8 +234,7 @@ export class HTTPAPIService implements IWebhookNotifier {
 			}
 
 			// Parse URL for authentication check
-			const parsedUrl = parse(req.url || "", true);
-			const pathname = parsedUrl.pathname || "";
+			const pathname = parseRequestUrl(req).pathname;
 
 			// Handle MCP endpoint
 			if (pathname === "/mcp") {
@@ -225,14 +264,18 @@ export class HTTPAPIService implements IWebhookNotifier {
 			if (!handled) {
 				this.sendResponse(res, 404, this.errorResponse("Not found"));
 			}
-		} catch (error: any) {
-			console.error("API Error:", error);
+		} catch (error: unknown) {
+			tasknotesLogger.error("API Error:", {
+				category: "provider",
+				operation: "api",
+				error: error,
+			});
 			this.sendResponse(res, 500, this.errorResponse("Internal server error"));
 		}
 	}
 
 	// Webhook interface implementation - delegate to WebhookController
-	async triggerWebhook(event: any, data: any): Promise<void> {
+	async triggerWebhook(event: WebhookEvent, data: unknown): Promise<void> {
 		await this.webhookController.triggerWebhook(event, data);
 	}
 
@@ -244,33 +287,85 @@ export class HTTPAPIService implements IWebhookNotifier {
 		this.webhookController.syncFromSettings();
 	}
 
-	private parseBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+	private parseBody(req: HTTPRequestLike): Promise<Record<string, unknown>> {
 		return parseJSONBody(req);
 	}
 
+	private starting: Promise<void> | null = null;
+
 	async start(): Promise<void> {
-		return new Promise((resolve, reject) => {
+		if (this.starting) return this.starting;
+		if (this.isRunning()) return;
+		const starting = this.startServer();
+		this.starting = starting;
+		try {
+			await starting;
+		} finally {
+			this.starting = null;
+		}
+	}
+
+	private async startServer(): Promise<void> {
+		if (!Platform.isDesktop || !Platform.isDesktopApp)
+			throw new Error("The HTTP API is only available in the desktop app.");
+		if (!this.plugin.settings.apiAuthToken) {
+			const token = btoa(
+				String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32)))
+			)
+				.replace(/\+/g, "-")
+				.replace(/\//g, "_")
+				.replace(/=+$/g, "");
+			this.plugin.settings.apiAuthToken = token;
 			try {
-				this.server = createServer((req, res) => {
-					this.handleRequest(req, res).catch((error) => {
-						console.error("Request handling error:", error);
-						this.sendResponse(res, 500, this.errorResponse("Internal server error"));
-					});
-				});
-
-				this.server.listen(this.plugin.settings.apiPort, () => {
-					console.log(
-						`TaskNotes API server started on port ${this.plugin.settings.apiPort}`
-					);
-					resolve();
-				});
-
-				this.server.on("error", (err) => {
-					console.error("API server error:", err);
-					reject(err);
-				});
+				await this.plugin.saveSettings();
 			} catch (error) {
-				reject(error);
+				// A retry must persist a credential, not reuse an unsaved one.
+				if (this.plugin.settings.apiAuthToken === token) {
+					this.plugin.settings.apiAuthToken = "";
+				}
+				throw error;
+			}
+		}
+		return new Promise((resolve, reject) => {
+			if (!Platform.isDesktop || !Platform.isDesktopApp) {
+				reject(new Error("The HTTP API is only available in the desktop app."));
+				return;
+			}
+
+			try {
+				if (Platform.isDesktop && Platform.isDesktopApp) {
+					// eslint-disable-next-line @typescript-eslint/no-require-imports -- The guarded desktop path lazy-loads Node's HTTP server.
+					const http = require("http") as HttpModuleLike;
+					this.server = http.createServer((req, res) => {
+						this.handleRequest(req, res).catch((error) => {
+							tasknotesLogger.error("Request handling error:", {
+								category: "provider",
+								operation: "request-handling",
+								error: error,
+							});
+							this.sendResponse(
+								res,
+								500,
+								this.errorResponse("Internal server error")
+							);
+						});
+					});
+
+					this.server.listen(this.plugin.settings.apiPort, API_BIND_HOST, () => {
+						resolve();
+					});
+
+					this.server.on("error", (err) => {
+						tasknotesLogger.error("API server error:", {
+							category: "provider",
+							operation: "api-server",
+							error: err,
+						});
+						reject(err);
+					});
+				}
+			} catch (error) {
+				reject(error instanceof Error ? error : new Error(String(error)));
 			}
 		});
 	}
@@ -279,7 +374,6 @@ export class HTTPAPIService implements IWebhookNotifier {
 		return new Promise((resolve) => {
 			if (this.server) {
 				this.server.close(() => {
-					console.log("TaskNotes API server stopped");
 					resolve();
 				});
 			} else {
@@ -289,7 +383,7 @@ export class HTTPAPIService implements IWebhookNotifier {
 	}
 
 	isRunning(): boolean {
-		return !!this.server && this.server.listening;
+		return this.server?.listening === true;
 	}
 
 	getPort(): number {

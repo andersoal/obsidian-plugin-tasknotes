@@ -1,20 +1,35 @@
-/* eslint-disable no-console */
-import { ItemView } from "obsidian";
-import {
-	ViewPerformanceService,
-	ViewPerformanceConfig,
-	ViewUpdateHandler,
-} from "../services/ViewPerformanceService";
 import { TaskInfo, TimeEntry } from "../types";
 import TaskNotesPlugin from "../main";
+import { createTaskNotesLogger } from "./tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Utils/ViewOptimizations" });
+
+export interface ViewPerformanceConfig {
+	viewId: string;
+	debounceDelay?: number;
+	maxBatchSize?: number;
+	changeDetectionEnabled?: boolean;
+}
+
+export interface ViewUpdateHandler {
+	updateForTask: (taskPath: string, operation: "update" | "delete" | "create") => Promise<void>;
+	refresh: (force?: boolean) => Promise<void>;
+	shouldRefreshForTask?: (originalTask: TaskInfo | undefined, updatedTask: TaskInfo) => boolean;
+}
+
+interface ViewPerformanceRegistry {
+	registerView(config: ViewPerformanceConfig, handler: ViewUpdateHandler): void;
+	unregisterView(viewId: string): void;
+}
 
 /**
  * Mixin interface for views that want performance optimizations
  */
 export interface OptimizedView {
 	plugin: TaskNotesPlugin;
-	viewPerformanceService?: ViewPerformanceService;
+	viewPerformanceService?: ViewPerformanceRegistry;
 	performanceConfig?: ViewPerformanceConfig;
+	getViewType(): string;
 
 	// Methods that implementing views should provide
 	updateForTask(taskPath: string, operation: "update" | "delete" | "create"): Promise<void>;
@@ -26,7 +41,7 @@ export interface OptimizedView {
  * Initialize performance optimizations for a view
  */
 export function initializeViewPerformance(
-	view: OptimizedView & ItemView,
+	view: OptimizedView,
 	config: Partial<ViewPerformanceConfig>
 ): void {
 	const fullConfig: ViewPerformanceConfig = {
@@ -49,8 +64,9 @@ export function initializeViewPerformance(
 
 		view.viewPerformanceService.registerView(fullConfig, handler);
 	} else {
-		console.warn(
-			`[ViewOptimizations] ViewPerformanceService not available for ${fullConfig.viewId}`
+		tasknotesLogger.warn(
+			`[ViewOptimizations] ViewPerformanceService not available for ${fullConfig.viewId}`,
+			{ category: "stale-data", operation: "viewperformanceservice-not" }
 		);
 	}
 }
@@ -58,7 +74,7 @@ export function initializeViewPerformance(
 /**
  * Cleanup performance optimizations when view is closed
  */
-export function cleanupViewPerformance(view: OptimizedView & ItemView): void {
+export function cleanupViewPerformance(view: OptimizedView): void {
 	if (view.viewPerformanceService && view.performanceConfig) {
 		view.viewPerformanceService.unregisterView(view.performanceConfig.viewId);
 	}
@@ -113,13 +129,20 @@ export function shouldRefreshForPropertyBasedView(
  * This can be used by TaskListView, KanbanView, etc.
  */
 export async function selectiveUpdateForListView(
-	view: ItemView & { taskElements?: Map<string, HTMLElement>; plugin: TaskNotesPlugin },
+	view: {
+		taskElements?: Map<string, HTMLElement>;
+		plugin: TaskNotesPlugin;
+		getCurrentVisibleProperties?: () => string[];
+		getVisibleProperties?: () => string[];
+		getVisiblePropertyLabels?: () => Record<string, string>;
+		refresh?: () => void | Promise<void>;
+	},
 	taskPath: string,
 	operation: "update" | "delete" | "create"
 ): Promise<void> {
 	if (!view.taskElements) {
 		// Fallback to full refresh if view doesn't have taskElements tracking
-		await (view as any).refresh?.();
+		await view.refresh?.();
 		return;
 	}
 
@@ -132,18 +155,21 @@ export async function selectiveUpdateForListView(
 				const updatedTask = await view.plugin.cacheManager.getTaskInfo(taskPath);
 				if (updatedTask) {
 					// Get visible properties from the view instead of extracting from DOM
-					const visibleProperties = (view as any).getCurrentVisibleProperties?.() || [
-						"due",
-						"scheduled",
-						"projects",
-						"contexts",
-						"tags",
-					];
+					const visibleProperties = view.getCurrentVisibleProperties?.() ||
+						view.getVisibleProperties?.() || [
+							"due",
+							"scheduled",
+							"projects",
+							"contexts",
+							"tags",
+						];
+					const propertyLabels = view.getVisiblePropertyLabels?.();
 					await updateTaskElementInPlace(
 						taskElement,
 						updatedTask,
 						view.plugin,
-						visibleProperties
+						visibleProperties,
+						propertyLabels
 					);
 				} else {
 					// Task was deleted, remove from view
@@ -164,7 +190,7 @@ export async function selectiveUpdateForListView(
 		case "create":
 			// For new tasks, we generally need to check if they should be visible
 			// This is view-specific, so fallback to refresh for now
-			await (view as any).refresh?.();
+			await view.refresh?.();
 			break;
 	}
 }
@@ -176,13 +202,14 @@ async function updateTaskElementInPlace(
 	element: HTMLElement,
 	taskInfo: TaskInfo,
 	plugin: TaskNotesPlugin,
-	visibleProperties: string[]
+	visibleProperties: string[],
+	propertyLabels?: Record<string, string>
 ): Promise<void> {
 	try {
 		// Use the existing updateTaskCard function if available
 		const { updateTaskCard } = await import("../ui/TaskCard");
 
-		updateTaskCard(element, taskInfo, plugin, visibleProperties);
+		updateTaskCard(element, taskInfo, plugin, visibleProperties, { propertyLabels });
 
 		// Add update animation
 		element.classList.add("task-card--updated");
@@ -190,11 +217,14 @@ async function updateTaskElementInPlace(
 			element.classList.remove("task-card--updated");
 		}, 1000);
 	} catch (error) {
-		console.error("[ViewOptimizations] Error updating task element in place:", error);
+		tasknotesLogger.error("[ViewOptimizations] Error updating task element in place:", {
+			category: "persistence",
+			operation: "updating-task-element-place",
+			error: error,
+		});
 		// Could fallback to full refresh here if needed
 	}
 }
-
 
 /**
  * Performance monitoring utility for debugging
@@ -212,10 +242,6 @@ export class ViewPerformanceMonitor {
 
 		const elapsed = performance.now() - startTime;
 		this.startTimes.delete(operation);
-
-		if (elapsed > logThreshold) {
-			console.log(`[Performance] ${operation} took ${elapsed.toFixed(2)}ms`);
-		}
 
 		return elapsed;
 	}

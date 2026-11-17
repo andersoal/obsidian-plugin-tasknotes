@@ -1,15 +1,27 @@
-import { normalizePath, TFile, Vault, App, parseYaml, stringifyYaml } from "obsidian";
+import { taskInfoTitle } from "../i18n/taskInfoTitle";
+import { uiDuration } from "../i18n/formatters";
+import { uiData } from "../i18n/dataText";
+import { recurrenceDisplayText } from "../i18n/recurrence";
+import {
+	normalizePath,
+	TFile,
+	Vault,
+	App,
+	parseYaml,
+	stringifyYaml,
+	getFrontMatterInfo,
+} from "obsidian";
 import { format } from "date-fns";
 import { TimeInfo, TaskInfo, TimeEntry, TimeBlock, DailyNoteFrontmatter } from "../types";
-import { FieldMapper } from "../services/FieldMapper";
-import { DEFAULT_FIELD_MAPPING } from "../settings/defaults";
+import { FieldMapper } from "../core/FieldMapper";
+import { DEFAULT_FIELD_MAPPING } from "../core/defaultFieldMapping";
 import {
 	addDTSTARTToRecurrenceRule as addDTSTARTToRecurrenceRuleCore,
 	addDTSTARTToRecurrenceRuleWithDraggedTime as addDTSTARTToRecurrenceRuleWithDraggedTimeCore,
 	generateRecurringInstances as generateRecurringInstancesCore,
 	getEffectiveTaskStatus as getEffectiveTaskStatusCore,
+	getFiniteRecurringInstanceCount as getFiniteRecurringInstanceCountCore,
 	getNextUncompletedOccurrence as getNextUncompletedOccurrenceCore,
-	getRecurrenceDisplayText as getRecurrenceDisplayTextCore,
 	getRecurringTaskCompletionText as getRecurringTaskCompletionTextCore,
 	isDueByRRule as isDueByRRuleCore,
 	shouldShowRecurringTaskOnDate as shouldShowRecurringTaskOnDateCore,
@@ -17,32 +29,47 @@ import {
 	updateDTSTARTInRecurrenceRule as updateDTSTARTInRecurrenceRuleCore,
 	updateToNextScheduledOccurrence as updateToNextScheduledOccurrenceCore,
 } from "../core/recurrence";
-import {
-	getTodayString,
-	parseDateToLocal,
-	formatDateForStorage,
-	isBeforeDateSafe as _isBeforeDateSafe,
-	getTodayLocal as _getTodayLocal,
-} from "./dateUtils";
+import { combineDateAndTime, parseDateToLocal } from "./dateUtils";
+import { normalizeFrontmatterTag } from "./taskIdentificationFrontmatter";
+import { normalizeThemeColor } from "./themeColors";
+import { createTaskNotesLogger } from "./tasknotesLogger";
+import { modifyVaultFile } from "../core/VaultMutationService";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Utils/Helpers" });
+
+type ObsidianMoment = import("moment").Moment;
+
+type WindowWithMoment = Window & {
+	moment(input?: string | Date): ObsidianMoment;
+};
+
+type DailyNoteFrontmatterWithTimeblocks = DailyNoteFrontmatter & {
+	timeblocks?: TimeBlock[];
+};
+
+const MINUTES_PER_DAY = 24 * 60;
+
+function getWindowMoment(input?: string | Date): ObsidianMoment {
+	return (window as unknown as WindowWithMoment).moment(input);
+}
 
 /**
  * Extracts frontmatter from a markdown file content using Obsidian's native parser
  */
-function extractFrontmatter(content: string): any {
-	if (!content.startsWith("---")) {
+function extractFrontmatter(content: string): unknown {
+	const info = getFrontMatterInfo(content);
+	if (!info.exists) {
 		return {};
 	}
 
-	const endOfFrontmatter = content.indexOf("---", 3);
-	if (endOfFrontmatter === -1) {
-		return {};
-	}
-
-	const frontmatterText = content.substring(3, endOfFrontmatter);
 	try {
-		return parseYaml(frontmatterText) || {};
+		return parseYaml(info.frontmatter) || {};
 	} catch (error) {
-		console.error("Error parsing frontmatter:", error);
+		tasknotesLogger.error("Error parsing frontmatter:", {
+			category: "validation",
+			operation: "parsing-frontmatter",
+			error: error,
+		});
 		return {};
 	}
 }
@@ -80,11 +107,11 @@ export async function ensureFolderExists(vault: Vault, folderPath: string): Prom
 	} catch (error) {
 		const errorMessage = error instanceof Error ? error.message : String(error);
 		const stack = error instanceof Error ? error.stack : undefined;
-		console.error("Error creating folder structure:", {
+		tasknotesLogger.error("Error creating folder structure:", {
+			category: "internal",
+			operation: "creating-folder-structure",
+			details: { stack, folderPath, normalizedPath: normalizePath(folderPath) },
 			error: errorMessage,
-			stack,
-			folderPath,
-			normalizedPath: normalizePath(folderPath),
 		});
 
 		// Create enhanced error with preserved context
@@ -106,13 +133,21 @@ export function calculateDuration(startTime: string, endTime: string): number {
 
 		// Validate dates
 		if (isNaN(start.getTime()) || isNaN(end.getTime())) {
-			console.error("Invalid timestamps for duration calculation:", { startTime, endTime });
+			tasknotesLogger.error("Invalid timestamps for duration calculation:", {
+				category: "validation",
+				operation: "invalid-timestamps-duration-calculation",
+				details: { startTime, endTime },
+			});
 			return 0;
 		}
 
 		// Ensure end is after start
 		if (end <= start) {
-			console.error("End time is not after start time:", { startTime, endTime });
+			tasknotesLogger.error("End time is not after start time:", {
+				category: "internal",
+				operation: "end-time-not-start-time",
+				details: { startTime, endTime },
+			});
 			return 0;
 		}
 
@@ -122,7 +157,12 @@ export function calculateDuration(startTime: string, endTime: string): number {
 
 		return Math.max(0, durationMinutes); // Ensure non-negative
 	} catch (error) {
-		console.error("Error calculating duration:", error, { startTime, endTime });
+		tasknotesLogger.error("Error calculating duration:", {
+			category: "internal",
+			operation: "calculating-duration",
+			details: { startTime, endTime },
+			error: error,
+		});
 		return 0;
 	}
 }
@@ -161,16 +201,7 @@ export function getActiveTimeEntry(timeEntries: TimeEntry[]): TimeEntry | null {
  * Format time in minutes to a readable string (e.g., "1h 30m", "45m")
  */
 export function formatTime(minutes: number): string {
-	if (!minutes || minutes === 0 || isNaN(minutes)) {
-		return "0m";
-	}
-
-	const hours = Math.floor(minutes / 60);
-	const mins = minutes % 60;
-
-	if (hours === 0) return `${mins}m`;
-	if (mins === 0) return `${hours}h`;
-	return `${hours}h ${mins}m`;
+	return uiDuration(Number.isFinite(minutes) ? minutes : 0);
 }
 
 /**
@@ -189,7 +220,11 @@ export function parseTime(timeStr: string): TimeInfo | null {
 		}
 		return null;
 	} catch (error) {
-		console.error("Error parsing time string:", error);
+		tasknotesLogger.error("Error parsing time string:", {
+			category: "internal",
+			operation: "parsing-time-string",
+			error: error,
+		});
 		return null;
 	}
 }
@@ -228,6 +263,22 @@ export function calculateDefaultDate(
 	return format(targetDate, "yyyy-MM-dd");
 }
 
+function isDefaultTime(value: string | undefined): value is string {
+	return typeof value === "string" && /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
+}
+
+export function calculateDefaultDateTime(
+	defaultOption: "none" | "today" | "tomorrow" | "next-week",
+	defaultTime?: string
+): string {
+	const date = calculateDefaultDate(defaultOption);
+	if (!date || !isDefaultTime(defaultTime)) {
+		return date;
+	}
+
+	return combineDateAndTime(date, defaultTime);
+}
+
 /**
  * Checks if two dates are the same day using UTC methods for consistency
  */
@@ -262,8 +313,8 @@ export function extractTaskInfo(
 
 			// Ensure required fields have defaults
 			const taskInfo: TaskInfo = {
-				title: mappedTask.title || "Untitled task",
-				status: mappedTask.status || (defaultStatus || "open"),
+				title: taskInfoTitle(mappedTask.title),
+				status: mappedTask.status || defaultStatus || "open",
 				priority: mappedTask.priority || "normal",
 				due: mappedTask.due,
 				scheduled: mappedTask.scheduled,
@@ -272,6 +323,7 @@ export function extractTaskInfo(
 				tags: mappedTask.tags || [],
 				contexts: mappedTask.contexts || [],
 				projects: mappedTask.projects || [],
+				attachments: mappedTask.attachments || [],
 				recurrence: mappedTask.recurrence,
 				complete_instances: mappedTask.complete_instances,
 				completedDate: mappedTask.completedDate,
@@ -289,8 +341,8 @@ export function extractTaskInfo(
 			const mappedTask = defaultMapper.mapFromFrontmatter(yaml, path, storeTitleInFilename);
 
 			return {
-				title: mappedTask.title || "Untitled task",
-				status: mappedTask.status || (defaultStatus || "open"),
+				title: taskInfoTitle(mappedTask.title),
+				status: mappedTask.status || defaultStatus || "open",
 				priority: mappedTask.priority || "normal",
 				due: mappedTask.due,
 				scheduled: mappedTask.scheduled,
@@ -299,6 +351,7 @@ export function extractTaskInfo(
 				tags: mappedTask.tags || [],
 				contexts: mappedTask.contexts || [],
 				projects: mappedTask.projects || [],
+				attachments: mappedTask.attachments || [],
 				recurrence: mappedTask.recurrence,
 				complete_instances: mappedTask.complete_instances,
 				completedDate: mappedTask.completedDate,
@@ -312,7 +365,7 @@ export function extractTaskInfo(
 	}
 
 	// Fallback to basic info from filename
-	const filename = path.split("/").pop()?.replace(".md", "") || "Untitled";
+	const filename = taskInfoTitle(path.split("/").pop()?.replace(".md", ""));
 	return {
 		title: filename,
 		status: defaultStatus || "open",
@@ -386,7 +439,11 @@ export function isDueByRRule(task: TaskInfo, date: Date): boolean {
 /**
  * Gets the effective status of a task, considering recurrence
  */
-export function getEffectiveTaskStatus(task: any, date: Date, completedStatus?: string): string {
+export function getEffectiveTaskStatus(
+	task: TaskInfo,
+	date: Date,
+	completedStatus?: string
+): string {
 	return getEffectiveTaskStatusCore(task, date, completedStatus);
 }
 
@@ -418,6 +475,10 @@ export function generateRecurringInstances(task: TaskInfo, startDate: Date, endD
 	return generateRecurringInstancesCore(task, startDate, endDate);
 }
 
+export function getFiniteRecurringInstanceCount(task: TaskInfo): number | null {
+	return getFiniteRecurringInstanceCountCore(task);
+}
+
 /**
  * Calculates the next uncompleted occurrence for a recurring task
  * Returns null if no future occurrences exist
@@ -443,7 +504,7 @@ export function updateToNextScheduledOccurrence(
  * Converts rrule string to human-readable text
  */
 export function getRecurrenceDisplayText(recurrence: string): string {
-	return getRecurrenceDisplayTextCore(recurrence);
+	return recurrenceDisplayText(recurrence);
 }
 
 /**
@@ -462,7 +523,7 @@ export function extractNoteInfo(
 	createdDate?: string;
 	lastModified?: number;
 } | null {
-	let title = path.split("/").pop()?.replace(".md", "") || "Untitled";
+	let title = path.split("/").pop()?.replace(".md", "") || "";
 	let tags: string[] = [];
 	let createdDate: string | undefined = undefined;
 	let lastModified: number | undefined = file?.stat.mtime;
@@ -499,7 +560,7 @@ export function extractNoteInfo(
 	}
 
 	// Look for first heading in the content as a fallback title
-	if (title === "Untitled") {
+	if (!title || title === uiData("Untitled", "Canonical Obsidian filename seed, never a translated display sentinel")) {
 		const headingMatch = content.match(/^#\s+(.+)$/m);
 		if (headingMatch && headingMatch[1]) {
 			title = headingMatch[1].trim();
@@ -526,7 +587,11 @@ export function extractNoteInfo(
 					createdDate = format(date, "yyyy-MM-dd");
 				}
 			} catch (e) {
-				console.error(`Error parsing date ${createdDate}:`, e);
+				tasknotesLogger.error(`Error parsing date ${createdDate}:`, {
+					category: "validation",
+					operation: "parsing-date",
+					error: e,
+				});
 			}
 		}
 	}
@@ -537,51 +602,68 @@ export function extractNoteInfo(
 /**
  * Validates a timeblock object against the expected schema
  */
-export function validateTimeBlock(timeblock: any): timeblock is TimeBlock {
+function parseTimeBlockMinutes(time: string, allowEndOfDay = false): number | null {
+	if (allowEndOfDay && time === "24:00") {
+		return MINUTES_PER_DAY;
+	}
+
+	const match = /^([0-1]?[0-9]|2[0-3]):([0-5][0-9])$/.exec(time);
+	if (!match) {
+		return null;
+	}
+
+	return Number(match[1]) * 60 + Number(match[2]);
+}
+
+function getNextDateString(date: string): string {
+	const nextDate = parseDateToLocal(date);
+	nextDate.setDate(nextDate.getDate() + 1);
+	return format(nextDate, "yyyy-MM-dd");
+}
+
+export function validateTimeBlock(timeblock: unknown): timeblock is TimeBlock {
 	if (!timeblock || typeof timeblock !== "object") {
 		return false;
 	}
+	const block = timeblock as Partial<TimeBlock>;
 
 	// Required fields
-	if (!timeblock.id || typeof timeblock.id !== "string") {
+	if (!block.id || typeof block.id !== "string") {
 		return false;
 	}
 
-	if (!timeblock.title || typeof timeblock.title !== "string") {
+	if (!block.title || typeof block.title !== "string") {
 		return false;
 	}
 
-	if (!timeblock.startTime || typeof timeblock.startTime !== "string") {
+	if (!block.startTime || typeof block.startTime !== "string") {
 		return false;
 	}
 
-	if (!timeblock.endTime || typeof timeblock.endTime !== "string") {
+	if (!block.endTime || typeof block.endTime !== "string") {
 		return false;
 	}
 
-	// Validate time format (HH:MM)
-	const timeRegex = /^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/;
-	if (!timeRegex.test(timeblock.startTime) || !timeRegex.test(timeblock.endTime)) {
+	const startMinutes = parseTimeBlockMinutes(block.startTime);
+	const parsedEndMinutes = parseTimeBlockMinutes(block.endTime, true);
+	if (startMinutes === null || parsedEndMinutes === null) {
 		return false;
 	}
 
-	// Ensure end time is after start time
-	const [startHour, startMin] = timeblock.startTime.split(":").map(Number);
-	const [endHour, endMin] = timeblock.endTime.split(":").map(Number);
-	const startMinutes = startHour * 60 + startMin;
-	const endMinutes = endHour * 60 + endMin;
+	const endMinutes =
+		block.endTime === "00:00" && startMinutes > 0 ? MINUTES_PER_DAY : parsedEndMinutes;
 
 	if (endMinutes <= startMinutes) {
 		return false;
 	}
 
 	// Optional fields validation
-	if (timeblock.attachments && !Array.isArray(timeblock.attachments)) {
+	if (block.attachments && !Array.isArray(block.attachments)) {
 		return false;
 	}
 
-	if (timeblock.attachments) {
-		for (const attachment of timeblock.attachments) {
+	if (block.attachments) {
+		for (const attachment of block.attachments) {
 			if (typeof attachment !== "string") {
 				return false;
 			}
@@ -593,11 +675,11 @@ export function validateTimeBlock(timeblock: any): timeblock is TimeBlock {
 		}
 	}
 
-	if (timeblock.color && typeof timeblock.color !== "string") {
+	if (block.color && typeof block.color !== "string") {
 		return false;
 	}
 
-	if (timeblock.description && typeof timeblock.description !== "string") {
+	if (block.description && typeof block.description !== "string") {
 		return false;
 	}
 
@@ -621,13 +703,21 @@ export function extractTimeblocksFromNote(content: string, path: string): TimeBl
 			if (validateTimeBlock(timeblock)) {
 				validTimeblocks.push(timeblock);
 			} else {
-				console.warn(`Invalid timeblock in ${path}:`, timeblock);
+				tasknotesLogger.warn(`Invalid timeblock in ${path}:`, {
+					category: "validation",
+					operation: "invalid-timeblock",
+					details: { value: timeblock },
+				});
 			}
 		}
 
 		return validTimeblocks;
 	} catch (error) {
-		console.error(`Error extracting timeblocks from ${path}:`, error);
+		tasknotesLogger.error(`Error extracting timeblocks from ${path}:`, {
+			category: "internal",
+			operation: "extracting-timeblocks",
+			error: error,
+		});
 		return [];
 	}
 }
@@ -636,11 +726,22 @@ export function extractTimeblocksFromNote(content: string, path: string): TimeBl
  * Converts a timeblock to a calendar event format
  * Uses proper timezone handling following UTC Anchor pattern to prevent date shift issues
  */
-export function timeblockToCalendarEvent(timeblock: TimeBlock, date: string, defaultColor = "#6366f1"): any {
+export function timeblockToCalendarEvent(
+	timeblock: TimeBlock,
+	date: string,
+	defaultColor = "#6366f1"
+): unknown {
 	// Create datetime strings that FullCalendar interprets consistently
 	// Using date-only format ensures the timeblock appears on the correct day
 	const startDateTime = `${date}T${timeblock.startTime}:00`;
-	const endDateTime = `${date}T${timeblock.endTime}:00`;
+	const startMinutes = parseTimeBlockMinutes(timeblock.startTime);
+	const endsAtNextMidnight =
+		timeblock.endTime === "24:00" ||
+		(timeblock.endTime === "00:00" && startMinutes !== null && startMinutes > 0);
+	const endDateTime = endsAtNextMidnight
+		? `${getNextDateString(date)}T00:00:00`
+		: `${date}T${timeblock.endTime}:00`;
+	const eventColor = normalizeThemeColor(timeblock.color || defaultColor, "#6366f1");
 
 	return {
 		id: `timeblock-${timeblock.id}`,
@@ -648,8 +749,8 @@ export function timeblockToCalendarEvent(timeblock: TimeBlock, date: string, def
 		start: startDateTime,
 		end: endDateTime,
 		allDay: false,
-		backgroundColor: timeblock.color || defaultColor,
-		borderColor: timeblock.color || defaultColor,
+		backgroundColor: eventColor,
+		borderColor: eventColor,
 		editable: true, // Enable drag and drop for timeblocks
 		eventType: "timeblock", // Mark as timeblock for FullCalendar
 		extendedProps: {
@@ -671,10 +772,27 @@ export function generateTimeblockId(): string {
 }
 
 /**
+ * Creates a copied timeblock with a fresh ID and updated time range.
+ */
+export function createCopiedTimeblock(
+	timeblock: TimeBlock,
+	newStartTime: string,
+	newEndTime: string
+): TimeBlock {
+	return {
+		...timeblock,
+		id: generateTimeblockId(),
+		startTime: newStartTime,
+		endTime: newEndTime,
+		attachments: timeblock.attachments ? [...timeblock.attachments] : undefined,
+	};
+}
+
+/**
  * Updates a timeblock in a daily note's frontmatter
  */
 export async function updateTimeblockInDailyNote(
-	app: any,
+	app: App,
 	timeblockId: string,
 	oldDate: string,
 	newDate: string,
@@ -692,7 +810,7 @@ export async function updateTimeblockInDailyNote(
 	const allDailyNotes = getAllDailyNotes();
 
 	// Get the timeblock from the old date
-	const oldMoment = (window as any).moment(oldDate);
+	const oldMoment = getWindowMoment(oldDate);
 	const oldDailyNote = getDailyNote(oldMoment, allDailyNotes);
 
 	if (!oldDailyNote) {
@@ -730,24 +848,40 @@ export async function updateTimeblockInDailyNote(
 }
 
 /**
+ * Copies a timeblock into a daily note with a new ID and time range.
+ */
+export async function copyTimeblockToDailyNote(
+	app: App,
+	date: string,
+	timeblock: TimeBlock,
+	newStartTime: string,
+	newEndTime: string
+): Promise<TimeBlock> {
+	const copiedTimeblock = createCopiedTimeblock(timeblock, newStartTime, newEndTime);
+	await addTimeblockToDailyNote(app, date, copiedTimeblock);
+	return copiedTimeblock;
+}
+
+/**
  * Updates timeblock times within the same daily note
  */
 async function updateTimeblockTimes(
-	app: any,
-	dailyNote: any,
+	app: App,
+	dailyNote: TFile,
 	timeblockId: string,
 	newStartTime: string,
 	newEndTime: string
 ): Promise<void> {
 	const content = await app.vault.read(dailyNote);
-	const frontmatter = extractFrontmatter(content) || {};
+	const frontmatter =
+		(extractFrontmatter(content) as DailyNoteFrontmatterWithTimeblocks | null) || {};
 
 	if (!frontmatter.timeblocks || !Array.isArray(frontmatter.timeblocks)) {
 		throw new Error("No timeblocks found in frontmatter");
 	}
 
 	// Update the timeblock
-	const timeblockIndex = frontmatter.timeblocks.findIndex((tb: any) => tb.id === timeblockId);
+	const timeblockIndex = frontmatter.timeblocks.findIndex((tb) => tb.id === timeblockId);
 	if (timeblockIndex === -1) {
 		throw new Error(`Timeblock ${timeblockId} not found`);
 	}
@@ -763,19 +897,20 @@ async function updateTimeblockTimes(
  * Removes a timeblock from a daily note
  */
 async function removeTimeblockFromDailyNote(
-	app: any,
-	dailyNote: any,
+	app: App,
+	dailyNote: TFile,
 	timeblockId: string
 ): Promise<void> {
 	const content = await app.vault.read(dailyNote);
-	const frontmatter = extractFrontmatter(content) || {};
+	const frontmatter =
+		(extractFrontmatter(content) as DailyNoteFrontmatterWithTimeblocks | null) || {};
 
 	if (!frontmatter.timeblocks || !Array.isArray(frontmatter.timeblocks)) {
 		return; // No timeblocks to remove
 	}
 
 	// Remove the timeblock
-	frontmatter.timeblocks = frontmatter.timeblocks.filter((tb: any) => tb.id !== timeblockId);
+	frontmatter.timeblocks = frontmatter.timeblocks.filter((tb) => tb.id !== timeblockId);
 
 	// Save back to file
 	await updateDailyNoteFrontmatter(app, dailyNote, frontmatter, content);
@@ -785,7 +920,7 @@ async function removeTimeblockFromDailyNote(
  * Adds a timeblock to a daily note (creating the note if needed)
  */
 async function addTimeblockToDailyNote(
-	app: any,
+	app: App,
 	date: string,
 	timeblock: TimeBlock
 ): Promise<void> {
@@ -793,7 +928,7 @@ async function addTimeblockToDailyNote(
 		"obsidian-daily-notes-interface"
 	);
 
-	const moment = (window as any).moment(date);
+	const moment = getWindowMoment(date);
 	const allDailyNotes = getAllDailyNotes();
 	let dailyNote = getDailyNote(moment, allDailyNotes);
 
@@ -816,7 +951,8 @@ async function addTimeblockToDailyNote(
 	}
 
 	const content = await app.vault.read(dailyNote);
-	const frontmatter = extractFrontmatter(content) || {};
+	const frontmatter =
+		(extractFrontmatter(content) as DailyNoteFrontmatterWithTimeblocks | null) || {};
 
 	if (!frontmatter.timeblocks) {
 		frontmatter.timeblocks = [];
@@ -832,28 +968,25 @@ async function addTimeblockToDailyNote(
  * Updates daily note frontmatter while preserving body content
  */
 async function updateDailyNoteFrontmatter(
-	app: any,
-	dailyNote: any,
-	frontmatter: any,
+	app: App,
+	dailyNote: TFile,
+	frontmatter: DailyNoteFrontmatterWithTimeblocks,
 	originalContent: string
 ): Promise<void> {
-	// Get body content (everything after frontmatter)
-	let bodyContent = originalContent;
-	if (originalContent.startsWith("---")) {
-		const endOfFrontmatter = originalContent.indexOf("---", 3);
-		if (endOfFrontmatter !== -1) {
-			bodyContent = originalContent.substring(endOfFrontmatter + 3);
-		}
-	}
+	// Get body content (everything after frontmatter), using Obsidian's own fence
+	// detection so a `---` inside a frontmatter value can't be mistaken for the
+	// closing fence.
+	const info = getFrontMatterInfo(originalContent);
+	const body = info.exists ? originalContent.slice(info.contentStart) : originalContent;
 
 	// Convert frontmatter back to YAML
 	const frontmatterText = stringifyYaml(frontmatter);
 
 	// Reconstruct file content
-	const newContent = `---\n${frontmatterText}---${bodyContent}`;
+	const newContent = `---\n${frontmatterText}---\n${body}`;
 
 	// Write back to file
-	await app.vault.modify(dailyNote, newContent);
+	await modifyVaultFile(app, dailyNote, newContent);
 
 	// Native metadata cache will automatically update
 }
@@ -904,10 +1037,7 @@ export function addDTSTARTToRecurrenceRule(task: TaskInfo): string | null {
  * @param dateStr - Date string in YYYY-MM-DD format (or with time component)
  * @returns Updated RRULE string with new DTSTART, or null on error
  */
-export function updateDTSTARTInRecurrenceRule(
-	recurrence: string,
-	dateStr: string
-): string | null {
+export function updateDTSTARTInRecurrenceRule(recurrence: string, dateStr: string): string | null {
 	return updateDTSTARTInRecurrenceRuleCore(recurrence, dateStr);
 }
 
@@ -925,7 +1055,7 @@ export function addDTSTARTToRecurrenceRuleWithDraggedTime(
 }
 
 /**
- * Sanitizes tag input by removing # prefixes to prevent duplicate tags
+ * Sanitizes tag input by removing # prefixes and whitespace inside tag names
  * Handles both single tags and comma-separated lists
  */
 export function sanitizeTags(tags: string): string {
@@ -935,11 +1065,7 @@ export function sanitizeTags(tags: string): string {
 
 	return tags
 		.split(",")
-		.map((tag) => {
-			const trimmed = tag.trim();
-			// Remove # prefix if it exists
-			return trimmed.startsWith("#") ? trimmed.slice(1) : trimmed;
-		})
+		.map((tag) => normalizeFrontmatterTag(tag))
 		.filter((tag) => tag.length > 0) // Remove empty tags
 		.join(", ");
 }

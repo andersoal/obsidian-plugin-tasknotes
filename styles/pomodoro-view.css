@@ -3,21 +3,24 @@
    ================================================ */
 
 /* Pomodoro View Container - Root Block */
-.tasknotes-plugin .pomodoro-view {
+.tasknotes-plugin.pomodoro-view {
+    box-sizing: border-box;
     padding: var(--tn-spacing-xl);
     display: flex;
     flex-direction: column;
+    width: 100%;
     height: 100%;
     overflow-y: auto;
     gap: var(--tn-spacing-xl);
     max-width: 100%;
+    min-width: 0;
+    min-height: 0;
     align-items: center;
-    justify-content: center;
+    justify-content: flex-start;
     background: var(--tn-bg-primary);
-    min-height: 100vh;
 
 	button {
-		cursor: var(--cursor, pointer);
+		cursor: var(--cursor-link, pointer);
 	}
 
 }
@@ -32,11 +35,22 @@
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: var(--tn-spacing-md);
+    gap: var(--tn-spacing-sm);
     padding: var(--tn-spacing-lg) 0;
     width: 100%;
     max-width: 500px;
     margin: 0 auto;
+}
+
+.tasknotes-plugin .pomodoro-view__timer-header {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    min-height: 2.5rem;
+    margin-bottom: var(--tn-spacing-xs);
+    text-align: center;
 }
 
 /* Progress Circle Container */
@@ -60,7 +74,7 @@
 
 /* Progress Circle Elements */
 .tasknotes-plugin .pomodoro-view__progress-circle {
-    transition: stroke-dashoffset 0.5s ease;
+    /* A discrete second tick avoids continuous SVG repainting. */
     stroke: var(--tn-interactive-accent);
     stroke-width: 6;
     fill: none;
@@ -79,7 +93,7 @@
 }
 
 .tasknotes-plugin .pomodoro-view__progress-circle--warning {
-    stroke: var(--tn-color-error) !important;
+    stroke: var(--tn-color-error);
     animation: tn-progress-pulse 1s infinite;
 }
 
@@ -103,19 +117,63 @@
 
 /* Timer Display */
 .tasknotes-plugin .pomodoro-view__timer-display {
-    font-size: 3.5rem;
+    pointer-events: auto;
+    font-size: max(1.5rem, calc(var(--pomodoro-font-size, 3.5rem) * var(--pomodoro-scale, 1)));
     color: var(--tn-text-normal);
     text-align: center;
     font-family: var(--tn-font-mono);
     letter-spacing: 0.05em;
     transition: color var(--tn-transition-fast);
-    font-weight: var(--tn-font-weight-bold);
+    font-weight: var(--pomodoro-font-weight, var(--tn-font-weight-bold));
     margin-bottom: var(--tn-spacing-md);
+}
+
+.tasknotes-plugin .pomodoro-view__timer-display--editable {
+    cursor: text;
+    border-radius: var(--tn-radius-sm);
+}
+
+.tasknotes-plugin .pomodoro-view__timer-display--editable:hover {
+    color: var(--tn-interactive-accent);
+}
+
+.tasknotes-plugin .pomodoro-view__timer-display--hidden {
+    display: none;
+}
+
+.tasknotes-plugin .pomodoro-view__timer-input {
+    pointer-events: auto;
+    width: 5.5em;
+    border: none;
+    border-radius: var(--tn-radius-sm);
+    background: var(--background-secondary);
+    color: var(--tn-text-normal);
+    font-family: var(--tn-font-mono);
+    font-size: max(1.5rem, calc(var(--pomodoro-font-size, 3.5rem) * var(--pomodoro-scale, 1)));
+    font-weight: var(--pomodoro-font-weight, var(--tn-font-weight-bold));
+    line-height: 1.1;
+    text-align: center;
+    margin-bottom: var(--tn-spacing-md);
+    box-shadow: inset 0 0 0 1px var(--background-modifier-border);
+}
+
+.tasknotes-plugin .pomodoro-view__timer-input:focus {
+    outline: 2px solid var(--tn-interactive-accent);
+    outline-offset: 2px;
+}
+
+.tasknotes-plugin .pomodoro-view__timer-input--hidden {
+    display: none;
 }
 
 .tasknotes-plugin .pomodoro-view__timer-display--warning {
     color: var(--tn-color-error);
     animation: tn-timer-pulse 2s infinite;
+}
+
+.tasknotes-plugin.pomodoro-view--rendering-paused .pomodoro-view__timer-display--warning,
+.tasknotes-plugin.pomodoro-view--rendering-paused .pomodoro-view__progress-circle--warning {
+    animation: none;
 }
 
 @keyframes tn-timer-pulse {
@@ -125,13 +183,21 @@
 
 /* Status Display */
 .tasknotes-plugin .pomodoro-view__status {
-    font-size: var(--tn-font-size-xl);
+    font-size: var(--tn-font-size-md);
     font-weight: var(--tn-font-weight-medium);
     text-align: center;
     color: var(--tn-text-muted);
-    text-transform: capitalize;
-    margin-bottom: var(--tn-spacing-lg);
-    order: -1;
+    line-height: 1.2;
+    margin: 0;
+}
+
+.tasknotes-plugin .pomodoro-view__session-meta {
+    margin: 0;
+    color: var(--tn-text-muted);
+    font-size: var(--tn-font-size-xs);
+    line-height: 1.25;
+    text-align: center;
+    max-width: 100%;
 }
 
 .tasknotes-plugin .pomodoro-view__status--work {
@@ -172,7 +238,7 @@
     max-height: 100px;
     opacity: 1;
     transform: translateY(0);
-    transition: all var(--tn-transition-medium);
+    transition: max-height var(--tn-transition-medium), opacity var(--tn-transition-medium), padding var(--tn-transition-medium), transform var(--tn-transition-medium);
 }
 
 /* Hide task display when empty with slide animation */
@@ -389,13 +455,15 @@
 
 /* Use consistent button system for time adjust buttons */
 .tasknotes-plugin .pomodoro-view__time-adjust-button {
-    width: 28px;
+    min-width: 44px;
     height: 28px;
-    border-radius: 50%;
+    padding: 0 var(--tn-spacing-sm);
+    border-radius: var(--tn-radius-sm);
     background: var(--background-secondary);
     color: var(--tn-text-normal);
     border: 1px solid var(--background-modifier-border);
     box-shadow: none;
+    font-size: var(--tn-font-size-xs);
     font-weight: 600;
     cursor: pointer;
     transition: background 0.15s ease, border-color 0.15s ease;
@@ -408,7 +476,8 @@
 }
 
 .tasknotes-plugin .pomodoro-view__time-adjust-button:focus {
-    outline: none;
+    outline: 2px solid var(--tn-interactive-accent);
+    outline-offset: 2px;
 }
 
 /* Button States */
@@ -440,6 +509,16 @@
     box-sizing: border-box;
 }
 
+/* Center the timer group only when there is spare height. Auto margins collapse
+   when the pane is shorter than the content, keeping the top scrollable. */
+.tasknotes-plugin.pomodoro-view > .pomodoro-view__timer-section {
+    margin-top: auto;
+}
+
+.tasknotes-plugin.pomodoro-view > .pomodoro-view__stats-section {
+    margin-bottom: auto;
+}
+
 /* Statistics Grid */
 .tasknotes-plugin .pomodoro-view__stats {
     display: flex;
@@ -460,10 +539,10 @@
 }
 
 .tasknotes-plugin .pomodoro-view__stat--clickable {
-    cursor: var(--cursor, pointer);
+    cursor: var(--cursor-link, pointer);
     padding: var(--tn-spacing-xs);
     border-radius: var(--tn-radius-sm);
-    transition: all var(--tn-transition-fast);
+    transition: background-color var(--tn-transition-fast), box-shadow var(--tn-transition-fast);
 }
 
 .tasknotes-plugin .pomodoro-view__stat--clickable:hover {
@@ -491,7 +570,7 @@
    ================================================ */
 
 @media (max-width: 768px) {
-    .tasknotes-plugin .pomodoro-view {
+    .tasknotes-plugin.pomodoro-view {
         padding: var(--tn-spacing-md);
         gap: var(--tn-spacing-md);
     }
@@ -574,203 +653,187 @@
    ================================================ */
 
 /* Extra responsive breakpoints for very granular control */
-.tasknotes-plugin .pomodoro-view--tiny {
+.tasknotes-plugin.pomodoro-view--tiny {
+    --pomodoro-font-size: 2rem;
+    --pomodoro-font-weight: 700;
+
     padding: var(--tn-spacing-sm);
     gap: var(--tn-spacing-sm);
 }
 
-.tasknotes-plugin .pomodoro-view.pomodoro-view--tiny .pomodoro-view__timer-overlay .pomodoro-view__timer-display {
-    font-size: 2rem !important;
-    font-weight: 700 !important;
-}
+.tasknotes-plugin.pomodoro-view--extra-narrow {
+    --pomodoro-font-size: 2.2rem;
+    --pomodoro-font-weight: 650;
 
-.tasknotes-plugin .pomodoro-view--extra-narrow {
     padding: var(--tn-spacing-md);
     gap: var(--tn-spacing-sm);
 }
 
-.tasknotes-plugin .pomodoro-view.pomodoro-view--extra-narrow .pomodoro-view__timer-overlay .pomodoro-view__timer-display {
-    font-size: 2.2rem !important;
-    font-weight: 650 !important;
-}
-
 /* Very narrow view (≤ 300px) - Minimal layout */
-.tasknotes-plugin .pomodoro-view--very-narrow {
+.tasknotes-plugin.pomodoro-view--very-narrow {
+    --pomodoro-font-size: 2.5rem;
+    --pomodoro-font-weight: 600;
+
     padding: var(--tn-spacing-md);
     gap: var(--tn-spacing-md);
 }
 
-.tasknotes-plugin .pomodoro-view--very-narrow .pomodoro-view__status {
+.tasknotes-plugin.pomodoro-view--very-narrow .pomodoro-view__status {
     font-size: var(--tn-font-size-sm);
     margin-bottom: var(--tn-spacing-xs);
 }
 
-.tasknotes-plugin .pomodoro-view--very-narrow .pomodoro-view__timer-section {
+.tasknotes-plugin.pomodoro-view--very-narrow .pomodoro-view__timer-section {
     padding: var(--tn-spacing-sm) 0;
 }
 
-.tasknotes-plugin .pomodoro-view.pomodoro-view--very-narrow .pomodoro-view__timer-overlay .pomodoro-view__timer-display {
-    font-size: 2.5rem !important;
-    font-weight: 600 !important;
-}
-
-.tasknotes-plugin .pomodoro-view--very-narrow .pomodoro-view__time-controls {
+.tasknotes-plugin.pomodoro-view--very-narrow .pomodoro-view__time-controls {
     gap: var(--tn-spacing-sm);
 }
 
-.tasknotes-plugin .pomodoro-view--very-narrow .pomodoro-view__time-adjust-button {
-    width: 32px;
+.tasknotes-plugin.pomodoro-view--very-narrow .pomodoro-view__time-adjust-button {
+    min-width: 42px;
     height: 32px;
-    font-size: var(--tn-font-size-lg);
+    font-size: var(--tn-font-size-xs);
 }
 
-.tasknotes-plugin .pomodoro-view--very-narrow .pomodoro-view__task-selector {
+.tasknotes-plugin.pomodoro-view--very-narrow .pomodoro-view__task-selector {
     gap: var(--tn-spacing-sm);
 }
 
-.tasknotes-plugin .pomodoro-view--very-narrow .pomodoro-view__task-buttons {
+.tasknotes-plugin.pomodoro-view--very-narrow .pomodoro-view__task-buttons {
     flex-direction: column;
     gap: var(--tn-spacing-xs);
 }
 
-.tasknotes-plugin .pomodoro-view--very-narrow .pomodoro-view__task-select-button,
-.tasknotes-plugin .pomodoro-view--very-narrow .pomodoro-view__task-clear-button {
+.tasknotes-plugin.pomodoro-view--very-narrow .pomodoro-view__task-select-button,
+.tasknotes-plugin.pomodoro-view--very-narrow .pomodoro-view__task-clear-button {
     font-size: var(--tn-font-size-sm);
     padding: var(--tn-spacing-xs) var(--tn-spacing-sm);
 }
 
-.tasknotes-plugin .pomodoro-view--very-narrow .pomodoro-view__primary-controls {
+.tasknotes-plugin.pomodoro-view--very-narrow .pomodoro-view__primary-controls {
     flex-direction: column;
     gap: var(--tn-spacing-xs);
 }
 
-.tasknotes-plugin .pomodoro-view--very-narrow .pomodoro-view__start-button,
-.tasknotes-plugin .pomodoro-view--very-narrow .pomodoro-view__pause-button,
-.tasknotes-plugin .pomodoro-view--very-narrow .pomodoro-view__stop-button {
+.tasknotes-plugin.pomodoro-view--very-narrow .pomodoro-view__start-button,
+.tasknotes-plugin.pomodoro-view--very-narrow .pomodoro-view__pause-button,
+.tasknotes-plugin.pomodoro-view--very-narrow .pomodoro-view__stop-button {
     width: 100%;
     max-width: 200px;
     font-size: var(--tn-font-size-sm);
     padding: var(--tn-spacing-sm);
 }
 
-.tasknotes-plugin .pomodoro-view--very-narrow .pomodoro-view__skip-break-button {
+.tasknotes-plugin.pomodoro-view--very-narrow .pomodoro-view__skip-break-button {
     font-size: var(--tn-font-size-sm);
     padding: var(--tn-spacing-xs) var(--tn-spacing-sm);
 }
 
-.tasknotes-plugin .pomodoro-view--very-narrow .pomodoro-view__stats {
+.tasknotes-plugin.pomodoro-view--very-narrow .pomodoro-view__stats {
     font-size: var(--tn-font-size-xs);
 }
 
 /* Narrow view (≤ 400px) - Compact layout */
-.tasknotes-plugin .pomodoro-view--narrow {
+.tasknotes-plugin.pomodoro-view--narrow {
+    --pomodoro-font-size: 3rem;
+    --pomodoro-font-weight: 600;
+
     padding: var(--tn-spacing-lg);
     gap: var(--tn-spacing-lg);
 }
 
-.tasknotes-plugin .pomodoro-view.pomodoro-view--narrow .pomodoro-view__timer-overlay .pomodoro-view__timer-display {
-    font-size: 3rem !important;
-    font-weight: 600 !important;
-}
-
-.tasknotes-plugin .pomodoro-view--narrow .pomodoro-view__time-controls {
+.tasknotes-plugin.pomodoro-view--narrow .pomodoro-view__time-controls {
     gap: var(--tn-spacing-md);
 }
 
-.tasknotes-plugin .pomodoro-view--narrow .pomodoro-view__time-adjust-button {
-    width: 36px;
+.tasknotes-plugin.pomodoro-view--narrow .pomodoro-view__time-adjust-button {
+    min-width: 48px;
     height: 36px;
 }
 
-.tasknotes-plugin .pomodoro-view--narrow .pomodoro-view__task-buttons {
+.tasknotes-plugin.pomodoro-view--narrow .pomodoro-view__task-buttons {
     flex-direction: column;
     gap: var(--tn-spacing-sm);
 }
 
-.tasknotes-plugin .pomodoro-view--narrow .pomodoro-view__primary-controls {
+.tasknotes-plugin.pomodoro-view--narrow .pomodoro-view__primary-controls {
     gap: var(--tn-spacing-sm);
 }
 
-.tasknotes-plugin .pomodoro-view--narrow .pomodoro-view__start-button,
-.tasknotes-plugin .pomodoro-view--narrow .pomodoro-view__pause-button,
-.tasknotes-plugin .pomodoro-view--narrow .pomodoro-view__stop-button {
+.tasknotes-plugin.pomodoro-view--narrow .pomodoro-view__start-button,
+.tasknotes-plugin.pomodoro-view--narrow .pomodoro-view__pause-button,
+.tasknotes-plugin.pomodoro-view--narrow .pomodoro-view__stop-button {
     font-size: var(--tn-font-size-md);
     padding: var(--tn-spacing-sm) var(--tn-spacing-md);
 }
 
 /* Small view (≤ 400px) - Enhanced compact layout */
-.tasknotes-plugin .pomodoro-view--small {
+.tasknotes-plugin.pomodoro-view--small {
+    --pomodoro-font-size: 3.2rem;
+    --pomodoro-font-weight: 550;
+
     padding: var(--tn-spacing-lg);
     gap: var(--tn-spacing-md);
 }
 
-.tasknotes-plugin .pomodoro-view.pomodoro-view--small .pomodoro-view__timer-overlay .pomodoro-view__timer-display {
-    font-size: 3.2rem !important;
-    font-weight: 550 !important;
-}
-
-.tasknotes-plugin .pomodoro-view--small .pomodoro-view__primary-controls {
+.tasknotes-plugin.pomodoro-view--small .pomodoro-view__primary-controls {
     gap: var(--tn-spacing-sm);
 }
 
 /* Medium-small view (≤ 500px) - Transitional layout */
-.tasknotes-plugin .pomodoro-view--medium-small {
+.tasknotes-plugin.pomodoro-view--medium-small {
+    --pomodoro-font-size: 3.6rem;
+    --pomodoro-font-weight: 500;
+
     padding: var(--tn-spacing-lg);
     gap: var(--tn-spacing-lg);
 }
 
-.tasknotes-plugin .pomodoro-view.pomodoro-view--medium-small .pomodoro-view__timer-overlay .pomodoro-view__timer-display {
-    font-size: 3.6rem !important;
-    font-weight: 500 !important;
-}
-
 /* Medium view (≤ 600px) - Standard responsive adjustments */
-.tasknotes-plugin .pomodoro-view--medium {
+.tasknotes-plugin.pomodoro-view--medium {
+    --pomodoro-font-size: 4rem;
+    --pomodoro-font-weight: 500;
+
     padding: var(--tn-spacing-xl);
     gap: var(--tn-spacing-xl);
 }
 
-.tasknotes-plugin .pomodoro-view.pomodoro-view--medium .pomodoro-view__timer-overlay .pomodoro-view__timer-display {
-    font-size: 4rem !important;
-    font-weight: 500 !important;
-}
-
-.tasknotes-plugin .pomodoro-view--medium .pomodoro-view__task-buttons {
+.tasknotes-plugin.pomodoro-view--medium .pomodoro-view__task-buttons {
     gap: var(--tn-spacing-md);
 }
 
 /* Wide view (> 600px) - Enhanced layout */
-.tasknotes-plugin .pomodoro-view--wide {
+.tasknotes-plugin.pomodoro-view--wide {
+    --pomodoro-font-size: 4.5rem;
+    --pomodoro-font-weight: 400;
+
     padding: var(--tn-spacing-xl);
     gap: var(--tn-spacing-xl);
 }
 
-.tasknotes-plugin .pomodoro-view.pomodoro-view--wide .pomodoro-view__timer-overlay .pomodoro-view__timer-display {
-    font-size: 4.5rem !important;
-    font-weight: 400 !important;
-}
-
 /* Task card responsiveness */
-.tasknotes-plugin .pomodoro-view--very-narrow .task-card,
-.tasknotes-plugin .pomodoro-view--narrow .task-card {
+.tasknotes-plugin.pomodoro-view--very-narrow .task-card,
+.tasknotes-plugin.pomodoro-view--narrow .task-card {
     font-size: var(--tn-font-size-sm);
 }
 
-.tasknotes-plugin .pomodoro-view--very-narrow .task-card__metadata,
-.tasknotes-plugin .pomodoro-view--narrow .task-card__metadata {
+.tasknotes-plugin.pomodoro-view--very-narrow .task-card__metadata,
+.tasknotes-plugin.pomodoro-view--narrow .task-card__metadata {
     font-size: var(--tn-font-size-xs);
 }
 
 /* Hide less essential elements in very narrow views */
-.tasknotes-plugin .pomodoro-view--very-narrow .task-card__context-menu {
+.tasknotes-plugin.pomodoro-view--very-narrow .task-card__context-menu {
     display: none;
 }
 
 /* Adjust progress circle stroke width for small sizes */
-.tasknotes-plugin .pomodoro-view--very-narrow .pomodoro-view__progress-circle {
+.tasknotes-plugin.pomodoro-view--very-narrow .pomodoro-view__progress-circle {
     stroke-width: 3;
 }
 
-.tasknotes-plugin .pomodoro-view--narrow .pomodoro-view__progress-circle {
+.tasknotes-plugin.pomodoro-view--narrow .pomodoro-view__progress-circle {
     stroke-width: 4;
 }

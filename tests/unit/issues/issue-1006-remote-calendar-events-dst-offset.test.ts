@@ -39,7 +39,13 @@ jest.mock('obsidian', () => ({
 	TFile: jest.fn(),
 }));
 
-describe.skip('Issue #1006 - Remote calendar events 1h ahead during DST transition period', () => {
+// This regression depends on real VTIMEZONE expansion; the default unit-test
+// ical.js mock intentionally parses only simple local date/time values.
+jest.mock('ical.js', () =>
+	jest.requireActual(`${process.cwd()}/node_modules/ical.js/dist/ical.es5.cjs`)
+);
+
+describe('Issue #1006 - Remote calendar events 1h ahead during DST transition period', () => {
 	let service: ICSSubscriptionService;
 	let mockPlugin: any;
 
@@ -370,6 +376,8 @@ describe.skip('Issue #1006 - Remote calendar events 1h ahead during DST transiti
 
 	describe('Multi-week recurring event across DST transitions', () => {
 		it('should maintain correct times for recurring events spanning DST transition', () => {
+			// Keep this historical fixture inside the bounded subscription window.
+			jest.spyOn(Date, 'now').mockReturnValue(Date.parse('2025-03-20T00:00:00Z'));
 			// Recurring weekly event starting in March, spanning the European DST transition
 			// Event every Thursday at 3 PM local time
 			// March 20 (before DST): 3 PM CET = 14:00 UTC

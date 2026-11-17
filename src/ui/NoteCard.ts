@@ -1,3 +1,5 @@
+import { uiText } from "../i18n/runtime";
+import { msg } from "@lingui/core/macro";
 import { TFile, setIcon } from "obsidian";
 import { NoteInfo } from "../types";
 import TaskNotesPlugin from "../main";
@@ -30,13 +32,13 @@ export function createNoteCard(
 ): HTMLElement {
 	const opts = { ...DEFAULT_NOTE_CARD_OPTIONS, ...options };
 
-	const item = document.createElement("div");
+	const item = activeWindow.createDiv();
 	// Check if this is a daily note using the core plugin
 	let isDailyNote = false;
 	try {
 		const allDailyNotes = getAllDailyNotes();
 		isDailyNote = Object.values(allDailyNotes).some((file) => file.path === note.path);
-	} catch (error) {
+	} catch {
 		// Daily Notes interface not available, fallback to false
 		isDailyNote = false;
 	}
@@ -55,8 +57,8 @@ export function createNoteCard(
 	if (opts.showDailyNoteBadge && isDailyNote) {
 		item.createSpan({
 			cls: "note-card__badge",
-			text: plugin.i18n.translate("ui.noteCard.dailyBadge"),
-			attr: { title: plugin.i18n.translate("ui.noteCard.dailyTooltip") },
+			text: plugin.i18n.translate(msg({ message: "Daily", context: "ui.noteCard.dailyBadge" })),
+			attr: { title: plugin.i18n.translate(msg({ message: "Daily note", context: "ui.noteCard.dailyTooltip" })) },
 		});
 	}
 
@@ -64,8 +66,8 @@ export function createNoteCard(
 	const mainRow = item.createDiv({ cls: "note-card__main-row" });
 
 	// Left indicator area: note icon
-	const leftIconWrap = mainRow.createEl("span", { cls: "note-card__icon" });
-	const leftIcon = leftIconWrap.createEl("span");
+	const leftIconWrap = mainRow.createSpan({ cls: "note-card__icon" });
+	const leftIcon = leftIconWrap.createSpan();
 	setIcon(leftIcon, "file-text");
 
 	// Content container
@@ -80,7 +82,7 @@ export function createNoteCard(
 	// Tags section (separate from other metadata)
 	if (opts.showTags && note.tags && note.tags.length > 0) {
 		// Divider line
-		contentContainer.createEl("div", { cls: "note-card__divider" });
+		contentContainer.createDiv({ cls: "note-card__divider" });
 
 		// Tags line
 		const tagsToShow = note.tags.slice(0, opts.maxTags);
@@ -91,7 +93,7 @@ export function createNoteCard(
 			tagsText += ` +${note.tags.length - opts.maxTags}`;
 		}
 
-		contentContainer.createEl("div", {
+		contentContainer.createDiv({
 			cls: "note-card__tags-text",
 			text: tagsText,
 		});
@@ -107,8 +109,8 @@ export function createNoteCard(
 				: note.createdDate;
 		contentContainer.createDiv({
 			cls: "note-card__metadata",
-			text: `${plugin.i18n.translate("ui.noteCard.createdLabel")} ${dateStr}`,
-			attr: { title: `${plugin.i18n.translate("ui.noteCard.createdLabel")} ${dateStr}` },
+			text: uiText(msg({ message: "Created: {date}", context: "note created date" }), { date: dateStr }),
+			attr: { title: uiText(msg({ message: "Created: {date}", context: "note created date" }), { date: dateStr }) },
 		});
 	}
 
@@ -116,7 +118,7 @@ export function createNoteCard(
 		contentContainer.createDiv({
 			cls: "note-card__metadata",
 			text: note.path,
-			attr: { title: `Path: ${note.path}` },
+			attr: { title: uiText(msg({ message: "Path: {path}", context: "ui/NoteCard: createNoteCard title" }), { path: note.path }) },
 		});
 	}
 
@@ -125,9 +127,9 @@ export function createNoteCard(
 		const file = plugin.app.vault.getAbstractFileByPath(note.path);
 		if (file instanceof TFile) {
 			if (e.ctrlKey || e.metaKey) {
-				plugin.app.workspace.openLinkText(note.path, "", true);
+				void plugin.app.workspace.openLinkText(note.path, "", true);
 			} else {
-				plugin.app.workspace.getLeaf(false).openFile(file);
+				void plugin.app.workspace.getLeaf(false).openFile(file);
 			}
 		}
 	});
@@ -139,7 +141,7 @@ export function createNoteCard(
 			e.preventDefault();
 			const file = plugin.app.vault.getAbstractFileByPath(note.path);
 			if (file instanceof TFile) {
-				plugin.app.workspace.openLinkText(note.path, "", true);
+				void plugin.app.workspace.openLinkText(note.path, "", true);
 			}
 		}
 	});
@@ -179,7 +181,7 @@ export function updateNoteCard(
 	try {
 		const allDailyNotes = getAllDailyNotes();
 		isDailyNote = Object.values(allDailyNotes).some((file) => file.path === note.path);
-	} catch (error) {
+	} catch {
 		// Daily Notes interface not available, fallback to false
 		isDailyNote = false;
 	}
@@ -199,8 +201,8 @@ export function updateNoteCard(
 		const mainRow =
 			element.querySelector(".note-card__main-row") ||
 			element.createDiv({ cls: "note-card__main-row" });
-		iconWrap = mainRow.createEl("span", { cls: "note-card__icon" });
-		const leftIcon = iconWrap.createEl("span");
+		iconWrap = mainRow.createSpan({ cls: "note-card__icon" });
+		const leftIcon = iconWrap.createSpan();
 		setIcon(leftIcon, "file-text");
 
 		// Move existing content into the main row structure if needed
@@ -228,7 +230,7 @@ export function updateNoteCard(
 			note.createdDate.indexOf("T") > 0
 				? formatDateForDisplay(note.createdDate, dateFormat)
 				: note.createdDate;
-		dateEl.textContent = `${plugin.i18n.translate("ui.noteCard.createdLabel")} ${dateStr}`;
+		dateEl.textContent = uiText(msg({ message: "Created: {date}", context: "note created date" }), { date: dateStr });
 	}
 
 	// Update path

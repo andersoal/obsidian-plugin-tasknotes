@@ -17,6 +17,7 @@ const CSS_FILES = [
     'styles/modal-bem.css',          // Modal components with proper BEM scoping
     'styles/task-modal.css',         // Task modal components (Google Keep/Todoist style)
     'styles/reminder-modal.css',     // Reminder modal component with proper BEM scoping
+    'styles/device-code-modal.css',  // OAuth device-code modal
     'styles/date-picker.css',        // Enhanced date/time picker styling
     'styles/task-selector-with-create-modal.css', // TaskSelectorWithCreateModal component with proper BEM scoping
     'styles/file-selector-modal.css', // FileSelectorModal component with proper BEM scoping
@@ -29,16 +30,21 @@ const CSS_FILES = [
     // BEM View Files
     'styles/task-list-view.css',     // TaskListView component with proper BEM scoping
     'styles/calendar-view.css',      // CalendarView component with proper BEM scoping
+    'vendor/tasknotes-calendar/calendar.css', // Pinned @tasknotes/calendar engine styles (scoped to .tnc), adapted for stylelint
     'styles/advanced-calendar-view.css', // AdvancedCalendarView component with proper BEM scoping
+    'styles/bases-calendar.css',     // Bases calendar theme mapping and TaskNotes event styles
     'styles/kanban-view.css',        // KanbanView component with proper BEM scoping
     'styles/agenda-view.css',        // AgendaView component with proper BEM scoping
     'styles/pomodoro-view.css',      // PomodoroView component with proper BEM scoping
     'styles/pomodoro-stats-view.css', // PomodoroStatsView component with proper BEM scoping
     'styles/stats-view.css',         // StatsView component with proper BEM scoping
+    'styles/release-notes-view.css', // Release notes view typography
     'styles/settings-view.css',      // SettingsView component with proper BEM scoping
+    'styles/field-manager.css',      // Modal field manager settings
     'styles/webhook-settings.css',   // Webhook settings UI with proper BEM scoping
     'styles/status-bar.css',         // StatusBar component with proper BEM scoping
-    'styles/bases-views.css'         // Bases integration views (list and kanban)
+    'styles/bases-views.css',        // Bases integration views (list and kanban)
+    'styles/static-style-utilities.css' // Static style utility classes migrated from inline styles
 ];
 
 const MAIN_CSS_TEMPLATE = `/* TaskNotes Plugin Styles */

@@ -1,3 +1,7 @@
+import { displayError } from "../i18n/runtime";
+import { uiLocale } from "../i18n/runtime";
+import { uiText } from "../i18n/runtime";
+import { msg } from "@lingui/core/macro";
 import {
 	App,
 	Modal,
@@ -8,6 +12,8 @@ import {
 	parseYaml,
 	stringifyYaml,
 	setTooltip,
+	getFrontMatterInfo,
+	moment as obsidianMoment,
 } from "obsidian";
 import TaskNotesPlugin from "../main";
 import { TimeBlock, DailyNoteFrontmatter, TaskInfo } from "../types";
@@ -15,13 +21,62 @@ import { generateTimeblockId } from "../utils/helpers";
 import { openFileSelector } from "./FileSelectorModal";
 import { openTaskSelector } from "./TaskSelectorWithCreateModal";
 import { parseDateAsLocal } from "../utils/dateUtils";
+import { colorValueToInputValue, normalizeThemeColor } from "../utils/themeColors";
+import { configureThemeColorInput } from "../settings/components/CardComponent";
+import { modifyVaultFile } from "../services/VaultMutationService";
 import {
 	createDailyNote,
 	getDailyNote,
 	getAllDailyNotes,
 	appHasDailyNotesPluginLoaded,
 } from "obsidian-daily-notes-interface";
-import { TranslationKey } from "../i18n";
+import { MessageDescriptor } from "../i18n";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Modals/TimeblockCreationModal" });
+
+type DailyNoteMoment = Parameters<typeof getDailyNote>[0];
+type DailyNotesLookup = ReturnType<typeof getAllDailyNotes>;
+
+const TIMEBLOCK_DAILY_NOTES_SETUP_GUIDANCE =
+	"Check the Daily Notes core plugin settings and make sure the configured daily notes folder exists.";
+
+function getUnknownErrorMessage(error: unknown): string {
+	if (error instanceof Error) {
+		return error.message;
+	}
+	if (typeof error === "string") {
+		return error;
+	}
+	return "";
+}
+
+export function readDailyNotesForTimeblockCreation(
+	readDailyNotes: () => DailyNotesLookup = getAllDailyNotes
+): DailyNotesLookup {
+	try {
+		return readDailyNotes();
+	} catch (error) {
+		const errorMessage = getUnknownErrorMessage(error);
+		const detail = errorMessage ? `: ${errorMessage}` : "";
+		throw new Error(
+			`Failed to read daily notes${detail}. ${TIMEBLOCK_DAILY_NOTES_SETUP_GUIDANCE}`
+		);
+	}
+}
+
+export function getTimeblockCreationErrorMessage(error: unknown): string {
+	const errorMessage = getUnknownErrorMessage(error);
+	if (!errorMessage) {
+		return uiText(msg({ message: "Failed to create timeblock. Check console for details.", context: "modals/TimeblockCreationModal: getTimeblockCreationErrorMessage display" }));
+	}
+
+	return uiText(msg({ message: "Failed to create timeblock: {errorMessage}", context: "modals/TimeblockCreationModal: getTimeblockCreationErrorMessage display" }), { errorMessage: displayError(errorMessage) });
+}
+
+function getDailyNoteMoment(input: string): DailyNoteMoment {
+	return (obsidianMoment as unknown as (input: string) => DailyNoteMoment)(input);
+}
 
 export interface TimeblockCreationOptions {
 	date: string; // YYYY-MM-DD format
@@ -29,12 +84,19 @@ export interface TimeblockCreationOptions {
 	endTime?: string; // HH:MM format
 	prefilledTitle?: string;
 	prefilledAttachmentPaths?: string[];
+	onCreated?: (result: TimeblockCreationResult) => void | Promise<void>;
+}
+
+export interface TimeblockCreationResult {
+	timeblock: TimeBlock;
+	date: string;
+	dailyNote: TFile;
 }
 
 export class TimeblockCreationModal extends Modal {
 	plugin: TaskNotesPlugin;
 	options: TimeblockCreationOptions;
-	private translate: (key: TranslationKey, variables?: Record<string, any>) => string;
+	private translate: (key: MessageDescriptor, variables?: Record<string, unknown>) => string;
 
 	// Form fields
 	private titleInput: HTMLInputElement;
@@ -64,27 +126,31 @@ export class TimeblockCreationModal extends Modal {
 		this.keyboardHandler = (e: KeyboardEvent) => {
 			if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
 				e.preventDefault();
-				this.handleSubmit();
+				void this.handleSubmit();
 			}
 		};
 		this.containerEl.addEventListener("keydown", this.keyboardHandler);
 
-		new Setting(contentEl).setName(this.translate("modals.timeblockCreation.heading")).setHeading();
+		new Setting(contentEl)
+			.setName(this.translate(msg({ message: "Create timeblock", context: "modals.timeblockCreation.heading" })))
+			.setHeading();
 
 		// Date display (read-only)
 		const dateDisplay = contentEl.createDiv({ cls: "timeblock-date-display" });
-		dateDisplay.createEl("strong", { text: this.translate("modals.timeblockCreation.dateLabel") });
+		dateDisplay.createEl("strong", {
+			text: this.translate(msg({ message: "Date: ", context: "modals.timeblockCreation.dateLabel" })),
+		});
 		// Parse the date string to get a proper date object for display (using local for UI)
 		const dateObj = parseDateAsLocal(this.options.date);
-		dateDisplay.createSpan({ text: dateObj.toLocaleDateString() });
+		dateDisplay.createSpan({ text: dateObj.toLocaleDateString(uiLocale()) });
 
 		// Title field
 		new Setting(contentEl)
-			.setName(this.translate("modals.timeblockCreation.titleLabel"))
-			.setDesc(this.translate("modals.timeblockCreation.titleDesc"))
+			.setName(this.translate(msg({ message: "Title", context: "modals.timeblockCreation.titleLabel" })))
+			.setDesc(this.translate(msg({ message: "Title for your timeblock", context: "modals.timeblockCreation.titleDesc" })))
 			.addText((text) => {
 				this.titleInput = text.inputEl;
-				text.setPlaceholder(this.translate("modals.timeblockCreation.titlePlaceholder"))
+				text.setPlaceholder(this.translate(msg({ message: "e.g., Deep work session", context: "modals.timeblockCreation.titlePlaceholder" })))
 					.setValue(this.options.prefilledTitle || "")
 					.onChange(() => this.validateForm());
 				// Focus on title input
@@ -92,31 +158,25 @@ export class TimeblockCreationModal extends Modal {
 			});
 
 		// Time range
-		const timeContainer = contentEl.createDiv({ cls: "timeblock-time-container" });
-
-		new Setting(timeContainer)
-			.setName(this.translate("modals.timeblockCreation.startTimeLabel"))
-			.setDesc(this.translate("modals.timeblockCreation.startTimeDesc"))
+		new Setting(contentEl)
+			.setName(this.translate(msg({ message: "Start time", context: "modals.timeblockCreation.startTimeLabel" })))
+			.setDesc(this.translate(msg({ message: "When the timeblock starts", context: "modals.timeblockCreation.startTimeDesc" })))
 			.addText((text) => {
 				this.startTimeInput = text.inputEl;
-				text.setPlaceholder(this.translate("modals.timeblockCreation.startTimePlaceholder"))
+				text.setPlaceholder(this.translate(msg({ message: "09:00", context: "modals.timeblockCreation.startTimePlaceholder" })))
 					.setValue(this.options.startTime || "")
 					.onChange(() => this.validateForm());
 				this.startTimeInput.type = "time";
 			});
 
-		new Setting(timeContainer)
-			.setName(this.translate("modals.timeblockCreation.endTimeLabel"))
-			.setDesc(this.translate("modals.timeblockCreation.endTimeDesc"))
+		new Setting(contentEl)
+			.setName(this.translate(msg({ message: "End time", context: "modals.timeblockCreation.endTimeLabel" })))
+			.setDesc(this.translate(msg({ message: "When the timeblock ends", context: "modals.timeblockCreation.endTimeDesc" })))
 			.addText((text) => {
 				this.endTimeInput = text.inputEl;
-				text.setPlaceholder(this.translate("modals.timeblockCreation.endTimePlaceholder"))
+				text.setPlaceholder(this.translate(msg({ message: "11:00", context: "modals.timeblockCreation.endTimePlaceholder" })))
 					.setValue(this.options.endTime || "")
 					.onChange(() => {
-						// Convert 00:00 to 23:59 for end time
-						if (this.endTimeInput.value === "00:00") {
-							this.endTimeInput.value = "23:59";
-						}
 						this.validateForm();
 					});
 				this.endTimeInput.type = "time";
@@ -124,48 +184,60 @@ export class TimeblockCreationModal extends Modal {
 
 		// Description (optional)
 		new Setting(contentEl)
-			.setName(this.translate("modals.timeblockCreation.descriptionLabel"))
-			.setDesc(this.translate("modals.timeblockCreation.descriptionDesc"))
+			.setName(this.translate(msg({ message: "Description", context: "modals.timeblockCreation.descriptionLabel" })))
+			.setDesc(this.translate(msg({ message: "Optional description for the timeblock", context: "modals.timeblockCreation.descriptionDesc" })))
 			.addTextArea((text) => {
 				this.descriptionInput = text.inputEl;
-				text.setPlaceholder(this.translate("modals.timeblockCreation.descriptionPlaceholder")).setValue("");
+				text.setPlaceholder(
+					this.translate(msg({ message: "Focus on new features, no interruptions", context: "modals.timeblockCreation.descriptionPlaceholder" }))
+				).setValue("");
 				this.descriptionInput.rows = 3;
 			});
 
 		// Color (optional)
 		new Setting(contentEl)
-			.setName(this.translate("modals.timeblockCreation.colorLabel"))
-			.setDesc(this.translate("modals.timeblockCreation.colorDesc"))
+			.setName(this.translate(msg({ message: "Color", context: "modals.timeblockCreation.colorLabel" })))
+			.setDesc(this.translate(msg({ message: "Optional color for the timeblock", context: "modals.timeblockCreation.colorDesc" })))
 			.addText((text) => {
 				this.colorInput = text.inputEl;
-				text.setPlaceholder(this.translate("modals.timeblockCreation.colorPlaceholder")).setValue(this.plugin.settings.calendarViewSettings.defaultTimeblockColor);
-				this.colorInput.type = "color";
+				text.setPlaceholder(
+					this.translate(msg({ message: "#3b82f6", context: "modals.timeblockCreation.colorPlaceholder" }))
+				).setValue(
+					colorValueToInputValue(
+						this.plugin.settings.calendarViewSettings.defaultTimeblockColor
+					)
+				);
+				configureThemeColorInput(this.colorInput);
 			});
 
 		// Attachments (optional)
 		new Setting(contentEl)
-			.setName(this.translate("modals.timeblockCreation.attachmentsLabel"))
-			.setDesc(this.translate("modals.timeblockCreation.attachmentsDesc"))
+			.setName(this.translate(msg({ message: "Attachments", context: "modals.timeblockCreation.attachmentsLabel" })))
+			.setDesc(this.translate(msg({ message: "Files or notes to link to this timeblock", context: "modals.timeblockCreation.attachmentsDesc" })))
 			.addButton((button) => {
 				button
-					.setButtonText(this.translate("modals.timeblockCreation.addAttachmentButton"))
-					.setTooltip(this.translate("modals.timeblockCreation.addAttachmentTooltip"))
+					.setButtonText(this.translate(msg({ message: "Add attachment", context: "modals.timeblockCreation.addAttachmentButton" })))
+					.setTooltip(this.translate(msg({ message: "Select a file or note using fuzzy search", context: "modals.timeblockCreation.addAttachmentTooltip" })))
 					.onClick(() => {
-						openFileSelector(this.plugin, (file) => {
-							if (file) this.addAttachment(file);
-						}, {
-							placeholder: "Search files or type to create new...",
-							filter: "all",
-							sortOrder:
-								this.plugin.settings.calendarViewSettings
-									.timeblockAttachmentSearchOrder,
-						});
+						openFileSelector(
+							this.plugin,
+							(file) => {
+								if (file instanceof TAbstractFile) this.addAttachment(file);
+							},
+							{
+								placeholder: this.translate(msg({ message: "Search files or type to create new...", context: "modals.fileSelector.placeholder" })),
+								filter: "all",
+								sortOrder:
+									this.plugin.settings.calendarViewSettings
+										.timeblockAttachmentSearchOrder,
+							}
+						);
 					});
 			})
 			.addButton((button) => {
 				button
-					.setButtonText("Add task")
-					.setTooltip("Select task")
+					.setButtonText(this.translate(msg({ message: "Add task", context: "modals.task.dependencies.addTaskButton" })))
+					.setTooltip(this.translate(msg({ message: "Select task", context: "modals.taskSelector.title" })))
 					.onClick(() => {
 						void this.openTaskSelectorForTitle();
 					});
@@ -179,14 +251,18 @@ export class TimeblockCreationModal extends Modal {
 		// Buttons
 		const buttonContainer = contentEl.createDiv({ cls: "timeblock-modal-buttons" });
 
-		const cancelButton = buttonContainer.createEl("button", { text: this.translate("common.cancel") });
+		const cancelButton = buttonContainer.createEl("button", {
+			text: this.translate(msg({ message: "Cancel", context: "common.cancel" })),
+		});
 		cancelButton.addEventListener("click", () => this.close());
 
 		const createButton = buttonContainer.createEl("button", {
-			text: this.translate("modals.timeblockCreation.createButton"),
+			text: this.translate(msg({ message: "Create timeblock", context: "modals.timeblockCreation.createButton" })),
 			cls: "mod-cta timeblock-create-button",
 		});
-		createButton.addEventListener("click", () => this.handleSubmit());
+		createButton.addEventListener("click", () => {
+			void this.handleSubmit();
+		});
 
 		// Initial validation
 		this.validateForm();
@@ -212,9 +288,9 @@ export class TimeblockCreationModal extends Modal {
 			const startMinutes = startHour * 60 + startMin;
 			let endMinutes = endHour * 60 + endMin;
 
-			// Treat 00:00 as 23:59 (end of day) for validation purposes
-			if (endMinutes === 0) {
-				endMinutes = 23 * 60 + 59; // 1439 minutes
+			// Treat 00:00 as the end of the selected day when it follows a later start.
+			if (endTime === "00:00" && startMinutes > 0) {
+				endMinutes = 24 * 60;
 			}
 
 			if (endMinutes <= startMinutes) {
@@ -232,7 +308,9 @@ export class TimeblockCreationModal extends Modal {
 			return;
 		}
 
-		const uniquePaths = new Set(prefilledPaths.filter((path) => typeof path === "string" && path.trim().length > 0));
+		const uniquePaths = new Set(
+			prefilledPaths.filter((path) => typeof path === "string" && path.trim().length > 0)
+		);
 		for (const path of uniquePaths) {
 			const file = this.app.vault.getAbstractFileByPath(path);
 			if (file) {
@@ -246,17 +324,15 @@ export class TimeblockCreationModal extends Modal {
 			// Validate inputs
 			const title = this.titleInput.value.trim();
 			const startTime = this.startTimeInput.value;
-			let endTime = this.endTimeInput.value;
+			const endTime = this.endTimeInput.value;
 			const description = this.descriptionInput.value.trim();
-			const color = this.colorInput.value;
+			const color = normalizeThemeColor(
+				this.colorInput.value,
+				this.plugin.settings.calendarViewSettings.defaultTimeblockColor
+			);
 			if (!title || !startTime || !endTime) {
-				new Notice(this.translate("notices.timeblockRequiredFieldsMissing"));
+				new Notice(this.translate(msg({ message: "Please fill in all required fields", context: "notices.timeblockRequiredFieldsMissing" })));
 				return;
-			}
-
-			// Convert 00:00 to 23:59 for end time before saving
-			if (endTime === "00:00") {
-				endTime = "23:59";
 			}
 
 			// Convert selected attachments to wikilinks
@@ -284,44 +360,56 @@ export class TimeblockCreationModal extends Modal {
 			}
 
 			// Save to daily note
-			await this.saveTimeblockToDailyNote(timeblock);
+			const dailyNote = await this.saveTimeblockToDailyNote(timeblock);
 
 			// Refresh calendar views
 			this.plugin.emitter.trigger("data-changed");
+			void this.options.onCreated?.({
+				timeblock,
+				date: this.options.date,
+				dailyNote,
+			});
 
-			new Notice(`Timeblock "${title}" created successfully`);
+			new Notice(this.translate(msg({ message: "Timeblock \"{title}\" created successfully", context: "modals.timeblockCreation.created" }), { title }));
 			this.close();
 		} catch (error) {
-			console.error("Error creating timeblock:", error);
-			new Notice("Failed to create timeblock. Check console for details.");
+			tasknotesLogger.error("Error creating timeblock:", {
+				category: "internal",
+				operation: "creating-timeblock",
+				error: error,
+			});
+			new Notice(getTimeblockCreationErrorMessage(error));
 		}
 	}
 
-	private async saveTimeblockToDailyNote(timeblock: TimeBlock): Promise<void> {
+	private async saveTimeblockToDailyNote(timeblock: TimeBlock): Promise<TFile> {
 		if (!appHasDailyNotesPluginLoaded()) {
-			throw new Error("Daily Notes plugin is not enabled");
+			throw new Error(
+				`Daily Notes core plugin is not enabled. ${TIMEBLOCK_DAILY_NOTES_SETUP_GUIDANCE}`
+			);
 		}
 
 		// Get or create daily note for the date
-		const moment = (window as any).moment(this.options.date);
-		const allDailyNotes = getAllDailyNotes();
-		let dailyNote = getDailyNote(moment, allDailyNotes);
+		const dailyNoteMoment = getDailyNoteMoment(this.options.date);
+		const allDailyNotes = readDailyNotesForTimeblockCreation();
+		let dailyNote = getDailyNote(dailyNoteMoment, allDailyNotes);
 
 		if (!dailyNote) {
 			// Create daily note if it doesn't exist
 			try {
-				dailyNote = await createDailyNote(moment);
+				dailyNote = await createDailyNote(dailyNoteMoment);
 			} catch (error) {
-				const errorMessage = error instanceof Error ? error.message : String(error);
+				const errorMessage = getUnknownErrorMessage(error);
+				const detail = errorMessage ? `: ${errorMessage}` : "";
 				throw new Error(
-					`Failed to create daily note: ${errorMessage}. Please check your Daily Notes plugin configuration and ensure the daily notes folder exists.`
+					`Failed to create daily note${detail}. ${TIMEBLOCK_DAILY_NOTES_SETUP_GUIDANCE}`
 				);
 			}
 
 			// Validate that daily note was created successfully
 			if (!dailyNote) {
 				throw new Error(
-					"Failed to create daily note. Please check your Daily Notes plugin configuration and ensure the daily notes folder exists."
+					`Failed to create daily note. ${TIMEBLOCK_DAILY_NOTES_SETUP_GUIDANCE}`
 				);
 			}
 		}
@@ -331,20 +419,19 @@ export class TimeblockCreationModal extends Modal {
 
 		// Parse existing frontmatter
 		let frontmatter: DailyNoteFrontmatter = {};
-		let bodyContent = content;
+		const info = getFrontMatterInfo(content);
+		const bodyContent = info.exists ? content.slice(info.contentStart) : content;
 
-		if (content.startsWith("---")) {
-			const endOfFrontmatter = content.indexOf("---", 3);
-			if (endOfFrontmatter !== -1) {
-				const frontmatterText = content.substring(3, endOfFrontmatter);
-				bodyContent = content.substring(endOfFrontmatter + 3);
-
-				try {
-					frontmatter = parseYaml(frontmatterText) || {};
-				} catch (error) {
-					console.error("Error parsing existing frontmatter:", error);
-					frontmatter = {};
-				}
+		if (info.exists) {
+			try {
+				frontmatter = parseYaml(info.frontmatter) || {};
+			} catch (error) {
+				tasknotesLogger.error("Error parsing existing frontmatter:", {
+					category: "validation",
+					operation: "parsing-existing-frontmatter",
+					error: error,
+				});
+				frontmatter = {};
 			}
 		}
 
@@ -355,21 +442,24 @@ export class TimeblockCreationModal extends Modal {
 		frontmatter.timeblocks.push(timeblock);
 
 		// Convert frontmatter back to YAML
-		const frontmatterText = stringifyYaml(frontmatter);
+		const newFrontmatterText = stringifyYaml(frontmatter);
 
 		// Reconstruct file content
-		const newContent = `---\n${frontmatterText}---${bodyContent}`;
+		const newContent = `---\n${newFrontmatterText}---\n${bodyContent}`;
 
 		// Write back to file
-		await this.app.vault.modify(dailyNote, newContent);
+		await modifyVaultFile(this.app, dailyNote, newContent);
 
 		// The native metadata cache will automatically update
+		return dailyNote;
 	}
 
 	private addAttachment(file: TAbstractFile): void {
 		// Avoid duplicates
 		if (this.selectedAttachments.some((existing) => existing.path === file.path)) {
-			new Notice(this.translate("notices.timeblockAttachmentExists", { fileName: file.name }));
+			new Notice(
+				this.translate(msg({ message: "\"{fileName}\" is already attached", context: "notices.timeblockAttachmentExists" }), { fileName: file.name })
+			);
 			return;
 		}
 
@@ -382,7 +472,7 @@ export class TimeblockCreationModal extends Modal {
 
 		this.selectedAttachments.push(file);
 		this.renderAttachmentsList();
-		new Notice(this.translate("notices.timeblockAttachmentAdded", { fileName: file.name }));
+		new Notice(this.translate(msg({ message: "Added \"{fileName}\" as attachment", context: "notices.timeblockAttachmentAdded" }), { fileName: file.name }));
 	}
 
 	private async openTaskSelectorForTitle(): Promise<void> {
@@ -391,26 +481,37 @@ export class TimeblockCreationModal extends Modal {
 			const candidates = allTasks.filter((task) => !task.archived);
 
 			if (candidates.length === 0) {
-				new Notice("No tasks available to select");
+				new Notice(this.translate(msg({ message: "No tasks available to select", context: "modals.timeblockInfo.noTasks" })));
 				return;
 			}
 
-			openTaskSelector(this.plugin, candidates, (selectedTask) => {
-				if (!selectedTask) return;
+			openTaskSelector(
+				this.plugin,
+				candidates,
+				(selectedTask) => {
+					if (!selectedTask) return;
 
-				this.titleInput.value = selectedTask.title || "";
-				this.validateForm();
+					if (!this.titleInput.value.trim()) {
+						this.titleInput.value = selectedTask.title || "";
+						this.validateForm();
+					}
 
-				const taskFile = this.app.vault.getAbstractFileByPath(selectedTask.path);
-				if (taskFile) {
-					this.addAttachment(taskFile);
+					const taskFile = this.app.vault.getAbstractFileByPath(selectedTask.path);
+					if (taskFile) {
+						this.addAttachment(taskFile);
+					}
+				},
+				{
+					title: this.translate(msg({ message: "Select task", context: "modals.taskSelector.title" })),
 				}
-			}, {
-				title: "Select task",
-			});
+			);
 		} catch (error) {
-			console.error("Failed to open task selector for timeblock creation:", error);
-			new Notice("Failed to open task selector");
+			tasknotesLogger.error("Failed to open task selector for timeblock creation:", {
+				category: "persistence",
+				operation: "open-task-selector-timeblock-creation",
+				error: error,
+			});
+			new Notice(this.translate(msg({ message: "Failed to open task selector", context: "modals.timeblockInfo.selectorFailed" })));
 		}
 	}
 
@@ -419,7 +520,7 @@ export class TimeblockCreationModal extends Modal {
 			(existing) => existing.path !== file.path
 		);
 		this.renderAttachmentsList();
-		new Notice(this.translate("notices.timeblockAttachmentRemoved", { fileName: file.name }));
+		new Notice(this.translate(msg({ message: "Removed \"{fileName}\" from attachments", context: "notices.timeblockAttachmentRemoved" }), { fileName: file.name }));
 	}
 
 	private renderAttachmentsList(): void {
@@ -429,7 +530,7 @@ export class TimeblockCreationModal extends Modal {
 			const emptyState = this.attachmentsList.createDiv({
 				cls: "timeblock-attachments-empty",
 			});
-			emptyState.textContent = "No attachments added yet";
+			emptyState.textContent = uiText(msg({ message: "No attachments added yet", context: "modals/TimeblockCreationModal: TimeblockCreationModal.renderAttachmentsList display" }));
 			return;
 		}
 
@@ -456,7 +557,7 @@ export class TimeblockCreationModal extends Modal {
 				cls: "timeblock-attachment-remove",
 				text: "×",
 			});
-			setTooltip(removeBtn, "Remove attachment", { placement: "top" });
+			setTooltip(removeBtn, uiText(msg({ message: "Remove attachment", context: "modals/TimeblockCreationModal: TimeblockCreationModal.renderAttachmentsList display" })), { placement: "top" });
 			removeBtn.addEventListener("click", () => {
 				this.removeAttachment(file);
 			});

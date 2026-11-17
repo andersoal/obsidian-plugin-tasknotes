@@ -1,4 +1,7 @@
 import "reflect-metadata";
+import { createTaskNotesLogger } from "./tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Utils/OpenAPIDecorators" });
 
 // OpenAPI specification interfaces
 export interface OpenAPIParameter {
@@ -20,8 +23,8 @@ export interface OpenAPIResponse {
 	description: string;
 	content?: {
 		[mediaType: string]: {
-			schema: any;
-			example?: any;
+			schema: unknown;
+			example?: unknown;
 		};
 	};
 }
@@ -36,8 +39,8 @@ export interface OpenAPIOperation {
 		required?: boolean;
 		content: {
 			[mediaType: string]: {
-				schema: any;
-				example?: any;
+				schema: unknown;
+				example?: unknown;
 			};
 		};
 	};
@@ -51,6 +54,29 @@ export interface OpenAPIEndpoint {
 	path: string;
 	method: string;
 	operation: OpenAPIOperation;
+}
+
+export interface OpenAPISpec {
+	openapi: string;
+	info: {
+		title: string;
+		version: string;
+		description: string;
+		contact: {
+			name: string;
+			url: string;
+		};
+	};
+	servers: Array<{
+		url: string;
+		description: string;
+	}>;
+	security: Array<{ [securityScheme: string]: string[] }>;
+	paths: Record<string, Record<string, OpenAPIOperation>>;
+	components: {
+		securitySchemes: Record<string, unknown>;
+		schemas: Record<string, unknown>;
+	};
 }
 
 // Metadata keys for storing OpenAPI information
@@ -68,18 +94,17 @@ export interface RouteInfo {
 /**
  * Class decorator to mark a class as having OpenAPI endpoints
  */
-export function OpenAPIController(target: any) {
+export function OpenAPIController(target: object) {
 	if (!Reflect.hasMetadata(OPENAPI_ENDPOINTS_KEY, target)) {
 		Reflect.defineMetadata(OPENAPI_ENDPOINTS_KEY, [], target);
 	}
-	return target;
 }
 
 /**
  * Route decorator for defining HTTP routes
  */
 export function Route(method: string, path: string) {
-	return function (target: any, propertyKey: string, descriptor: PropertyDescriptor) {
+	return function (target: object, propertyKey: string, descriptor: PropertyDescriptor) {
 		// Store route metadata
 		Reflect.defineMetadata(
 			ROUTE_KEY,
@@ -118,7 +143,7 @@ export function Delete(path: string) {
  * Method decorator for documenting API endpoints
  */
 export function OpenAPI(operation: OpenAPIOperation) {
-	return function (target: any, propertyKey: string, descriptor: PropertyDescriptor) {
+	return function (target: object, propertyKey: string, descriptor: PropertyDescriptor) {
 		Reflect.defineMetadata(OPENAPI_OPERATION_KEY, operation, target, propertyKey);
 
 		// Store endpoint information on the class
@@ -145,8 +170,12 @@ export function OpenAPI(operation: OpenAPIOperation) {
  * New code should use @Route decorators instead
  */
 function extractPathAndMethod(methodName: string): { path: string; method: string } {
-	console.warn(
-		`extractPathAndMethod is deprecated. Use @Route decorators on method: ${methodName}`
+	tasknotesLogger.warn(
+		`extractPathAndMethod is deprecated. Use @Route decorators on method: ${methodName}`,
+		{
+			category: "provider",
+			operation: "extractpathandmethod-deprecated-use-route-decorators-on-method",
+		}
 	);
 	return { path: "/api/unknown", method: "get" };
 }
@@ -154,7 +183,7 @@ function extractPathAndMethod(methodName: string): { path: string; method: strin
 /**
  * Generate OpenAPI specification from decorated methods
  */
-export function generateOpenAPISpec(controllerInstance: any): any {
+export function generateOpenAPISpec(controllerInstance: object): OpenAPISpec {
 	// Get endpoints from @OpenAPI decorators
 	const openAPIEndpoints: OpenAPIEndpoint[] =
 		Reflect.getMetadata(OPENAPI_ENDPOINTS_KEY, controllerInstance.constructor) || [];
@@ -162,7 +191,7 @@ export function generateOpenAPISpec(controllerInstance: any): any {
 	// Also get routes from @Get/@Post/etc decorators
 	const routes: RouteInfo[] = getRoutes(controllerInstance.constructor) || [];
 
-	const spec = {
+	const spec: OpenAPISpec = {
 		openapi: "3.0.0",
 		info: {
 			title: "TaskNotes API",
@@ -185,7 +214,7 @@ export function generateOpenAPISpec(controllerInstance: any): any {
 				bearerAuth: [],
 			},
 		],
-		paths: {} as any,
+		paths: {},
 		components: {
 			securitySchemes: {
 				bearerAuth: {
@@ -260,7 +289,7 @@ export function generateOpenAPISpec(controllerInstance: any): any {
 /**
  * Common schema definitions for TaskNotes API
  */
-function getCommonSchemas(): any {
+function getCommonSchemas(): Record<string, unknown> {
 	return {
 		APIResponse: {
 			type: "object",
@@ -352,6 +381,56 @@ function getCommonSchemas(): any {
 					description: "Estimated time in minutes",
 					nullable: true,
 				},
+				recurrence: {
+					type: "string",
+					description: "RFC 5545 recurrence rule string",
+					nullable: true,
+				},
+				recurrence_anchor: {
+					type: "string",
+					enum: ["scheduled", "completion"],
+					description:
+						"Whether recurrence advances from the scheduled date or completion date",
+					nullable: true,
+				},
+				reminders: {
+					type: "array",
+					items: {
+						$ref: "#/components/schemas/Reminder",
+					},
+					description: "Task reminders",
+				},
+				blockedBy: {
+					type: "array",
+					items: {
+						$ref: "#/components/schemas/TaskDependency",
+					},
+					description: "Dependencies that must be satisfied before this task can start",
+				},
+				blocking: {
+					type: "array",
+					items: {
+						type: "string",
+					},
+					description:
+						"Task paths this task blocks. This is derived from other tasks' blockedBy fields.",
+					readOnly: true,
+				},
+				isBlocked: {
+					type: "boolean",
+					description: "Whether this task has incomplete blocking dependencies",
+					readOnly: true,
+				},
+				isBlocking: {
+					type: "boolean",
+					description: "Whether this task blocks at least one other task",
+					readOnly: true,
+				},
+				hasSubtasks: {
+					type: "boolean",
+					description: "Whether another task references this task as a project",
+					readOnly: true,
+				},
 				details: {
 					type: "string",
 					description: "Additional task details/description",
@@ -428,8 +507,217 @@ function getCommonSchemas(): any {
 					minimum: 0,
 					description: "Estimated time in minutes",
 				},
+				recurrence: {
+					type: "string",
+					description: "RFC 5545 recurrence rule string",
+				},
+				recurrence_anchor: {
+					type: "string",
+					enum: ["scheduled", "completion"],
+					description:
+						"Whether recurrence advances from the scheduled date or completion date",
+				},
+				reminders: {
+					type: "array",
+					items: {
+						$ref: "#/components/schemas/Reminder",
+					},
+					description: "Task reminders",
+				},
+				blockedBy: {
+					type: "array",
+					items: {
+						$ref: "#/components/schemas/TaskDependency",
+					},
+					description: "Dependencies that must be satisfied before this task can start",
+				},
 			},
 			required: ["title"],
+		},
+		FilterQuery: {
+			allOf: [
+				{
+					$ref: "#/components/schemas/FilterGroup",
+				},
+				{
+					type: "object",
+					properties: {
+						sortKey: {
+							type: "string",
+							description:
+								"Optional task sort key: due, scheduled, priority, status, title, dateCreated, completedDate, tags, or a configured user field using user:<id-or-key> or user.<id-or-key>.",
+						},
+						sortDirection: {
+							type: "string",
+							enum: ["asc", "desc"],
+							description: "Sort direction.",
+						},
+						groupKey: {
+							type: "string",
+							description:
+								"Optional grouping key: none, priority, context, project, due, scheduled, status, tags, completedDate, or a configured user field using user:<id-or-key> or user.<id-or-key>.",
+						},
+						subgroupKey: {
+							type: "string",
+							description: "Optional secondary grouping key; configured user fields accept user:<id-or-key> or user.<id-or-key>.",
+						},
+					},
+				},
+			],
+		},
+		FilterGroup: {
+			type: "object",
+			properties: {
+				type: {
+					type: "string",
+					enum: ["group"],
+				},
+				id: {
+					type: "string",
+					description: "Client-provided identifier for this group.",
+				},
+				conjunction: {
+					type: "string",
+					enum: ["and", "or"],
+					description: "How child conditions and groups are combined.",
+				},
+				children: {
+					type: "array",
+					items: {
+						oneOf: [
+							{
+								$ref: "#/components/schemas/FilterCondition",
+							},
+							{
+								$ref: "#/components/schemas/FilterGroup",
+							},
+						],
+					},
+				},
+			},
+			required: ["type", "id", "conjunction", "children"],
+		},
+		FilterCondition: {
+			type: "object",
+			properties: {
+				type: {
+					type: "string",
+					enum: ["condition"],
+				},
+				id: {
+					type: "string",
+					description: "Client-provided identifier for this condition.",
+				},
+				property: {
+					type: "string",
+					oneOf: [
+						{
+							enum: [
+								"title", "path", "status", "priority", "tags", "contexts", "projects",
+								"blockedBy", "blocking", "due", "scheduled", "completedDate", "dateCreated",
+								"dateModified", "archived", "hasSubtasks", "dependencies.isBlocked",
+								"dependencies.isBlocking", "timeEstimate", "recurrence", "status.isCompleted",
+							],
+						},
+						{ pattern: "^user[:.].+$" },
+					],
+					description: "Task property to filter on. Configured user fields accept user:<id-or-key> or user.<id-or-key>. Discover canonical IDs and aliases with GET /api/filter-options; unknown properties and bare custom keys return HTTP 400.",
+				},
+				operator: {
+					type: "string",
+					enum: [
+						"is",
+						"is-not",
+						"contains",
+						"does-not-contain",
+						"is-before",
+						"is-after",
+						"is-on-or-before",
+						"is-on-or-after",
+						"is-empty",
+						"is-not-empty",
+						"is-checked",
+						"is-not-checked",
+						"is-greater-than",
+						"is-less-than",
+						"is-greater-than-or-equal",
+						"is-less-than-or-equal",
+					],
+					description:
+						"Comparison operator. Use an operator supported by the selected property.",
+				},
+				value: {
+					description:
+						"Comparison value. Empty and checked operators do not require a value.",
+					nullable: true,
+					oneOf: [
+						{
+							type: "string",
+						},
+						{
+							type: "array",
+							items: {
+								type: "string",
+							},
+						},
+						{
+							type: "number",
+						},
+						{
+							type: "boolean",
+						},
+					],
+				},
+			},
+			required: ["type", "id", "property", "operator"],
+		},
+		TaskDependency: {
+			type: "object",
+			properties: {
+				uid: {
+					type: "string",
+					description: "Link or identifier for the blocking task",
+				},
+				reltype: {
+					type: "string",
+					enum: ["FINISHTOSTART", "FINISHTOFINISH", "STARTTOSTART", "STARTTOFINISH"],
+					description: "Dependency relationship type",
+				},
+				gap: {
+					type: "string",
+					description: "Optional ISO 8601 duration offset between tasks",
+				},
+			},
+			required: ["uid", "reltype"],
+		},
+		Reminder: {
+			type: "object",
+			properties: {
+				id: {
+					type: "string",
+					description: "Reminder identifier",
+				},
+				type: {
+					type: "string",
+					enum: ["absolute", "relative"],
+					description: "Reminder type",
+				},
+				absoluteTime: {
+					type: "string",
+					format: "date-time",
+					description: "Absolute reminder timestamp",
+				},
+				relatedTo: {
+					type: "string",
+					enum: ["due", "scheduled"],
+					description: "Date field used as the relative reminder anchor",
+				},
+				offset: {
+					type: "string",
+					description: "ISO 8601 duration relative to the anchor date",
+				},
+			},
+			required: ["id", "type"],
 		},
 		TaskStats: {
 			type: "object",
@@ -1008,14 +1296,14 @@ function getCommonSchemas(): any {
 /**
  * Get route metadata from a method
  */
-export function getRouteInfo(target: any, propertyKey: string): RouteInfo | undefined {
+export function getRouteInfo(target: object, propertyKey: string): RouteInfo | undefined {
 	return Reflect.getMetadata(ROUTE_KEY, target, propertyKey);
 }
 
 /**
  * Get all routes from a controller class
  */
-export function getRoutes(controllerClass: any): RouteInfo[] {
+export function getRoutes(controllerClass: object): RouteInfo[] {
 	return Reflect.getMetadata("routes", controllerClass) || [];
 }
 
@@ -1023,7 +1311,7 @@ export function getRoutes(controllerClass: any): RouteInfo[] {
  * Get OpenAPI operation metadata from a method
  */
 export function getOpenAPIOperation(
-	target: any,
+	target: object,
 	propertyKey: string
 ): OpenAPIOperation | undefined {
 	return Reflect.getMetadata(OPENAPI_OPERATION_KEY, target, propertyKey);
@@ -1032,7 +1320,7 @@ export function getOpenAPIOperation(
 /**
  * Check if a class has OpenAPI endpoints
  */
-export function hasOpenAPIEndpoints(target: any): boolean {
+export function hasOpenAPIEndpoints(target: object): boolean {
 	const endpoints: OpenAPIEndpoint[] = Reflect.getMetadata(OPENAPI_ENDPOINTS_KEY, target) || [];
 	return endpoints.length > 0;
 }

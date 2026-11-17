@@ -1,6 +1,11 @@
 import { TFile, parseLinktext } from "obsidian";
 import { TaskInfo } from "../types";
 import TaskNotesPlugin from "../main";
+import { createTaskNotesLogger, type TaskNotesLogger } from "../utils/tasknotesLogger";
+import {
+	formatTaskLinkSubpathDisplayText,
+	resolveTaskLinkDisplayText,
+} from "../editor/taskLinkDisplayText";
 
 export interface TaskLinkInfo {
 	isValidTaskLink: boolean;
@@ -9,12 +14,26 @@ export interface TaskLinkInfo {
 	displayText?: string;
 }
 
+interface ParsedTaskLink {
+	linkPath: string;
+	displayText?: string;
+	subpath?: string;
+	hasExplicitAlias: boolean;
+}
+
 export class TaskLinkDetectionService {
 	private plugin: TaskNotesPlugin;
 	private linkCache = new Map<string, { result: TaskLinkInfo; lastModified: number }>();
+	private logger: TaskNotesLogger;
 
-	constructor(plugin: TaskNotesPlugin) {
+	constructor(plugin: TaskNotesPlugin, logger?: TaskNotesLogger) {
 		this.plugin = plugin;
+		this.logger =
+			logger ??
+			createTaskNotesLogger({
+				tag: "TaskLinkDetectionService",
+				isDebugEnabled: () => plugin.settings.enableDebugLogging,
+			});
 	}
 
 	/**
@@ -34,7 +53,7 @@ export class TaskLinkDetectionService {
 			return { isValidTaskLink: false };
 		}
 
-		const { linkPath, displayText } = parsed;
+		const { linkPath, displayText: parsedDisplayText } = parsed;
 		const cacheKey = `${sourcePath}:${linkPath}`;
 
 		// Check cache first
@@ -66,6 +85,13 @@ export class TaskLinkDetectionService {
 		try {
 			const taskInfo = await this.plugin.cacheManager.getTaskInfo(resolvedPath);
 			if (taskInfo) {
+				const displayText = this.resolveDisplayText(
+					parsed,
+					linkType,
+					taskInfo,
+					linkPath,
+					parsedDisplayText
+				);
 				const result: TaskLinkInfo = {
 					isValidTaskLink: true,
 					taskPath: resolvedPath,
@@ -76,11 +102,12 @@ export class TaskLinkDetectionService {
 				return result;
 			}
 		} catch (error) {
-			console.debug(
-				"TaskLinkDetectionService: Error checking task info for link:",
-				resolvedPath,
-				error
-			);
+			this.logger.debug("Error checking task info for link", {
+				category: "stale-data",
+				operation: "detect-task-link",
+				details: { resolvedPath },
+				error,
+			});
 		}
 
 		const result = { isValidTaskLink: false };
@@ -88,10 +115,31 @@ export class TaskLinkDetectionService {
 		return result;
 	}
 
+	private resolveDisplayText(
+		parsed: ParsedTaskLink,
+		linkType: "wikilink" | "markdown",
+		taskInfo: TaskInfo,
+		linkPath: string,
+		parsedDisplayText?: string
+	): string | undefined {
+		if (linkType === "markdown") {
+			if (parsedDisplayText) {
+				return resolveTaskLinkDisplayText(parsedDisplayText, taskInfo.path, linkPath);
+			}
+			return formatTaskLinkSubpathDisplayText(taskInfo.title, parsed.subpath);
+		}
+
+		if (parsed.hasExplicitAlias) {
+			return parsedDisplayText;
+		}
+
+		return formatTaskLinkSubpathDisplayText(taskInfo.title, parsed.subpath);
+	}
+
 	/**
 	 * Parse wikilink syntax to extract link path and display text
 	 */
-	private parseWikilink(wikilinkText: string): { linkPath: string; displayText?: string } | null {
+	private parseWikilink(wikilinkText: string): ParsedTaskLink | null {
 		// Remove the [[ and ]] brackets
 		const content = wikilinkText.slice(2, -2).trim();
 		if (!content) return null;
@@ -109,6 +157,8 @@ export class TaskLinkDetectionService {
 			return {
 				linkPath: parsed.path,
 				displayText: aliasPart,
+				subpath: parsed.subpath || undefined,
+				hasExplicitAlias: true,
 			};
 		}
 
@@ -116,7 +166,8 @@ export class TaskLinkDetectionService {
 		const parsed = parseLinktext(content);
 		return {
 			linkPath: parsed.path,
-			displayText: parsed.subpath || undefined,
+			subpath: parsed.subpath || undefined,
+			hasExplicitAlias: false,
 		};
 	}
 
@@ -125,7 +176,7 @@ export class TaskLinkDetectionService {
 	 */
 	private parseMarkdownLink(
 		markdownLinkText: string
-	): { linkPath: string; displayText?: string } | null {
+	): ParsedTaskLink | null {
 		// Parse markdown link: [text](path)
 		const match = markdownLinkText.match(/^\[([^\]]*)\]\(([^)]+)\)$/);
 		if (!match) return null;
@@ -144,11 +195,12 @@ export class TaskLinkDetectionService {
 		try {
 			linkPath = decodeURIComponent(linkPath);
 		} catch (error) {
-			console.debug(
-				"TaskLinkDetectionService: Failed to decode URI component:",
-				linkPath,
-				error
-			);
+			this.logger.debug("Failed to decode URI component", {
+				category: "validation",
+				operation: "parse-markdown-link",
+				details: { linkPath },
+				error,
+			});
 			// If decoding fails, use the original path
 		}
 
@@ -157,7 +209,9 @@ export class TaskLinkDetectionService {
 
 		return {
 			linkPath: parsed.path,
-			displayText: displayText || parsed.subpath || undefined,
+			displayText: displayText || undefined,
+			subpath: parsed.subpath || undefined,
+			hasExplicitAlias: Boolean(displayText),
 		};
 	}
 
@@ -170,7 +224,12 @@ export class TaskLinkDetectionService {
 			const file = this.plugin.app.metadataCache.getFirstLinkpathDest(linkPath, sourcePath);
 			return file?.path || null;
 		} catch (error) {
-			console.debug("Error resolving link path:", linkPath, error);
+			this.logger.debug("Error resolving link path", {
+				category: "provider",
+				operation: "resolve-link-path",
+				details: { linkPath, sourcePath },
+				error,
+			});
 			return null;
 		}
 	}

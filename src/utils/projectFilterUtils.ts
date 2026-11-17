@@ -1,3 +1,5 @@
+import { stringifyUnknown } from "./stringUtils";
+
 export interface ProjectPropertyFilter {
 	key: string;
 	value: string;
@@ -15,6 +17,65 @@ export interface PropertyFilterSettings {
 
 function normalizePropertyValue(value?: string): string {
 	return value != null ? value.trim() : "";
+}
+
+function normalizePropertyValues(value?: string): string[] {
+	const normalized = normalizePropertyValue(value);
+	return normalized.length > 0
+		? normalized
+				.split(",")
+				.map((item) => item.trim())
+				.filter(Boolean)
+		: [];
+}
+
+/**
+ * Only explicit containsAny calls opt in to expression parsing. Legacy values
+ * such as "not started" and quoted statuses retain their literal meaning.
+ * Malformed calls fail closed rather than accidentally suggesting every project.
+ */
+function parsePropertyValueExpression(value: string): { values: string[]; negate: boolean } | null {
+	const prefix = /^(?:![ \t]*|not\s+)?containsAny\s*\(/i.exec(value);
+	if (!prefix) return { values: normalizePropertyValues(value), negate: false };
+	if (!value.endsWith(")")) return null;
+	const args = value.slice(prefix[0].length, -1);
+	const values: string[] = [];
+	let token = "";
+	let quote = "";
+	let quoted = false;
+	let closedQuote = false;
+	for (let i = 0; i < args.length; i++) {
+		const char = args[i];
+		if (quote) {
+			if (char === "\\") {
+				i++;
+				if (i >= args.length) return null;
+				token += args[i];
+			} else if (char === quote) {
+				quote = "";
+				closedQuote = true;
+			} else token += char;
+		} else if (char === ",") {
+			if (!token.trim() && !quoted) return null;
+			values.push(quoted ? token : token.trim());
+			token = "";
+			quoted = false;
+			closedQuote = false;
+		} else if (char === '"' || char === "'") {
+			if (token.trim() || quoted) return null;
+			token = "";
+			quote = char;
+			quoted = true;
+		} else if (closedQuote) {
+			if (char.trim()) return null;
+		} else {
+			if (char === "(" || char === ")") return null;
+			token += char;
+		}
+	}
+	if (quote || (!token.trim() && !quoted)) return null;
+	values.push(quoted ? token : token.trim());
+	return { values, negate: /^(?:!|not\s)/i.test(value) };
 }
 
 export function normalizeProjectPropertyKey(key?: string): string {
@@ -49,14 +110,18 @@ export function matchesProjectProperty(
 		return false;
 	}
 
-	const actualValue = (frontmatter as Record<string, unknown>)[filter.key];
+	const actualValue = (frontmatter)[filter.key];
 
-	const expected = normalizePropertyValue(filter.value);
-	if (expected.length === 0) {
+	const parsed = parsePropertyValueExpression(normalizePropertyValue(filter.value));
+	if (!parsed) return false;
+	const expectedValues = parsed.values;
+	if (expectedValues.length === 0) {
 		return actualValue !== undefined && actualValue !== null;
 	}
 
-	const normalizedExpected = expected.toLowerCase();
+	const normalizedExpectedValues = new Set(
+		expectedValues.map((expectedValue) => expectedValue.toLowerCase())
+	);
 
 	const matchesValue = (value: unknown): boolean => {
 		if (value === null || value === undefined) {
@@ -66,20 +131,24 @@ export function matchesProjectProperty(
 			return value.some((item) => matchesValue(item));
 		}
 		if (typeof value === "string") {
-			return value.trim().toLowerCase() === normalizedExpected;
+			return normalizedExpectedValues.has(value.trim().toLowerCase());
 		}
 		if (typeof value === "number" || typeof value === "boolean") {
-			return String(value).toLowerCase() === normalizedExpected;
+			return normalizedExpectedValues.has(String(value).toLowerCase());
 		}
 		if (typeof value === "object") {
 			try {
-				return JSON.stringify(value).toLowerCase() === normalizedExpected;
+				return normalizedExpectedValues.has(JSON.stringify(value).toLowerCase());
 			} catch {
 				return false;
 			}
 		}
-		return String(value).toLowerCase() === normalizedExpected;
+		return normalizedExpectedValues.has(stringifyUnknown(value).toLowerCase());
 	};
 
-	return matchesValue(actualValue);
+	// A value filter never admits missing/empty properties, even under negation.
+	if (actualValue == null || (typeof actualValue === "string" && !actualValue.trim()) ||
+		(Array.isArray(actualValue) && actualValue.length === 0)) return false;
+	const matched = matchesValue(actualValue);
+	return parsed.negate ? !matched : matched;
 }

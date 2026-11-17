@@ -1,4 +1,7 @@
+import type { MessageDescriptor } from "@lingui/core";
+import { msg } from "@lingui/core/macro";
 import { Menu } from "obsidian";
+import type { MenuItem } from "obsidian";
 import { FilterOptions, FilterQuery, TaskGroupKey } from "../types";
 import type TaskNotesPlugin from "../main";
 
@@ -7,14 +10,14 @@ import type TaskNotesPlugin from "../main";
  * Kept independent for ease of testing and minimal integration surface.
  */
 export class SubgroupMenuBuilder {
-	private static translate(plugin: TaskNotesPlugin, key: string, fallback: string): string {
+	private static translate(plugin: TaskNotesPlugin, key: MessageDescriptor, fallback: string): string {
 		const translator = plugin?.i18n?.translate?.bind(plugin.i18n);
 		try {
 			const value = translator ? translator(key) : undefined;
 			if (typeof value === "string" && value.trim().length > 0) {
 				return value;
 			}
-		} catch (error) {
+		} catch {
 			// Ignore translation errors and use fallback
 		}
 		return fallback;
@@ -30,15 +33,27 @@ export class SubgroupMenuBuilder {
 		plugin: TaskNotesPlugin
 	): Record<string, string> {
 		const builtIn: Record<TaskGroupKey, string> = {
-			none: SubgroupMenuBuilder.translate(plugin, "ui.filterBar.group.none", "None"),
-			status: SubgroupMenuBuilder.translate(plugin, "ui.filterBar.group.status", "Status"),
-			priority: SubgroupMenuBuilder.translate(plugin, "ui.filterBar.group.priority", "Priority"),
-			context: SubgroupMenuBuilder.translate(plugin, "ui.filterBar.group.context", "Context"),
-			project: SubgroupMenuBuilder.translate(plugin, "ui.filterBar.group.project", "Project"),
-			due: SubgroupMenuBuilder.translate(plugin, "ui.filterBar.group.dueDate", "Due Date"),
-			scheduled: SubgroupMenuBuilder.translate(plugin, "ui.filterBar.group.scheduledDate", "Scheduled Date"),
-			tags: SubgroupMenuBuilder.translate(plugin, "ui.filterBar.group.tags", "Tags"),
-			completedDate: SubgroupMenuBuilder.translate(plugin, "ui.filterBar.group.completedDate", "Completed Date"),
+			none: SubgroupMenuBuilder.translate(plugin, msg({ message: "None", context: "ui.filterBar.group.none" }), "None"),
+			status: SubgroupMenuBuilder.translate(plugin, msg({ message: "Status", context: "ui.filterBar.group.status" }), "Status"),
+			priority: SubgroupMenuBuilder.translate(
+				plugin,
+				msg({ message: "Priority", context: "ui.filterBar.group.priority" }),
+				"Priority"
+			),
+			context: SubgroupMenuBuilder.translate(plugin, msg({ message: "Context", context: "ui.filterBar.group.context" }), "Context"),
+			project: SubgroupMenuBuilder.translate(plugin, msg({ message: "Project", context: "ui.filterBar.group.project" }), "Project"),
+			due: SubgroupMenuBuilder.translate(plugin, msg({ message: "Due date", context: "ui.filterBar.group.dueDate" }), "Due Date"),
+			scheduled: SubgroupMenuBuilder.translate(
+				plugin,
+				msg({ message: "Scheduled date", context: "ui.filterBar.group.scheduledDate" }),
+				"Scheduled Date"
+			),
+			tags: SubgroupMenuBuilder.translate(plugin, msg({ message: "Tags", context: "ui.filterBar.group.tags" }), "Tags"),
+			completedDate: SubgroupMenuBuilder.translate(
+				plugin,
+				msg({ message: "Completed date", context: "ui.filterBar.group.completedDate" }),
+				"Completed Date"
+			),
 		} as const;
 
 		const options: Record<string, string> = {};
@@ -77,19 +92,21 @@ export class SubgroupMenuBuilder {
 		onSelect: (key: TaskGroupKey) => void,
 		plugin: TaskNotesPlugin
 	): void {
-		const primary = (currentQuery.groupKey || "none") as TaskGroupKey;
-		const subKey = (currentQuery.subgroupKey || "none") as TaskGroupKey;
+		const primary = (currentQuery.groupKey || "none");
+		const subKey = (currentQuery.subgroupKey || "none");
 		const options = SubgroupMenuBuilder.buildOptions(primary, filterOptions, plugin);
 
 		// Visual separator and header
 		menu.addSeparator();
-		menu.addItem((item: any) => {
-			item.setTitle(SubgroupMenuBuilder.translate(plugin, "ui.filterBar.subgroupLabel", "SUBGROUP"));
+			menu.addItem((item: MenuItem) => {
+				item.setTitle(
+					SubgroupMenuBuilder.translate(plugin, msg({ message: "SUBGROUP", context: "ui.filterBar.subgroupLabel" }), "SUBGROUP")
+				);
 			if (typeof item.setDisabled === "function") item.setDisabled(true);
 		});
 
 		Object.entries(options).forEach(([key, label]) => {
-			menu.addItem((item: any) => {
+			menu.addItem((item: MenuItem) => {
 				item.setTitle(label);
 				if (subKey === key) item.setIcon("check");
 				item.onClick(() => onSelect(key as TaskGroupKey));

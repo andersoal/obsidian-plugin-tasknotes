@@ -1,5 +1,9 @@
+import { formatStableDate } from "../i18n/formatters";
 import { format } from "date-fns";
 import YAML from "yaml";
+import { createTaskNotesLogger } from "./tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Utils/TemplateProcessor" });
 // YAML not needed in template processor
 
 export interface TemplateData {
@@ -27,7 +31,7 @@ export interface ICSTemplateData extends TemplateData {
 }
 
 export interface ProcessedTemplate {
-	frontmatter: Record<string, any>;
+	frontmatter: Record<string, unknown>;
 	body: string;
 }
 
@@ -106,23 +110,32 @@ export function parseTemplateSections(templateContent: string): {
 function processTemplateFrontmatter(
 	frontmatterContent: string,
 	taskData: TemplateData | ICSTemplateData
-): Record<string, any> {
+): Record<string, unknown> {
 	try {
 		// First, process template variables in the raw YAML text with YAML-safe replacements
-		const processedYamlText = processTemplateVariablesForYaml(frontmatterContent, taskData);
+		const processedYamlText = quoteTemplaterYamlScalars(
+			processTemplateVariablesForYaml(frontmatterContent, taskData)
+		);
 
 		// Then parse the processed YAML
 		const parsedFrontmatter = YAML.parse(processedYamlText);
 
 		// Return empty object if parsing failed or result is not an object
 		if (typeof parsedFrontmatter !== "object" || parsedFrontmatter === null) {
-			console.warn("Template frontmatter did not parse to a valid object");
+			tasknotesLogger.warn("Template frontmatter did not parse to a valid object", {
+				category: "validation",
+				operation: "template-frontmatter-did-not-parse-valid-object",
+			});
 			return {};
 		}
 
 		return parsedFrontmatter;
 	} catch (error) {
-		console.error("Error processing template frontmatter:", error);
+		tasknotesLogger.error("Error processing template frontmatter:", {
+			category: "validation",
+			operation: "processing-template-frontmatter",
+			error: error,
+		});
 		return {};
 	}
 }
@@ -150,8 +163,7 @@ function processTemplateVariablesForYaml(
 
 	// {{title}} - Task title (quote if contains special characters)
 	const title = taskData.title || "";
-	const quotedTitle = needsYamlQuoting(title) ? `"${escapeYamlString(title)}"` : title;
-	result = result.replace(/\{\{title\}\}/g, quotedTitle);
+	result = replaceYamlTemplateVariable(result, "title", title);
 
 	// {{priority}} - Task priority
 	result = result.replace(/\{\{priority\}\}/g, taskData.priority || "");
@@ -187,8 +199,7 @@ function processTemplateVariablesForYaml(
 
 	// {{parentNote}} - Parent note name/path - ALWAYS quote for YAML safety
 	const parentNote = taskData.parentNote || "";
-	const quotedParentNote = parentNote ? `"${escapeYamlString(parentNote)}"` : "";
-	result = result.replace(/\{\{parentNote\}\}/g, quotedParentNote);
+	result = replaceYamlTemplateVariable(result, "parentNote", parentNote, { alwaysQuote: true });
 
 	// {{date}} - Current date (basic format only)
 	result = result.replace(/\{\{date\}\}/g, format(now, "yyyy-MM-dd"));
@@ -207,17 +218,17 @@ function processTemplateVariablesForYaml(
 	result = result.replace(/\{\{dateTime\}\}/g, format(now, "yyyy-MM-dd-HHmm"));
 	result = result.replace(/\{\{shortDate\}\}/g, format(now, "yyMMdd"));
 	result = result.replace(/\{\{shortYear\}\}/g, format(now, "yy"));
-	result = result.replace(/\{\{monthName\}\}/g, format(now, "MMMM"));
-	result = result.replace(/\{\{monthNameShort\}\}/g, format(now, "MMM"));
-	result = result.replace(/\{\{dayName\}\}/g, format(now, "EEEE"));
-	result = result.replace(/\{\{dayNameShort\}\}/g, format(now, "EEE"));
+	result = result.replace(/\{\{monthName\}\}/g, formatStableDate(now, "MMMM"));
+	result = result.replace(/\{\{monthNameShort\}\}/g, formatStableDate(now, "MMM"));
+	result = result.replace(/\{\{dayName\}\}/g, formatStableDate(now, "EEEE"));
+	result = result.replace(/\{\{dayNameShort\}\}/g, formatStableDate(now, "EEE"));
 	result = result.replace(/\{\{week\}\}/g, format(now, "ww"));
 	result = result.replace(/\{\{quarter\}\}/g, format(now, "q"));
-	result = result.replace(/\{\{time12\}\}/g, format(now, "hh:mm a"));
+	result = result.replace(/\{\{time12\}\}/g, formatStableDate(now, "hh:mm a"));
 	result = result.replace(/\{\{time24\}\}/g, format(now, "HH:mm"));
 	result = result.replace(/\{\{hourPadded\}\}/g, format(now, "HH"));
 	result = result.replace(/\{\{hour12\}\}/g, format(now, "hh"));
-	result = result.replace(/\{\{ampm\}\}/g, format(now, "a"));
+	result = result.replace(/\{\{ampm\}\}/g, formatStableDate(now, "a"));
 	result = result.replace(/\{\{unix\}\}/g, Math.floor(now.getTime() / 1000).toString());
 	result = result.replace(/\{\{unixMs\}\}/g, now.getTime().toString());
 	result = result.replace(/\{\{milliseconds\}\}/g, format(now, "SSS"));
@@ -235,7 +246,10 @@ function processTemplateVariablesForYaml(
 	const secondsSinceMidnight = Math.floor((now.getTime() - midnight.getTime()) / 1000);
 	const zettelId = `${datePart}${secondsSinceMidnight.toString(36)}`;
 	result = result.replace(/\{\{zettel\}\}/g, zettelId);
-	result = result.replace(/\{\{nano\}\}/g, Date.now().toString() + Math.random().toString(36).substring(2, 7));
+	result = result.replace(
+		/\{\{nano\}\}/g,
+		Date.now().toString() + Math.random().toString(36).substring(2, 7)
+	);
 
 	// Priority and status variations
 	const priority = taskData.priority || "";
@@ -247,8 +261,14 @@ function processTemplateVariablesForYaml(
 	const titleForVariations = taskData.title || "";
 	result = result.replace(/\{\{titleLower\}\}/g, titleForVariations.toLowerCase());
 	result = result.replace(/\{\{titleUpper\}\}/g, titleForVariations.toUpperCase());
-	result = result.replace(/\{\{titleSnake\}\}/g, titleForVariations.toLowerCase().replace(/\s+/g, "_"));
-	result = result.replace(/\{\{titleKebab\}\}/g, titleForVariations.toLowerCase().replace(/\s+/g, "-"));
+	result = result.replace(
+		/\{\{titleSnake\}\}/g,
+		titleForVariations.toLowerCase().replace(/\s+/g, "_")
+	);
+	result = result.replace(
+		/\{\{titleKebab\}\}/g,
+		titleForVariations.toLowerCase().replace(/\s+/g, "-")
+	);
 	result = result.replace(
 		/\{\{titleCamel\}\}/g,
 		titleForVariations
@@ -266,14 +286,11 @@ function processTemplateVariablesForYaml(
 
 	// ICS Event template variables (only available if taskData is ICSTemplateData)
 	if ("icsEventTitle" in taskData) {
-		const icsData = taskData as ICSTemplateData;
+		const icsData = taskData;
 
 		// {{icsEventTitle}} - ICS event title (quote if contains special characters)
 		const icsTitle = icsData.icsEventTitle || "";
-		const quotedIcsTitle = needsYamlQuoting(icsTitle)
-			? `"${escapeYamlString(icsTitle)}"`
-			: icsTitle;
-		result = result.replace(/\{\{icsEventTitle\}\}/g, quotedIcsTitle);
+		result = replaceYamlTemplateVariable(result, "icsEventTitle", icsTitle);
 
 		// {{icsEventStart}} - ICS event start time
 		result = result.replace(/\{\{icsEventStart\}\}/g, icsData.icsEventStart || "");
@@ -283,38 +300,61 @@ function processTemplateVariablesForYaml(
 
 		// {{icsEventLocation}} - ICS event location (quote if contains special characters)
 		const icsLocation = icsData.icsEventLocation || "";
-		const quotedIcsLocation =
-			icsLocation && needsYamlQuoting(icsLocation)
-				? `"${escapeYamlString(icsLocation)}"`
-				: icsLocation;
-		result = result.replace(/\{\{icsEventLocation\}\}/g, quotedIcsLocation);
+		result = replaceYamlTemplateVariable(result, "icsEventLocation", icsLocation);
 
 		// {{icsEventDescription}} - ICS event description (quote if contains special characters)
 		const icsDescription = icsData.icsEventDescription || "";
-		const quotedIcsDescription =
-			icsDescription && needsYamlQuoting(icsDescription)
-				? `"${escapeYamlString(icsDescription)}"`
-				: icsDescription;
-		result = result.replace(/\{\{icsEventDescription\}\}/g, quotedIcsDescription);
+		result = replaceYamlTemplateVariable(result, "icsEventDescription", icsDescription);
 
 		// {{icsEventUrl}} - ICS event URL
 		result = result.replace(/\{\{icsEventUrl\}\}/g, icsData.icsEventUrl || "");
 
 		// {{icsEventSubscription}} - ICS subscription name (quote if contains special characters)
 		const icsSubscription = icsData.icsEventSubscription || "";
-		const quotedIcsSubscription =
-			icsSubscription && needsYamlQuoting(icsSubscription)
-				? `"${escapeYamlString(icsSubscription)}"`
-				: icsSubscription;
-		result = result.replace(/\{\{icsEventSubscription\}\}/g, quotedIcsSubscription);
+		result = replaceYamlTemplateVariable(result, "icsEventSubscription", icsSubscription);
 
 		// {{icsEventId}} - ICS event ID (ALWAYS quote for YAML safety since it's a UUID)
 		const icsEventId = icsData.icsEventId || "";
-		const quotedIcsEventId = icsEventId ? `"${escapeYamlString(icsEventId)}"` : "";
-		result = result.replace(/\{\{icsEventId\}\}/g, quotedIcsEventId);
+		result = replaceYamlTemplateVariable(result, "icsEventId", icsEventId, {
+			alwaysQuote: true,
+		});
 	}
 
 	return result;
+}
+
+function replaceYamlTemplateVariable(
+	template: string,
+	variableName: string,
+	value: string,
+	options: { alwaysQuote?: boolean } = {}
+): string {
+	const escapedVariableName = variableName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const quotedPlaceholder = new RegExp(`(["'])\\{\\{${escapedVariableName}\\}\\}\\1`, "g");
+	const valueString = value || "";
+
+	let result = template.replace(quotedPlaceholder, (_match, quote: string) => {
+		const escapedValue =
+			quote === "'" ? valueString.replace(/'/g, "''") : escapeYamlString(valueString);
+		return `${quote}${escapedValue}${quote}`;
+	});
+
+	const replacement =
+		valueString && (options.alwaysQuote || needsYamlQuoting(valueString))
+			? `"${escapeYamlString(valueString)}"`
+			: valueString;
+	const unquotedPlaceholder = new RegExp(`\\{\\{${escapedVariableName}\\}\\}`, "g");
+	result = result.replace(unquotedPlaceholder, replacement);
+
+	return result;
+}
+
+function quoteTemplaterYamlScalars(yamlText: string): string {
+	return yamlText.replace(
+		/^(\s*[^#\n][^:\n]*:\s*)(<%.*?%>)(\s*)$/gm,
+		(_match, prefix: string, value: string, suffix: string) =>
+			`${prefix}"${escapeYamlString(value)}"${suffix}`
+	);
 }
 
 /**
@@ -413,17 +453,17 @@ export function processTemplateVariables(
 	result = result.replace(/\{\{dateTime\}\}/g, format(now, "yyyy-MM-dd-HHmm"));
 	result = result.replace(/\{\{shortDate\}\}/g, format(now, "yyMMdd"));
 	result = result.replace(/\{\{shortYear\}\}/g, format(now, "yy"));
-	result = result.replace(/\{\{monthName\}\}/g, format(now, "MMMM"));
-	result = result.replace(/\{\{monthNameShort\}\}/g, format(now, "MMM"));
-	result = result.replace(/\{\{dayName\}\}/g, format(now, "EEEE"));
-	result = result.replace(/\{\{dayNameShort\}\}/g, format(now, "EEE"));
+	result = result.replace(/\{\{monthName\}\}/g, formatStableDate(now, "MMMM"));
+	result = result.replace(/\{\{monthNameShort\}\}/g, formatStableDate(now, "MMM"));
+	result = result.replace(/\{\{dayName\}\}/g, formatStableDate(now, "EEEE"));
+	result = result.replace(/\{\{dayNameShort\}\}/g, formatStableDate(now, "EEE"));
 	result = result.replace(/\{\{week\}\}/g, format(now, "ww"));
 	result = result.replace(/\{\{quarter\}\}/g, format(now, "q"));
-	result = result.replace(/\{\{time12\}\}/g, format(now, "hh:mm a"));
+	result = result.replace(/\{\{time12\}\}/g, formatStableDate(now, "hh:mm a"));
 	result = result.replace(/\{\{time24\}\}/g, format(now, "HH:mm"));
 	result = result.replace(/\{\{hourPadded\}\}/g, format(now, "HH"));
 	result = result.replace(/\{\{hour12\}\}/g, format(now, "hh"));
-	result = result.replace(/\{\{ampm\}\}/g, format(now, "a"));
+	result = result.replace(/\{\{ampm\}\}/g, formatStableDate(now, "a"));
 	result = result.replace(/\{\{unix\}\}/g, Math.floor(now.getTime() / 1000).toString());
 	result = result.replace(/\{\{unixMs\}\}/g, now.getTime().toString());
 	result = result.replace(/\{\{milliseconds\}\}/g, format(now, "SSS"));
@@ -441,7 +481,10 @@ export function processTemplateVariables(
 	const secondsSinceMidnightBody = Math.floor((now.getTime() - midnightBody.getTime()) / 1000);
 	const zettelIdBody = `${datePartBody}${secondsSinceMidnightBody.toString(36)}`;
 	result = result.replace(/\{\{zettel\}\}/g, zettelIdBody);
-	result = result.replace(/\{\{nano\}\}/g, Date.now().toString() + Math.random().toString(36).substring(2, 7));
+	result = result.replace(
+		/\{\{nano\}\}/g,
+		Date.now().toString() + Math.random().toString(36).substring(2, 7)
+	);
 
 	// Priority and status variations
 	const priority = taskData.priority || "";
@@ -453,8 +496,14 @@ export function processTemplateVariables(
 	const titleForVariations = taskData.title || "";
 	result = result.replace(/\{\{titleLower\}\}/g, titleForVariations.toLowerCase());
 	result = result.replace(/\{\{titleUpper\}\}/g, titleForVariations.toUpperCase());
-	result = result.replace(/\{\{titleSnake\}\}/g, titleForVariations.toLowerCase().replace(/\s+/g, "_"));
-	result = result.replace(/\{\{titleKebab\}\}/g, titleForVariations.toLowerCase().replace(/\s+/g, "-"));
+	result = result.replace(
+		/\{\{titleSnake\}\}/g,
+		titleForVariations.toLowerCase().replace(/\s+/g, "_")
+	);
+	result = result.replace(
+		/\{\{titleKebab\}\}/g,
+		titleForVariations.toLowerCase().replace(/\s+/g, "-")
+	);
 	result = result.replace(
 		/\{\{titleCamel\}\}/g,
 		titleForVariations
@@ -472,7 +521,7 @@ export function processTemplateVariables(
 
 	// ICS Event template variables (only available if taskData is ICSTemplateData)
 	if ("icsEventTitle" in taskData) {
-		const icsData = taskData as ICSTemplateData;
+		const icsData = taskData;
 
 		// {{icsEventTitle}} - ICS event title
 		result = result.replace(/\{\{icsEventTitle\}\}/g, icsData.icsEventTitle || "");
@@ -510,9 +559,9 @@ export function processTemplateVariables(
  * User-defined values take precedence over template frontmatter
  */
 export function mergeTemplateFrontmatter(
-	baseFrontmatter: Record<string, any>,
-	templateFrontmatter: Record<string, any>
-): Record<string, any> {
+	baseFrontmatter: Record<string, unknown>,
+	templateFrontmatter: Record<string, unknown>
+): Record<string, unknown> {
 	// User-defined values (baseFrontmatter) take precedence over template values
 	return {
 		...templateFrontmatter,

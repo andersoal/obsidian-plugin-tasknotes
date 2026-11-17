@@ -1,3 +1,6 @@
+import type { OccurrenceMaterializationMode, OccurrenceNextTrigger } from "@tasknotes/model";
+import type { TAbstractFile } from "obsidian";
+
 // View types (active views)
 export const MINI_CALENDAR_VIEW_TYPE = "tasknotes-mini-calendar-view";
 export const TASK_LIST_VIEW_TYPE = "tasknotes-task-list-view";
@@ -25,6 +28,13 @@ export const EVENT_TIMEBLOCKING_TOGGLED = "timeblocking-toggled";
 export const EVENT_TIMEBLOCK_UPDATED = "timeblock-updated";
 export const EVENT_TIMEBLOCK_DELETED = "timeblock-deleted";
 export const EVENT_DATE_CHANGED = "date-changed";
+
+export type JsonPrimitive = string | number | boolean | null;
+export type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
+
+export interface JsonObject {
+	[key: string]: JsonValue;
+}
 
 // Calendar colorization modes
 export type ColorizeMode = "tasks" | "notes" | "daily";
@@ -119,6 +129,7 @@ export type FilterProperty =
 	| "dateModified"
 	// Boolean properties
 	| "archived"
+	| "hasSubtasks"
 	| "dependencies.isBlocked"
 	| "dependencies.isBlocking"
 	// Numeric properties
@@ -157,6 +168,8 @@ export type FilterOperator =
 export interface PropertyDefinition {
 	id: FilterProperty;
 	label: string;
+	aliases?: readonly string[];
+	frontmatterKey?: string;
 	category: "text" | "select" | "date" | "boolean" | "numeric" | "special";
 	supportedOperators: FilterOperator[];
 	valueInputType: "text" | "select" | "multi-select" | "date" | "number" | "none";
@@ -328,6 +341,13 @@ export const FILTER_PROPERTIES: PropertyDefinition[] = [
 		supportedOperators: ["is-checked", "is-not-checked"],
 		valueInputType: "none",
 	},
+	{
+		id: "hasSubtasks",
+		label: "Has Subtasks",
+		category: "boolean",
+		supportedOperators: ["is-checked", "is-not-checked"],
+		valueInputType: "none",
+	},
 
 	// Numeric properties
 	{
@@ -445,10 +465,19 @@ export interface TaskInfo {
 	tags?: string[];
 	contexts?: string[];
 	projects?: string[];
+	attachments?: string[]; // Ordered links to files that belong to this task
 	recurrence?: string; // RFC 5545 recurrence rule string
-	recurrence_anchor?: 'scheduled' | 'completion'; // Determines if recurrence is from scheduled date (fixed) or completion date (flexible). Defaults to 'scheduled'
+	recurrence_anchor?: "scheduled" | "completion"; // Determines if recurrence is from scheduled date (fixed) or completion date (flexible). Defaults to 'scheduled'
 	complete_instances?: string[]; // Array of dates (YYYY-MM-DD) when recurring task was completed
 	skipped_instances?: string[]; // Array of dates (YYYY-MM-DD) when recurring task was skipped
+	recurrence_parent?: string; // Link/path to the parent recurring task when this is a materialized occurrence
+	occurrence_date?: string; // Target recurrence date (YYYY-MM-DD) for materialized occurrences
+	recurrence_original_date?: string; // Original rule date (YYYY-MM-DD) of a pending moved virtual recurring occurrence
+	occurrence_materialization?: OccurrenceMaterializationMode; // Parent occurrence materialization policy
+	occurrence_next_trigger?: OccurrenceNextTrigger; // Parent policy for materializing the next occurrence
+	occurrence_template?: string; // Optional template note/link for generated occurrence notes
+	occurrence_past_horizon?: string; // ISO duration override for rolling materialization past horizon
+	occurrence_future_horizon?: string; // ISO duration override for rolling materialization future horizon
 	completedDate?: string; // Date (YYYY-MM-DD) when task was marked as done
 	timeEstimate?: number; // Estimated time in minutes
 	timeEntries?: TimeEntry[]; // Individual time tracking sessions
@@ -457,13 +486,17 @@ export interface TaskInfo {
 	dateModified?: string; // Last modification date (ISO timestamp)
 	icsEventId?: string[]; // Links to ICS calendar event IDs
 	googleCalendarEventId?: string; // Google Calendar event ID for sync
+	googleCalendarExceptionEventId?: string; // Detached Google Calendar event ID for a moved recurring occurrence
+	googleCalendarExceptionOriginalScheduled?: string; // Original recurring date replaced by the current moved occurrence
+	googleCalendarMovedOriginalDates?: string[]; // Original recurring dates excluded after moved occurrences are resolved
 	reminders?: Reminder[]; // Task reminders
-	customProperties?: Record<string, any>; // Custom properties from Bases or other sources
-	basesData?: any; // Raw Bases data for formula computation (internal use)
+	customProperties?: Record<string, unknown>; // Custom properties from Bases or other sources
+	basesData?: unknown; // Raw Bases data for formula computation (internal use)
 	blockedBy?: TaskDependency[]; // Dependencies that must be satisfied before this task can start
 	blocking?: string[]; // Task paths that this task is blocking
 	isBlocked?: boolean; // True if any blocking dependency is incomplete
 	isBlocking?: boolean; // True if this task blocks at least one other task
+	hasSubtasks?: boolean; // True if another task references this task as a project
 	details?: string; // Optional task body content
 	sortOrder?: string; // LexoRank string for ordering within column
 }
@@ -471,8 +504,15 @@ export interface TaskInfo {
 export interface TaskCreationData extends Partial<TaskInfo> {
 	details?: string; // Optional details/description for file content
 	parentNote?: string; // Optional parent note name/path for template variable
-	creationContext?: "inline-conversion" | "manual-creation" | "modal-inline-creation" | "api" | "import" | "ics-event"; // Context for folder determination
-	customFrontmatter?: Record<string, any>; // Custom frontmatter properties (including user fields)
+	creationContext?:
+		| "inline-conversion"
+		| "manual-creation"
+		| "modal-inline-creation"
+		| "api"
+		| "import"
+		| "ics-event"; // Context for folder determination
+	customFrontmatter?: Record<string, unknown>; // Custom frontmatter properties (including user fields)
+	occurrenceFilenameTemplate?: string; // Resolved filename template for a materialized occurrence (creation-only)
 }
 
 export interface TimeEntry {
@@ -546,8 +586,17 @@ export interface TaskFrontmatter {
 	priority: "low" | "normal" | "high";
 	contexts?: string[];
 	projects?: string[];
+	attachments?: string[];
 	recurrence?: string; // RFC 5545 recurrence rule string
 	complete_instances?: string[];
+	skipped_instances?: string[];
+	recurrence_parent?: string;
+	occurrence_date?: string;
+	occurrence_materialization?: OccurrenceMaterializationMode;
+	occurrence_next_trigger?: OccurrenceNextTrigger;
+	occurrence_template?: string;
+	occurrence_past_horizon?: string;
+	occurrence_future_horizon?: string;
 	completedDate?: string;
 	timeEstimate?: number;
 	timeEntries?: TimeEntry[];
@@ -570,10 +619,10 @@ export interface DailyNoteFrontmatter {
 
 // Event handler types
 export interface FileEventHandlers {
-	modify?: (file: any) => void;
-	delete?: (file: any) => void;
-	rename?: (file: any, oldPath: string) => void;
-	create?: (file: any) => void;
+	modify?: (file: TAbstractFile) => void;
+	delete?: (file: TAbstractFile) => void;
+	rename?: (file: TAbstractFile, oldPath: string) => void;
+	create?: (file: TAbstractFile) => void;
 }
 
 // Pomodoro types
@@ -583,6 +632,8 @@ export interface PomodoroTimePeriod {
 }
 
 export interface PomodoroSession {
+	/** Start timestamp of the task timer created by this session, if owned. */
+	timeTrackingStartTime?: string;
 	id: string;
 	taskPath?: string; // optional, can run timer without task
 	startTime: string; // ISO datetime when session was first created
@@ -662,12 +713,22 @@ export interface FieldMapping {
 	scheduled: string;
 	contexts: string;
 	projects: string;
+	attachments: string;
+	assignees: string;
 	timeEstimate: string;
 	completedDate: string;
 	dateCreated: string;
 	dateModified: string;
 	recurrence: string; // RFC 5545 recurrence rule string
 	recurrenceAnchor: string; // User-configurable property name for recurrence_anchor field
+	recurrenceParent: string;
+	occurrenceDate: string;
+	recurrenceOriginalDate?: string; // Optional so settings saved before this field existed keep working; defaults to recurrence_original_date
+	occurrenceMaterialization: string;
+	occurrenceNextTrigger: string;
+	occurrenceTemplate: string;
+	occurrencePastHorizon: string;
+	occurrenceFutureHorizon: string;
 	archiveTag: string; // For the archive tag in the tags array
 	timeEntries: string;
 	completeInstances: string;
@@ -677,8 +738,20 @@ export interface FieldMapping {
 	icsEventId: string; // For linking to ICS calendar events (stored as array in frontmatter)
 	icsEventTag: string; // Tag used for ICS event-related content
 	googleCalendarEventId: string; // For Google Calendar sync (stores event ID)
+	googleCalendarExceptionEventId: string; // Detached Google Calendar event ID for moved recurring occurrences
+	googleCalendarExceptionOriginalScheduled: string; // Original recurring date replaced by the current moved occurrence
+	googleCalendarMovedOriginalDates: string; // Historical moved recurring dates excluded from the master event
 	reminders: string; // For task reminders
 	sortOrder: string; // Numeric ordering within column (lower = higher)
+}
+
+/**
+ * onlyIf is for callers acting on state read earlier, such as a queued drop. The
+ * occurrence is completed only if it holds for the task as the operation reads it,
+ * and a completed occurrence is never reopened.
+ */
+export interface RecurringCompletionOptions {
+	onlyIf?: (task: TaskInfo) => boolean;
 }
 
 export interface StatusConfig {
@@ -688,6 +761,9 @@ export interface StatusConfig {
 	color: string; // Hex color for UI elements
 	icon?: string; // Optional Lucide icon name (e.g., "circle", "check", "clock")
 	isCompleted: boolean; // Whether this counts as "done"
+	isSkipped?: boolean; // Whether this counts as a skipped occurrence
+	excludeFromCycle?: boolean; // Whether status-dot cycling should skip this status
+	nextStatus?: string; // Optional status value to use when cycling forward from this status
 	order: number; // Sort order (for cycling)
 	autoArchive: boolean; // Whether to auto-archive tasks with this status
 	autoArchiveDelay: number; // Minutes to wait before auto-archiving
@@ -698,6 +774,7 @@ export interface PriorityConfig {
 	value: string; // What gets written to YAML
 	label: string; // What displays in UI
 	color: string; // Hex color for indicators
+	icon?: string; // Optional Lucide icon name for task card indicators
 	weight: number; // For sorting (higher = more important)
 }
 
@@ -746,11 +823,12 @@ export interface CalendarViewPreferences {
 	showTimeblocks?: boolean;
 	headerCollapsed?: boolean;
 	showAllDaySlot?: boolean;
+	showTimeGrid?: boolean;
 }
 
 // All view-specific preferences
 export interface ViewPreferences {
-	[viewType: string]: any; // Can be CalendarViewPreferences or other view-specific types
+	[viewType: string]: unknown; // Can be CalendarViewPreferences or other view-specific types
 }
 
 // ICS Subscription types
@@ -763,6 +841,9 @@ export interface ICSSubscription {
 	color: string;
 	enabled: boolean;
 	refreshInterval: number; // minutes (for remote) or check interval (for local)
+	authType?: "none" | "basic"; // HTTP auth for remote feeds; the password lives in SecretStorage
+	username?: string;
+	filter?: string; // Case-insensitive literal title substring; empty/missing shows all events
 }
 
 export interface ICSEvent {
@@ -776,6 +857,7 @@ export interface ICSEvent {
 	location?: string;
 	url?: string;
 	rrule?: string; // Recurrence rule
+	recurringEventId?: string; // Stable master/series ID for expanded recurring event instances
 	color?: string; // Hex color code (e.g., "#4285F4")
 }
 
@@ -812,8 +894,9 @@ export interface WebhookConfig {
 	createdAt: string;
 	lastTriggered?: string;
 	failureCount: number;
+	consecutiveFailures?: number;
 	successCount: number;
-	transformFile?: string; // Optional path to transformation file (.js or .json)
+	transformFile?: string; // Optional path to a JSON transformation file
 	corsHeaders?: boolean; // Whether to include custom headers (false for Discord, Slack, etc.)
 }
 
@@ -824,14 +907,14 @@ export interface WebhookPayload {
 		name: string;
 		path?: string;
 	};
-	data: any;
+	data: unknown;
 }
 
 export interface WebhookDelivery {
 	id: string;
 	webhookId: string;
 	event: WebhookEvent;
-	payload: WebhookPayload;
+	payload: unknown;
 	status: "pending" | "success" | "failed";
 	attempts: number;
 	lastAttempt?: string;
@@ -847,9 +930,56 @@ export interface PendingAutoArchive {
 	statusValue: string;
 }
 
+export interface PendingGoogleCalendarDeletion {
+	/** Task path, or the daily note path when `timeblockId` is set */
+	taskPath: string;
+	/** Set when the event belongs to a daily-note timeblock rather than a task */
+	timeblockId?: string;
+	calendarId: string;
+	eventId: string;
+	createdAt: number;
+	attempts: number;
+	lastAttemptAt?: number;
+	lastError?: string;
+}
+
+export interface GoogleCalendarEventIndexEntry {
+	taskPath: string;
+	calendarId: string;
+	eventId: string;
+	updatedAt: number;
+}
+
+/** Links a daily-note timeblock to the Google Calendar event created for it */
+export interface GoogleCalendarTimeblockEventIndexEntry {
+	notePath: string;
+	timeblockId: string;
+	calendarId: string;
+	eventId: string;
+	/** Event payload last written to Google, used to skip unchanged timeblocks */
+	fingerprint: string;
+	updatedAt: number;
+}
+
+export interface PendingGoogleCalendarTimeblockSync {
+	notePath: string;
+	timeblockId: string;
+	requestedAt: number;
+	attempts: number;
+	lastError?: string;
+}
+
+export interface PendingGoogleCalendarSync {
+	taskPath: string;
+	requestedAt: number;
+	attempts: number;
+	lastAttemptAt?: number;
+	lastError?: string;
+}
+
 // Webhook notification interface for loose coupling
 export interface IWebhookNotifier {
-	triggerWebhook(event: WebhookEvent, data: any): Promise<void>;
+	triggerWebhook(event: WebhookEvent, data: unknown): Promise<void>;
 }
 
 // OAuth types
@@ -905,6 +1035,12 @@ export interface GoogleCalendarEvent {
 		responseStatus?: string;
 	}>;
 	htmlLink?: string;
+	recurringEventId?: string;
+	originalStartTime?: {
+		dateTime?: string;
+		date?: string;
+		timeZone?: string;
+	};
 	recurrence?: string[]; // RRULE strings
 	colorId?: string; // Google Calendar color ID (1-11)
 	status?: string; // Event status: "confirmed", "tentative", or "cancelled"

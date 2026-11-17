@@ -7,6 +7,10 @@ The TaskNotes HTTP API provides local HTTP access to tasks, time tracking, pomod
 - Desktop only
 - Disabled by default
 - Started when Obsidian starts and TaskNotes API is enabled
+- Bound to loopback (`127.0.0.1`) only, not the local network
+- Browser CORS requests are allowed only from loopback origins such as
+  `localhost`, `127.0.0.1`, and `[::1]`, and origin-only Chrome/Firefox extension URLs
+  (`chrome-extension://…`, `moz-extension://…`) without paths, credentials, ports, queries, or fragments
 - Not available on mobile
 
 Enable it in `Settings -> TaskNotes -> Integrations -> HTTP API`.
@@ -19,16 +23,53 @@ Default port is `8080`.
 
 ## Authentication
 
-Authentication is optional.
+Authentication is required for both HTTP API and MCP requests.
 
-- If `apiAuthToken` is empty, all API requests are accepted.
-- If `apiAuthToken` is set, send `Authorization: Bearer <token>`.
+- Send `Authorization: Bearer <token>` using the token in Integrations settings.
+- If `apiAuthToken` is empty at startup, TaskNotes generates and saves a token before starting the server.
+- Clearing the token does not enable unauthenticated access; requests are rejected until a token is configured or generated at the next server start.
+- Existing clients that omitted authentication must be updated to send the token.
 
 Example:
 
 ```bash
 curl -H "Authorization: Bearer YOUR_TOKEN" http://localhost:8080/api/health
 ```
+
+## Connecting Claude Desktop with MCP
+
+TaskNotes 4.13.0 and later require a **TaskNotes API token**, not a Claude/Anthropic API key. The local MCP endpoint uses bearer authentication, not OAuth registration.
+
+1. In **Settings → TaskNotes → Integrations**, enable **HTTP API** and **MCP server**.
+2. To generate a TaskNotes token, leave **API authentication token** empty and restart Obsidian. An existing TaskNotes token can be reused; do not clear it unless you intend to replace it for all clients.
+3. Reopen Integrations and copy the generated token. Keep it private.
+4. In Claude Desktop, open **Settings → Developer → Edit Config** and add the following entry, preserving any other MCP servers:
+
+```json
+{
+  "mcpServers": {
+    "Tasknotes": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "http://127.0.0.1:8080/mcp",
+        "--header",
+        "Authorization:${AUTH_HEADER}"
+      ],
+      "env": {
+        "AUTH_HEADER": "Bearer YOUR_TASKNOTES_API_TOKEN"
+      }
+    }
+  }
+}
+```
+
+Replace `YOUR_TASKNOTES_API_TOKEN` with the token from TaskNotes, keeping the `Bearer ` prefix. Change `8080` if you configured a different port. This configuration requires Node.js/npm so Claude can run `npx`.
+
+5. Fully quit and reopen Claude Desktop. Keep Obsidian running while using the tools.
+
+If Claude reports **Server Disconnected**, or `mcp-remote` fails in `registerClient`/OAuth registration, first check that the bearer header contains the current TaskNotes token. A missing or rejected token can cause the client to attempt OAuth registration, which this endpoint does not provide. After changing the token in TaskNotes, update every client and restart Claude. Do not disable authentication as a workaround.
 
 ## Response Format
 
@@ -70,9 +111,14 @@ Error:
 - `POST /api/tasks/:id/toggle-status`
 - `POST /api/tasks/:id/archive`
 - `POST /api/tasks/:id/complete-instance`
+- `POST /api/tasks/:id/materialize-occurrence`
 - `POST /api/tasks/query`
 - `GET /api/filter-options`
 - `GET /api/stats`
+
+### Bases
+
+- `POST /api/bases/default-files/update`
 
 ### Time Tracking
 
@@ -135,7 +181,7 @@ Query params:
 
 Important:
 
-- Filtering params such as `status`, `priority`, `tag`, `project`, `due_before`, `due_after`, `overdue`, `completed`, `archived`, and `sort` are rejected on this endpoint with HTTP `400`.
+- Filtering params such as `status`, `priority`, `tag`, `project`, `context`, `due_before`, `due_after`, `overdue`, `completed`, `archived`, and `sort` are rejected on this endpoint with HTTP `400`.
 - Use `POST /api/tasks/query` for filtering.
 
 Example:
@@ -150,6 +196,7 @@ Response fields:
 - `data.pagination` with `total`, `offset`, `limit`, `hasMore`
 - `data.vault`
 - `data.note`
+- Task objects include configured TaskNotes user fields in `customProperties`, keyed by their frontmatter property key.
 
 ### `POST /api/tasks`
 
@@ -163,12 +210,23 @@ Common optional fields:
 
 - `details`, `status`, `priority`, `due`, `scheduled`
 - `tags`, `contexts`, `projects`
-- `recurrence`, `timeEstimate`
+- `recurrence`, `recurrence_anchor`, `timeEstimate`, `reminders`
+- `blockedBy`
+
+`blockedBy` accepts an array of dependency objects:
+
+- `uid`: link or identifier for the blocking task, such as `[[Project setup]]`
+- `reltype`: one of `FINISHTOSTART`, `FINISHTOFINISH`, `STARTTOSTART`, or `STARTTOFINISH`
+- `gap`: optional ISO 8601 duration, such as `P1D`
+
+`blocking` is a read-only reverse relationship in API responses. To make a task block existing tasks, update those existing tasks' `blockedBy` fields.
+
+The MCP tools `tasknotes_create_task` and `tasknotes_update_task` accept the same `blockedBy` objects. On `tasknotes_update_task`, `blockedBy` replaces the whole list, and `null` or `[]` clears it.
 
 ```bash
 curl -X POST http://localhost:8080/api/tasks \
   -H "Content-Type: application/json" \
-  -d '{"title":"Review docs","priority":"high"}'
+  -d '{"title":"Review docs","priority":"high","blockedBy":[{"uid":"[[Draft docs]]","reltype":"FINISHTOSTART"}]}'
 ```
 
 Returns HTTP `201` with created task data.
@@ -178,6 +236,8 @@ Returns HTTP `201` with created task data.
 Get one task by path id.
 
 - `:id` must be URL-encoded task path.
+- Single-task reads include the task body in `details`.
+- Configured TaskNotes user fields are returned in `customProperties`, keyed by their frontmatter property key.
 
 ```bash
 curl "http://localhost:8080/api/tasks/TaskNotes%2FTasks%2FReview%20docs.md"
@@ -186,6 +246,10 @@ curl "http://localhost:8080/api/tasks/TaskNotes%2FTasks%2FReview%20docs.md"
 ### `PUT /api/tasks/:id`
 
 Update task with partial payload.
+
+Configured TaskNotes user fields can be updated either by their frontmatter property key or via `customProperties`.
+
+Sending an empty array for `contexts` or `blockedBy` clears the corresponding frontmatter field.
 
 ```bash
 curl -X PUT "http://localhost:8080/api/tasks/TaskNotes%2FTasks%2FReview%20docs.md" \
@@ -211,13 +275,26 @@ Complete recurring instance.
 
 Request body:
 
-- Optional `date` (ISO string). If omitted, uses current date context.
+- Optional `date` (a valid ISO calendar date, such as `YYYY-MM-DD`, or an ISO timestamp). If omitted, uses current date context. Date-only values are recommended for occurrence selection; ISO timestamps remain supported for existing clients.
+- Legacy `instanceDate` is accepted as an alias. Conflicting aliases or malformed dates return `400` without completing an occurrence.
+
+When the recurring parent uses materialized occurrence notes, this endpoint completes the matching occurrence note if one exists. If the parent is set to **Create next after completion** and no matching occurrence note exists yet, TaskNotes creates and completes that occurrence note instead of only recording a virtual `complete_instances` entry.
+
+### `POST /api/tasks/:id/materialize-occurrence`
+
+Create or return a materialized occurrence note for a recurring task date. This endpoint is idempotent for the same parent and date.
+
+Request body:
+
+- Required `date` (ISO date string, for example `2026-06-01`)
 
 ### `POST /api/tasks/query`
 
 Advanced filtering.
 
-Request body is a `FilterQuery` object. Root object is a group with:
+Request body is a `FilterQuery` object. `FilterQuery` is still the supported advanced query shape for the HTTP API.
+
+The root object is a group with:
 
 - `type: "group"`
 - `id`
@@ -250,6 +327,82 @@ Example:
 }
 ```
 
+Filter tasks by context:
+
+```json
+{
+  "type": "group",
+  "id": "root",
+  "conjunction": "and",
+  "children": [
+    {
+      "type": "condition",
+      "id": "context",
+      "property": "contexts",
+      "operator": "contains",
+      "value": "@office"
+    }
+  ],
+  "sortKey": "due",
+  "sortDirection": "asc"
+}
+```
+
+Filter active, unarchived tasks, similar to the default available-task view:
+
+```json
+{
+  "type": "group",
+  "id": "root",
+  "conjunction": "and",
+  "children": [
+    {
+      "type": "condition",
+      "id": "not-archived",
+      "property": "archived",
+      "operator": "is-not-checked"
+    },
+    {
+      "type": "condition",
+      "id": "not-completed",
+      "property": "status.isCompleted",
+      "operator": "is-not-checked"
+    }
+  ],
+  "sortKey": "due",
+  "sortDirection": "asc",
+  "groupKey": "none"
+}
+```
+
+Condition fields:
+
+- `type`: `"condition"`
+- `id`: any stable string for your client
+- `property`: a task property, such as `title`, `status`, `priority`, `tags`, `contexts`, `projects`, `blockedBy`, `blocking`, `due`, `scheduled`, `completedDate`, `dateCreated`, `dateModified`, `archived`, `hasSubtasks`, `dependencies.isBlocked`, `dependencies.isBlocking`, `timeEstimate`, `recurrence`, or `status.isCompleted`
+- `operator`: one of `is`, `is-not`, `contains`, `does-not-contain`, `is-before`, `is-after`, `is-on-or-before`, `is-on-or-after`, `is-empty`, `is-not-empty`, `is-checked`, `is-not-checked`, `is-greater-than`, `is-less-than`, `is-greater-than-or-equal`, or `is-less-than-or-equal`
+- `value`: required for comparison operators, omitted for empty/checked operators
+
+For user-defined fields, the canonical property is `user:<fieldId>`. Queries also accept
+`user:<frontmatter-key>`, `user.<fieldId>`, and `user.<frontmatter-key>`, including in
+`sortKey` and `groupKey`. For example, a field with ID `field_1234567890` and key
+`my-custom-field` can be queried with either `user:field_1234567890` or
+`user:my-custom-field`. Bare custom keys such as `my-custom-field` are not supported.
+
+`GET /api/filter-options` returns each configured field in `userProperties`, including
+its canonical `id`, accepted `aliases`, `frontmatterKey`, and `supportedOperators`.
+Canonical IDs take precedence if a field's ID collides with another field's key.
+
+External queries must contain complete, valid conditions. Unknown properties, invalid
+operators, incomplete conditions, and invalid sort/group keys return HTTP **400**,
+even if the vault is empty or another AND/OR branch would short-circuit evaluation.
+A valid query with no matches remains a successful response with an empty task list.
+
+The MCP tool `tasknotes_query_tasks` uses the same validation and custom-field aliases.
+Invalid queries return a tool result with `isError: true`; valid queries with no matches
+remain successful (for an ungrouped query, `{"all":[]}`). Use
+`tasknotes_get_filter_options` to discover fields before querying them.
+
 Response:
 
 - `data.tasks`
@@ -266,6 +419,22 @@ Returns filter options for UI builders.
 Returns summary counts:
 
 - `total`, `completed`, `active`, `overdue`, `archived`, `withTimeTracking`
+
+## Bases
+
+### `POST /api/bases/default-files/update`
+
+Overwrite the configured default TaskNotes `.base` files with templates generated from the current TaskNotes settings. This is the same write operation as **Settings -> TaskNotes -> Views & base files -> Update files** and replaces manual edits in those configured default files.
+
+```bash
+curl -X POST http://localhost:8080/api/bases/default-files/update
+```
+
+Response fields:
+
+- `data.created`: default files created because they were missing
+- `data.updated`: existing default files overwritten with current templates
+- `data.skipped`: configured default files skipped
 
 ## Time Tracking
 
@@ -452,9 +621,9 @@ Common status codes:
 
 Current behavior:
 
-- CORS allows all origins (`*`).
+- CORS permits loopback and origin-only Chrome/Firefox extension origins, not arbitrary websites.
 - Transport is HTTP only (no TLS).
-- Node server is started with `server.listen(port)` and does not explicitly bind to `127.0.0.1`.
+- The server binds explicitly to `127.0.0.1`; bearer authentication is required.
 
 Practical guidance:
 

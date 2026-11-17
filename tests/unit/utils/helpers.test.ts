@@ -39,10 +39,9 @@ import {
 
 import { TaskInfo, TimeEntry, TimeBlock } from '../../../src/types';
 import { TaskFactory } from '../../helpers/mock-factories';
-import { MockObsidian, TFile } from '../../__mocks__/obsidian';
+import { MockObsidian, TFile } from '../../helpers/obsidian-runtime';
 
 // Mock external dependencies
-jest.mock('obsidian');
 jest.mock('rrule');
 
 // Mock date-fns functions
@@ -84,6 +83,7 @@ jest.mock('rrule', () => ({
 // Mock dateUtils functions
 jest.mock('../../../src/utils/dateUtils', () => ({
   parseDate: jest.fn((dateStr: string) => new Date(dateStr)),
+  parseDateToLocal: jest.fn((dateStr: string) => new Date(dateStr)),
   getTodayString: jest.fn(() => '2025-06-25'), // Fixed future date
   getTodayLocal: jest.fn(() => new Date('2025-06-25')),
   parseDateAsLocal: jest.fn((dateStr: string) => new Date(dateStr)),
@@ -126,13 +126,6 @@ describe('Helpers', () => {
     let mockVault: any;
 
     beforeEach(() => {
-      // Mock normalizePath from obsidian
-      const obsidianMock = require('obsidian');
-      obsidianMock.normalizePath = jest.fn((path: string) => {
-        if (!path) return '';
-        return path.replace(/\\/g, '/').replace(/\/+/g, '/').replace(/^\/*/, '').replace(/\/*$/, '');
-      });
-      
       mockVault = {
         adapter: {
           exists: jest.fn().mockResolvedValue(false),
@@ -343,21 +336,23 @@ describe('Helpers', () => {
 
     describe('formatTime', () => {
       it('should format hours and minutes', () => {
-        expect(formatTime(90)).toBe('1h 30m');
-        expect(formatTime(120)).toBe('2h');
-        expect(formatTime(45)).toBe('45m');
-        expect(formatTime(0)).toBe('0m');
+        expect(formatTime(90)).toBe('1 hr 30 min');
+        expect(formatTime(120)).toBe('2 hr');
+        expect(formatTime(45)).toBe('45 min');
+        expect(formatTime(0)).toBe('0 min');
+        expect(formatTime(0.5)).toBe('0.5 min');
+        expect(formatTime(119.9999)).toBe('2 hr');
       });
 
       it('should handle edge cases', () => {
-        expect(formatTime(null as any)).toBe('0m');
-        expect(formatTime(undefined as any)).toBe('0m');
-        expect(formatTime(NaN)).toBe('0m');
+        expect(formatTime(null as any)).toBe('0 min');
+        expect(formatTime(undefined as any)).toBe('0 min');
+        expect(formatTime(NaN)).toBe('0 min');
       });
 
       it('should handle large values', () => {
-        expect(formatTime(1440)).toBe('24h'); // 24 hours
-        expect(formatTime(1500)).toBe('25h'); // 25 hours
+        expect(formatTime(1440)).toBe('24 hr'); // 24 hours
+        expect(formatTime(1500)).toBe('25 hr'); // 25 hours
       });
     });
 
@@ -634,7 +629,7 @@ describe('Helpers', () => {
        *
        * @see https://github.com/callumalpass/tasknotes/issues/1076
        */
-      it.skip('reproduces issue #1076 - should accept 00:00 as valid end time (midnight)', () => {
+      it('should accept 00:00 as a valid end time when it means midnight at the end of the day', () => {
         const timeblock: TimeBlock = {
           id: 'tb-1',
           title: 'Late Night Work',
@@ -646,7 +641,7 @@ describe('Helpers', () => {
         expect(validateTimeBlock(timeblock)).toBe(true);
       });
 
-      it.skip('reproduces issue #1076 - should accept 23:30 to 00:00 as valid 30-minute block', () => {
+      it('should accept 23:30 to 00:00 as a valid 30-minute block', () => {
         const timeblock: TimeBlock = {
           id: 'tb-1',
           title: 'End of Day Review',
@@ -658,7 +653,7 @@ describe('Helpers', () => {
         expect(validateTimeBlock(timeblock)).toBe(true);
       });
 
-      it.skip('reproduces issue #1076 - should calculate correct duration for timeblock ending at 00:00', () => {
+      it('should validate a timeblock ending at 00:00 without changing its stored end time', () => {
         // When fixed, the validation should treat 00:00 as 1440 minutes (24 hours)
         // Duration should be: 1440 - (22 * 60) = 1440 - 1320 = 120 minutes (2 hours)
         const timeblock: TimeBlock = {
@@ -676,7 +671,7 @@ describe('Helpers', () => {
         // duration = 1440 - 1320 = 120 minutes
       });
 
-      it.skip('reproduces issue #1076 - edge case: 00:00 to 00:00 should be invalid', () => {
+      it('should reject 00:00 to 00:00 as zero duration', () => {
         // A timeblock starting and ending at midnight (same time) should still be invalid
         const timeblock: TimeBlock = {
           id: 'tb-1',
@@ -687,6 +682,17 @@ describe('Helpers', () => {
 
         // This should be invalid: zero duration timeblock
         expect(validateTimeBlock(timeblock)).toBe(false);
+      });
+
+      it('should accept 24:00 as an explicit end-of-day end time', () => {
+        const timeblock: TimeBlock = {
+          id: 'tb-1',
+          title: 'Late Night Work',
+          startTime: '22:00',
+          endTime: '24:00'
+        };
+
+        expect(validateTimeBlock(timeblock)).toBe(true);
       });
 
       it('should reject timeblock with invalid time format', () => {
@@ -779,6 +785,25 @@ describe('Helpers', () => {
         });
       });
 
+      it('should convert a 00:00 end time to the next day for calendar rendering', () => {
+        const timeblock: TimeBlock = {
+          id: 'tb-midnight',
+          title: 'Late Work',
+          startTime: '22:00',
+          endTime: '00:00'
+        };
+
+        const event = timeblockToCalendarEvent(timeblock, '2025-01-15') as {
+          start: string;
+          end: string;
+          extendedProps: { timeblock: TimeBlock };
+        };
+
+        expect(event.start).toBe('2025-01-15T22:00:00');
+        expect(event.end).toBe('2025-01-16T00:00:00');
+        expect(event.extendedProps.timeblock.endTime).toBe('00:00');
+      });
+
       it('should use default color when none provided', () => {
         const timeblock: TimeBlock = {
           id: 'tb-1',
@@ -807,26 +832,6 @@ describe('Helpers', () => {
 
     describe('extractTimeblocksFromNote', () => {
       it('should extract valid timeblocks from frontmatter', () => {
-        // Mock parseYaml to return the expected structure
-        const obsidianMock = require('obsidian');
-        obsidianMock.parseYaml = jest.fn().mockReturnValue({
-          title: 'Daily Note',
-          timeblocks: [
-            {
-              id: 'tb-1',
-              title: 'Meeting',
-              startTime: '09:00',
-              endTime: '10:00'
-            },
-            {
-              id: 'tb-2',
-              title: 'Focus Time',
-              startTime: '14:00',
-              endTime: '16:00'
-            }
-          ]
-        });
-        
         const content = `---
 title: Daily Note
 timeblocks:
@@ -854,25 +859,6 @@ timeblocks:
       });
 
       it('should filter out invalid timeblocks', () => {
-        // Mock parseYaml to return mixed valid/invalid timeblocks
-        const obsidianMock = require('obsidian');
-        obsidianMock.parseYaml = jest.fn().mockReturnValue({
-          timeblocks: [
-            {
-              id: 'tb-1',
-              title: 'Valid',
-              startTime: '09:00',
-              endTime: '10:00'
-            },
-            {
-              id: 'tb-2',
-              title: 'Invalid',
-              startTime: '10:00',
-              endTime: '09:00' // End before start = invalid
-            }
-          ]
-        });
-        
         const content = `---
 timeblocks:
   - id: tb-1
@@ -892,13 +878,6 @@ timeblocks:
       });
 
       it('should return empty array for content without timeblocks', () => {
-        // Reset parseYaml mock for this test
-        const obsidianMock = require('obsidian');
-        obsidianMock.parseYaml = jest.fn().mockReturnValue({
-          title: 'Note without timeblocks'
-          // No timeblocks property
-        });
-        
         const content = `---
 title: Note without timeblocks
 ---
@@ -910,18 +889,70 @@ Just a regular note.`;
       });
 
       it('should handle malformed frontmatter', () => {
-        // Mock parseYaml to throw an error for malformed YAML
-        const obsidianMock = require('obsidian');
-        obsidianMock.parseYaml = jest.fn().mockImplementation(() => {
-          throw new Error('Invalid YAML');
-        });
-        
         const content = `---
 invalid yaml: [
 ---`;
 
         const result = extractTimeblocksFromNote(content, '/notes/test.md');
         expect(result).toEqual([]);
+      });
+
+      it('should find the real closing fence when a value contains "---" mid-line', () => {
+        // Regression test: a `---` inside a frontmatter value used to be
+        // mistaken for the closing fence, truncating the frontmatter before
+        // the timeblocks list and silently dropping every timeblock.
+        const content = `---
+description: "Section A --- Section B"
+timeblocks:
+  - id: tb-1
+    title: Standup
+    startTime: "09:00"
+    endTime: "09:15"
+---
+
+# Daily Note Content`;
+
+        const result = extractTimeblocksFromNote(content, '/daily/2025-01-15.md');
+        expect(result).toHaveLength(1);
+        expect(result[0]).toMatchObject({ id: 'tb-1', title: 'Standup' });
+      });
+
+      it('should find the real closing fence when a value is literally "---"', () => {
+        const content = `---
+marker: "---"
+timeblocks:
+  - id: tb-1
+    title: Standup
+    startTime: "09:00"
+    endTime: "09:15"
+---
+
+# Daily Note Content`;
+
+        const result = extractTimeblocksFromNote(content, '/daily/2025-01-15.md');
+        expect(result).toHaveLength(1);
+        expect(result[0]).toMatchObject({ id: 'tb-1', title: 'Standup' });
+      });
+
+      it('should handle CRLF line endings', () => {
+        const content =
+          '---\r\ndescription: "A --- B"\r\ntimeblocks:\r\n  - id: tb-1\r\n    title: Standup\r\n    startTime: "09:00"\r\n    endTime: "09:15"\r\n---\r\n\r\n# Daily Note Content';
+
+        const result = extractTimeblocksFromNote(content, '/daily/2025-01-15.md');
+        expect(result).toHaveLength(1);
+        expect(result[0]).toMatchObject({ id: 'tb-1', title: 'Standup' });
+      });
+
+      it('should return empty array for content with no frontmatter at all', () => {
+        const content = '# Just a heading\n\nSome regular text';
+        const result = extractTimeblocksFromNote(content, '/notes/test.md');
+        expect(result).toEqual([]);
+      });
+
+      it('should return empty array (not throw) when the frontmatter fence is never closed', () => {
+        const content = '---\ntimeblocks:\n  - id: tb-1\n    title: Standup';
+        expect(() => extractTimeblocksFromNote(content, '/notes/test.md')).not.toThrow();
+        expect(extractTimeblocksFromNote(content, '/notes/test.md')).toEqual([]);
       });
     });
   });
@@ -930,7 +961,7 @@ invalid yaml: [
     it('should handle null and undefined inputs gracefully', () => {
       expect(calculateTotalTimeSpent(null as any)).toBe(0);
       expect(getActiveTimeEntry(undefined as any)).toBeNull();
-      expect(formatTime(null as any)).toBe('0m');
+      expect(formatTime(null as any)).toBe('0 min');
       expect(parseTime(null as any)).toBeNull();
     });
 

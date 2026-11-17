@@ -1,14 +1,21 @@
-import { App, SuggestModal, TFile, Notice, setIcon, debounce } from "obsidian";
+import { displayError } from "../i18n/runtime";
+import { uiDuration } from "../i18n/formatters";
+import { configLabel } from "../i18n/configLabels";
+import { uiText } from "../i18n/runtime";
+import { msg } from "@lingui/core/macro";
+import { App, SuggestModal, Notice, setIcon } from "obsidian";
 import { TaskInfo, TaskCreationData } from "../types";
 import { filterEmptyProjects } from "../utils/helpers";
 import type TaskNotesPlugin from "../main";
-import { TranslationKey } from "../i18n";
-import {
-	NaturalLanguageParser,
-	ParsedTaskData,
-} from "../services/NaturalLanguageParser";
+import { MessageDescriptor } from "../i18n";
+import { NaturalLanguageParser, ParsedTaskData } from "../services/NaturalLanguageParser";
 import { createTaskCard } from "../ui/TaskCard";
-import { buildTaskCreationDataFromParsed } from "../utils/buildTaskCreationDataFromParsed";
+import { buildTaskCreationDataFromParsed } from "../services/buildTaskCreationDataFromParsed";
+import { getTaskWithInstanceStatus, isTaskInstanceCompleted } from "../utils/taskInstanceStatus";
+import { NLPSuggest } from "./taskCreationSuggest";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Modals/TaskSelectorWithCreateModal" });
 
 export type TaskSelectorWithCreateResult =
 	| { type: "selected"; task: TaskInfo }
@@ -18,10 +25,125 @@ export type TaskSelectorWithCreateResult =
 export interface TaskSelectorWithCreateOptions {
 	/** Callback when a task is selected or created */
 	onResult: (result: TaskSelectorWithCreateResult) => void;
+	/** When false, only existing tasks can be selected. */
+	allowCreate?: boolean;
+	/** Include archived tasks when the caller supplies them, such as active trackers. */
+	includeArchived?: boolean;
 	/** Optional placeholder text override */
 	placeholder?: string;
 	/** Optional title override */
 	title?: string;
+	/** Defaults applied only when creating a new task, never when selecting an existing one. */
+	creationDefaults?: Partial<TaskCreationData>;
+	/** Date used for recurring task instance status in the selector */
+	targetDate?: Date;
+}
+
+function searchableValueIncludes(value: unknown, lowerQuery: string): boolean {
+	if (value === null || value === undefined) {
+		return false;
+	}
+
+	if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") {
+		return false;
+	}
+
+	return String(value).toLowerCase().includes(lowerQuery);
+}
+
+function searchableValueRank(value: unknown, lowerQuery: string): number | null {
+	if (value === null || value === undefined) {
+		return null;
+	}
+
+	if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") {
+		return null;
+	}
+
+	const text = String(value).toLowerCase();
+	if (!text.includes(lowerQuery)) {
+		return null;
+	}
+
+	if (text === lowerQuery) {
+		return 0;
+	}
+
+	if (text.startsWith(lowerQuery)) {
+		return 1;
+	}
+
+	const startsWord = text.split(/[^a-z0-9]+/).some((word) => word.startsWith(lowerQuery));
+	if (startsWord) {
+		return 2;
+	}
+
+	return 3;
+}
+
+function bestSearchableValueRank(values: unknown[], lowerQuery: string): number | null {
+	let bestRank: number | null = null;
+
+	for (const value of values) {
+		const rank = searchableValueRank(value, lowerQuery);
+		if (rank === null) {
+			continue;
+		}
+
+		bestRank = bestRank === null ? rank : Math.min(bestRank, rank);
+	}
+
+	return bestRank;
+}
+
+export function taskMatchesSelectorQuery(task: TaskInfo, lowerQuery: string): boolean {
+	if (searchableValueIncludes(task.title, lowerQuery)) return true;
+	if (searchableValueIncludes(task.due, lowerQuery)) return true;
+	if (task.priority !== "normal" && searchableValueIncludes(task.priority, lowerQuery)) {
+		return true;
+	}
+	if (task.contexts?.some((context) => searchableValueIncludes(context, lowerQuery))) {
+		return true;
+	}
+
+	const filteredProjects = filterEmptyProjects(task.projects || []);
+	if (filteredProjects.some((project) => searchableValueIncludes(project, lowerQuery))) {
+		return true;
+	}
+
+	return false;
+}
+
+export function getTaskSelectorQueryRank(task: TaskInfo, lowerQuery: string): number {
+	const titleRank = searchableValueRank(task.title, lowerQuery);
+	if (titleRank !== null) {
+		return titleRank;
+	}
+
+	const contextRank = bestSearchableValueRank(task.contexts || [], lowerQuery);
+	if (contextRank !== null) {
+		return 10 + contextRank;
+	}
+
+	const filteredProjects = filterEmptyProjects(task.projects || []);
+	const projectRank = bestSearchableValueRank(filteredProjects, lowerQuery);
+	if (projectRank !== null) {
+		return 20 + projectRank;
+	}
+
+	if (task.priority !== "normal") {
+		const priorityRank = searchableValueRank(task.priority, lowerQuery);
+		if (priorityRank !== null) {
+			return 30 + priorityRank;
+		}
+	}
+
+	const dueRank = searchableValueRank(task.due, lowerQuery);
+	if (dueRank !== null) {
+		return 40 + dueRank;
+	}
+
+	return Number.MAX_SAFE_INTEGER;
 }
 
 /**
@@ -38,11 +160,14 @@ export class TaskSelectorWithCreateModal extends SuggestModal<TaskInfo> {
 	private tasks: TaskInfo[];
 	private options: TaskSelectorWithCreateOptions;
 	private plugin: TaskNotesPlugin;
-	private translate: (key: TranslationKey, variables?: Record<string, any>) => string;
+	private translate: (key: MessageDescriptor, variables?: Record<string, unknown>) => string;
 	private nlParser: NaturalLanguageParser;
+	private nlpSuggest: NLPSuggest | null = null;
 	private createFooterEl: HTMLElement | null = null;
-	private currentQuery: string = "";
-	private resultHandled: boolean = false;
+	private currentQuery = "";
+	private resultHandled = false;
+	private isCreatingTask = false;
+	private targetDate: Date;
 
 	constructor(
 		app: App,
@@ -54,28 +179,56 @@ export class TaskSelectorWithCreateModal extends SuggestModal<TaskInfo> {
 		this.plugin = plugin;
 		this.tasks = tasks;
 		this.options = options;
+		this.targetDate = options.targetDate || new Date();
 		this.translate = plugin.i18n.translate.bind(plugin.i18n);
 		this.nlParser = NaturalLanguageParser.fromPlugin(plugin);
 
 		// Set placeholder
 		this.setPlaceholder(
-			options.placeholder || this.translate("modals.taskSelectorWithCreate.placeholder")
+			options.placeholder ||
+				this.translate(
+					msg({ message: "Search tasks or type to create new...", context: "modals.taskSelectorWithCreate.placeholder" })
+				)
 		);
 
 		// Set instructions
 		this.setInstructions([
-			{ command: "↑↓", purpose: this.translate("modals.taskSelector.instructions.navigate") },
-			{ command: "↵", purpose: this.translate("modals.taskSelector.instructions.select") },
 			{
-				command: "⇧↵",
-				purpose: this.translate("modals.taskSelectorWithCreate.instructions.create"),
+				command: "↑↓",
+				purpose: this.translate(
+					msg({ message: "to navigate", context: "modals.taskSelector.instructions.navigate" })
+				),
 			},
-			{ command: "esc", purpose: this.translate("modals.taskSelector.instructions.dismiss") },
+			{
+				command: "↵",
+				purpose: this.translate(
+					msg({ message: "to select", context: "modals.taskSelector.instructions.select" })
+				),
+			},
+			...(options.allowCreate === false
+				? []
+				: [
+						{
+							command: "⇧↵",
+							purpose: this.translate(
+								msg({ message: "to create new task", context: "modals.taskSelectorWithCreate.instructions.create" })
+							),
+						},
+					]),
+			{
+				command: "esc",
+				purpose: this.translate(
+					msg({ message: "to cancel", context: "modals.taskSelector.instructions.dismiss" })
+				),
+			},
 		]);
 
 		// Set modal title for accessibility
 		this.titleEl.setText(
-			options.title || this.translate("modals.taskSelectorWithCreate.title")
+			options.title ||
+				this.translate(
+					msg({ message: "Create or open task", context: "modals.taskSelectorWithCreate.title" })
+				)
 		);
 		this.titleEl.setAttribute("id", "task-selector-with-create-title");
 
@@ -90,21 +243,23 @@ export class TaskSelectorWithCreateModal extends SuggestModal<TaskInfo> {
 
 	onOpen(): void {
 		super.onOpen();
+		if (this.options.allowCreate === false) return;
 
 		// Add keydown listener for Shift+Enter on the modal container to catch it before Obsidian
 		this.scope.register(["Shift"], "Enter", (e: KeyboardEvent) => {
 			e.preventDefault();
 			e.stopPropagation();
-			this.createNewTask();
+			void this.createNewTask();
 			return false;
 		});
 
 		// Add input listener for real-time preview updates
 		this.inputEl.addEventListener("input", this.handleInputChange);
+		this.nlpSuggest = new NLPSuggest(this.app, this.inputEl, this.plugin);
 
 		// Create footer after DOM is ready.
 		// SuggestModal builds its DOM asynchronously, so we defer to the next tick.
-		setTimeout(() => this.createFooter(), 0);
+		window.setTimeout(() => this.createFooter(), 0);
 	}
 
 	private createFooter(): void {
@@ -112,10 +267,49 @@ export class TaskSelectorWithCreateModal extends SuggestModal<TaskInfo> {
 		// We want to append our footer inside the modalEl, after .prompt
 		const modalContentEl = this.modalEl.querySelector(".prompt")?.parentElement || this.modalEl;
 
-		this.createFooterEl = createDiv({ cls: "task-selector-create-footer" });
-		this.createFooterEl.style.display = "none";
-		modalContentEl.appendChild(this.createFooterEl);
+		this.createFooterEl = modalContentEl.createDiv({ cls: "task-selector-create-footer" });
+		this.createFooterEl.setAttribute("role", "button");
+		this.createFooterEl.setAttribute("aria-hidden", "true");
+		this.createFooterEl.tabIndex = -1;
+		this.createFooterEl.addEventListener("click", this.handleCreateFooterActivation);
+		this.createFooterEl.addEventListener("keydown", this.handleCreateFooterKeydown);
+		this.createFooterEl.classList.remove(
+			"tn-static-display-block-2a1b75c9",
+			"tn-static-display-flex-4d51fc62",
+			"tn-static-display-flex-75816cae",
+			"tn-static-display-flex-8bb39979",
+			"tn-static-display-inline-block-60e32dcb",
+			"tn-static-display-inline-cccfa456",
+			"tn-static-display-inline-flex-f984c520",
+			"tn-static-min-height-800px-997b4c8c"
+		);
+		this.createFooterEl.classList.add("tn-static-display-none-6b99de8b");
+
+		if (this.currentQuery) {
+			this.updateCreateFooter(this.currentQuery);
+		}
 	}
+
+	private handleCreateFooterActivation = (event: MouseEvent | KeyboardEvent): void => {
+		if (
+			!this.createFooterEl ||
+			this.createFooterEl.classList.contains("tn-static-display-none-6b99de8b")
+		) {
+			return;
+		}
+
+		event.preventDefault();
+		event.stopPropagation();
+		void this.createNewTask();
+	};
+
+	private handleCreateFooterKeydown = (event: KeyboardEvent): void => {
+		if (event.key !== "Enter" && event.key !== " ") {
+			return;
+		}
+
+		this.handleCreateFooterActivation(event);
+	};
 
 	private handleInputChange = (): void => {
 		const query = this.inputEl.value.trim();
@@ -127,26 +321,67 @@ export class TaskSelectorWithCreateModal extends SuggestModal<TaskInfo> {
 		if (!this.createFooterEl) return;
 
 		if (!query) {
-			this.createFooterEl.style.display = "none";
+			this.createFooterEl.classList.remove(
+				"tn-static-display-block-2a1b75c9",
+				"tn-static-display-flex-4d51fc62",
+				"tn-static-display-flex-75816cae",
+				"tn-static-display-flex-8bb39979",
+				"tn-static-display-inline-block-60e32dcb",
+				"tn-static-display-inline-cccfa456",
+				"tn-static-display-inline-flex-f984c520",
+				"tn-static-min-height-800px-997b4c8c"
+			);
+			this.createFooterEl.classList.add("tn-static-display-none-6b99de8b");
+			this.createFooterEl.setAttribute("aria-hidden", "true");
+			this.createFooterEl.removeAttribute("aria-label");
+			this.createFooterEl.tabIndex = -1;
 			this.createFooterEl.empty();
 			return;
 		}
 
-		const parsed = this.nlParser.parseInput(query);
+		const parsed = this.nlParser.parseInputForModal(query);
 
-		if (parsed.title && parsed.title !== "Untitled Task") {
+		if (parsed.title.trim()) {
 			this.createFooterEl.empty();
-			this.createFooterEl.style.display = "flex";
+			this.createFooterEl.classList.remove(
+				"tn-static-display-block-2a1b75c9",
+				"tn-static-display-flex-4d51fc62",
+				"tn-static-display-flex-8bb39979",
+				"tn-static-display-inline-block-60e32dcb",
+				"tn-static-display-inline-cccfa456",
+				"tn-static-display-inline-flex-f984c520",
+				"tn-static-display-none-6b99de8b",
+				"tn-static-min-height-800px-997b4c8c"
+			);
+			this.createFooterEl.classList.add("tn-static-display-flex-75816cae");
+			this.createFooterEl.setAttribute("aria-hidden", "false");
+			this.createFooterEl.setAttribute(
+				"aria-label",
+				uiText(
+					msg({
+						message: "Create: {title}",
+						context: "task selector create action accessible name",
+					}),
+					{ title: parsed.title }
+				)
+			);
+			this.createFooterEl.tabIndex = 0;
 
 			// Icon
-			const iconDiv = this.createFooterEl.createDiv({ cls: "task-selector-create-footer__icon" });
+			const iconDiv = this.createFooterEl.createDiv({
+				cls: "task-selector-create-footer__icon",
+			});
 			setIcon(iconDiv, "plus-circle");
 
 			// Content
-			const contentDiv = this.createFooterEl.createDiv({ cls: "task-selector-create-footer__content" });
+			const contentDiv = this.createFooterEl.createDiv({
+				cls: "task-selector-create-footer__content",
+			});
 
 			// Title line
-			const titleLine = contentDiv.createDiv({ cls: "task-selector-create-footer__title-line" });
+			const titleLine = contentDiv.createDiv({
+				cls: "task-selector-create-footer__title-line",
+			});
 			titleLine.createSpan({
 				cls: "task-selector-create-footer__title",
 				text: parsed.title,
@@ -158,31 +393,53 @@ export class TaskSelectorWithCreateModal extends SuggestModal<TaskInfo> {
 				const metaLine = contentDiv.createDiv({ cls: "task-selector-create-footer__meta" });
 				metaParts.forEach((part) => {
 					const chipEl = metaLine.createSpan({
-						cls: `task-selector-create-footer__chip task-selector-create-footer__chip--${part.type}`
+						cls: `task-selector-create-footer__chip task-selector-create-footer__chip--${part.type}`,
 					});
-					const chipIconEl = chipEl.createSpan({ cls: "task-selector-create-footer__chip-icon" });
+					const chipIconEl = chipEl.createSpan({
+						cls: "task-selector-create-footer__chip-icon",
+					});
 					setIcon(chipIconEl, part.icon);
-					chipEl.createSpan({ cls: "task-selector-create-footer__chip-text", text: part.text });
+					chipEl.createSpan({
+						cls: "task-selector-create-footer__chip-text",
+						text: part.text,
+					});
 				});
 			}
 
 			// Shortcut hint
 			const hintLine = contentDiv.createDiv({ cls: "task-selector-create-footer__hint" });
 			hintLine.createSpan({
-				cls: "task-selector-create-footer__shortcut",
-				text: "⇧↵",
-			});
-			hintLine.createSpan({
 				cls: "task-selector-create-footer__hint-text",
-				text: this.translate("modals.taskSelectorWithCreate.footer.createLabel"),
+				text: uiText(
+					msg({
+						message: "Create with {shortcut}",
+						context: "task selector create keyboard hint",
+					}),
+					{ shortcut: "⇧↵" }
+				),
 			});
 		} else {
-			this.createFooterEl.style.display = "none";
+			this.createFooterEl.classList.remove(
+				"tn-static-display-block-2a1b75c9",
+				"tn-static-display-flex-4d51fc62",
+				"tn-static-display-flex-75816cae",
+				"tn-static-display-flex-8bb39979",
+				"tn-static-display-inline-block-60e32dcb",
+				"tn-static-display-inline-cccfa456",
+				"tn-static-display-inline-flex-f984c520",
+				"tn-static-min-height-800px-997b4c8c"
+			);
+			this.createFooterEl.classList.add("tn-static-display-none-6b99de8b");
+			this.createFooterEl.setAttribute("aria-hidden", "true");
+			this.createFooterEl.removeAttribute("aria-label");
+			this.createFooterEl.tabIndex = -1;
 			this.createFooterEl.empty();
 		}
 	}
 
-	private buildMetadataParts(parsed: ParsedTaskData): Array<{ icon: string; text: string; type: string }> {
+	private buildMetadataParts(
+		parsed: ParsedTaskData
+	): Array<{ icon: string; text: string; type: string }> {
 		const parts: Array<{ icon: string; text: string; type: string }> = [];
 
 		// Due date
@@ -193,7 +450,9 @@ export class TaskSelectorWithCreateModal extends SuggestModal<TaskInfo> {
 
 		// Scheduled date
 		if (parsed.scheduledDate) {
-			const dateStr = parsed.scheduledTime ? `${parsed.scheduledDate} ${parsed.scheduledTime}` : parsed.scheduledDate;
+			const dateStr = parsed.scheduledTime
+				? `${parsed.scheduledDate} ${parsed.scheduledTime}`
+				: parsed.scheduledDate;
 			parts.push({ icon: "calendar-clock", text: dateStr, type: "scheduled" });
 		}
 
@@ -207,28 +466,32 @@ export class TaskSelectorWithCreateModal extends SuggestModal<TaskInfo> {
 			const statusConfig = this.plugin.statusManager.getStatusConfig(parsed.status);
 			parts.push({
 				icon: "circle-dot",
-				text: statusConfig?.label || parsed.status,
-				type: "status"
+				text: configLabel(statusConfig) || parsed.status,
+				type: "status",
 			});
 		}
 
 		// Contexts
 		if (parsed.contexts && parsed.contexts.length > 0) {
-			parsed.contexts.forEach(ctx => {
+			parsed.contexts.forEach((ctx) => {
 				parts.push({ icon: "at-sign", text: ctx, type: "context" });
 			});
 		}
 
 		// Projects
 		if (parsed.projects && parsed.projects.length > 0) {
-			parsed.projects.forEach(proj => {
-				parts.push({ icon: "folder", text: proj.replace(/^\[\[|\]\]$/g, ""), type: "project" });
+			parsed.projects.forEach((proj) => {
+				parts.push({
+					icon: "folder",
+					text: proj.replace(/^\[\[|\]\]$/g, ""),
+					type: "project",
+				});
 			});
 		}
 
 		// Tags
 		if (parsed.tags && parsed.tags.length > 0) {
-			parsed.tags.forEach(tag => {
+			parsed.tags.forEach((tag) => {
 				parts.push({ icon: "hash", text: tag, type: "tag" });
 			});
 		}
@@ -240,17 +503,16 @@ export class TaskSelectorWithCreateModal extends SuggestModal<TaskInfo> {
 
 		// Time estimate
 		if (parsed.estimate && parsed.estimate > 0) {
-			const hours = Math.floor(parsed.estimate / 60);
-			const mins = parsed.estimate % 60;
-			const timeStr = hours > 0 ? `${hours}h ${mins}m` : `${mins}m`;
+			const timeStr = uiDuration(parsed.estimate);
 			parts.push({ icon: "timer", text: timeStr, type: "estimate" });
 		}
 
 		// Details (truncated)
 		if (parsed.details) {
-			const truncated = parsed.details.length > 30
-				? parsed.details.substring(0, 30) + "..."
-				: parsed.details;
+			const truncated =
+				parsed.details.length > 30
+					? parsed.details.substring(0, 30) + "..."
+					: parsed.details;
 			parts.push({ icon: "file-text", text: truncated, type: "details" });
 		}
 
@@ -261,7 +523,18 @@ export class TaskSelectorWithCreateModal extends SuggestModal<TaskInfo> {
 				const fieldDef = userFieldDefs.find((f) => f.id === fieldId);
 				const displayName = fieldDef?.displayName || fieldId;
 				const displayValue = Array.isArray(value) ? value.join(", ") : value;
-				parts.push({ icon: "sliders-horizontal", text: `${displayName}: ${displayValue}`, type: "userfield" });
+				parts.push({
+					icon: "sliders-horizontal",
+					text: uiText(
+						msg({
+							message: "{displayName}: {displayValue}",
+							context:
+								"modals/TaskSelectorWithCreateModal: TaskSelectorWithCreateModal.buildMetadataParts text",
+						}),
+						{ displayName: displayName, displayValue: displayValue }
+					),
+					type: "userfield",
+				});
 			}
 		}
 
@@ -269,18 +542,33 @@ export class TaskSelectorWithCreateModal extends SuggestModal<TaskInfo> {
 	}
 
 	private async createNewTask(): Promise<void> {
-		const query = this.inputEl.value.trim();
-		if (!query) {
-			new Notice(this.translate("modals.taskSelectorWithCreate.notices.emptyQuery"));
+		if (this.options.allowCreate === false) return;
+		if (this.isCreatingTask) {
 			return;
 		}
 
+		const query = this.inputEl.value.trim();
+		if (!query) {
+			new Notice(
+				this.translate(
+					msg({ message: "Please enter a task description", context: "modals.taskSelectorWithCreate.notices.emptyQuery" })
+				)
+			);
+			return;
+		}
+
+		this.isCreatingTask = true;
+
 		try {
 			// Parse the query using NLP
-			const parsed = this.nlParser.parseInput(query);
+			const parsed = this.nlParser.parseInputForModal(query);
 
-			if (!parsed.title || parsed.title === "Untitled Task") {
-				new Notice(this.translate("modals.taskSelectorWithCreate.notices.invalidTitle"));
+			if (!parsed.title.trim()) {
+				new Notice(
+					this.translate(
+						msg({ message: "Could not parse a valid task title", context: "modals.taskSelectorWithCreate.notices.invalidTitle" })
+					)
+				);
 				return;
 			}
 
@@ -291,7 +579,12 @@ export class TaskSelectorWithCreateModal extends SuggestModal<TaskInfo> {
 			const result = await this.plugin.taskService.createTask(taskData);
 
 			new Notice(
-				this.translate("modals.taskCreation.notices.success", { title: result.taskInfo.title })
+				this.translate(
+					msg({ message: "Task \"{title}\" created successfully", context: "modals.taskCreation.notices.success" }),
+					{
+						title: result.taskInfo.title,
+					}
+				)
 			);
 
 			// Close modal and return result
@@ -299,14 +592,36 @@ export class TaskSelectorWithCreateModal extends SuggestModal<TaskInfo> {
 			this.close();
 			this.options.onResult({ type: "created", task: result.taskInfo });
 		} catch (error) {
-			console.error("Failed to create task:", error);
+			tasknotesLogger.error("Failed to create task:", {
+				category: "persistence",
+				operation: "create-task",
+				error: error,
+			});
 			const message = error instanceof Error ? error.message : String(error);
-			new Notice(this.translate("modals.taskCreation.notices.failure", { message }));
+			new Notice(
+				this.translate(
+					msg({ message: "Failed to create task: {message}", context: "modals.taskCreation.notices.failure" }),
+					{ message: displayError(message) }
+				)
+			);
+		} finally {
+			this.isCreatingTask = false;
 		}
 	}
 
 	private buildTaskDataFromParsed(parsed: ParsedTaskData): TaskCreationData {
-		return buildTaskCreationDataFromParsed(this.plugin, parsed);
+		const taskData = buildTaskCreationDataFromParsed(this.plugin, parsed);
+		const defaults = this.options.creationDefaults;
+		if (!defaults) return taskData;
+
+		return {
+			...defaults,
+			...taskData,
+			priority: parsed.priority || defaults.priority || taskData.priority,
+			projects: [...new Set([...(defaults.projects || []), ...(taskData.projects || [])])],
+			tags: [...new Set([...(defaults.tags || []), ...(taskData.tags || [])])],
+			contexts: [...new Set([...(defaults.contexts || []), ...(taskData.contexts || [])])],
+		};
 	}
 
 	getSuggestions(query: string): TaskInfo[] {
@@ -315,38 +630,43 @@ export class TaskSelectorWithCreateModal extends SuggestModal<TaskInfo> {
 	}
 
 	private getFilteredTasks(query: string): TaskInfo[] {
-		const lowerQuery = query.toLowerCase();
+		const lowerQuery = query.trim().toLowerCase();
+		const hasQuery = lowerQuery.length > 0;
 
 		return this.tasks
-			.filter((task) => !task.archived)
+			.filter((task) => this.options.includeArchived || !task.archived)
 			.filter((task) => {
-				if (!query) return true;
-
-				// Search in title
-				if (task.title && task.title.toLowerCase().includes(lowerQuery)) return true;
-
-				// Search in due date
-				if (task.due && task.due.toLowerCase().includes(lowerQuery)) return true;
-
-				// Search in priority
-				if (task.priority && task.priority !== "normal" && task.priority.toLowerCase().includes(lowerQuery))
-					return true;
-
-				// Search in contexts (filter out null/undefined values)
-				if (task.contexts?.some((c) => c && c.toLowerCase().includes(lowerQuery))) return true;
-
-				// Search in projects (filter out null/undefined values)
-				const filteredProjects = filterEmptyProjects(task.projects || []);
-				if (filteredProjects.some((p) => p && p.toLowerCase().includes(lowerQuery))) return true;
-
-				return false;
+				if (!hasQuery) return true;
+				return taskMatchesSelectorQuery(task, lowerQuery);
 			})
 			.sort((a, b) => {
+				if (hasQuery) {
+					const rankCompare =
+						getTaskSelectorQueryRank(a, lowerQuery) -
+						getTaskSelectorQueryRank(b, lowerQuery);
+					if (rankCompare !== 0) return rankCompare;
+				}
+
 				// Sort by completion status first (incomplete tasks come first)
-				const aCompleted = this.plugin.statusManager.isCompletedStatus(a.status);
-				const bCompleted = this.plugin.statusManager.isCompletedStatus(b.status);
+				const aCompleted = isTaskInstanceCompleted(
+					a,
+					this.targetDate,
+					this.plugin.statusManager,
+					this.plugin.settings.defaultTaskStatus
+				);
+				const bCompleted = isTaskInstanceCompleted(
+					b,
+					this.targetDate,
+					this.plugin.statusManager,
+					this.plugin.settings.defaultTaskStatus
+				);
 				if (aCompleted !== bCompleted) {
 					return aCompleted ? 1 : -1;
+				}
+
+				if (hasQuery) {
+					const titleCompare = a.title.localeCompare(b.title);
+					if (titleCompare !== 0) return titleCompare;
 				}
 
 				// Sort by due date second
@@ -370,7 +690,16 @@ export class TaskSelectorWithCreateModal extends SuggestModal<TaskInfo> {
 
 	renderSuggestion(task: TaskInfo, el: HTMLElement): void {
 		// Use TaskCard component with default layout for full styling
-		const taskCard = createTaskCard(task, this.plugin, undefined, { layout: "default" });
+		const displayTask = getTaskWithInstanceStatus(
+			task,
+			this.targetDate,
+			this.plugin.statusManager,
+			this.plugin.settings.defaultTaskStatus
+		);
+		const taskCard = createTaskCard(displayTask, this.plugin, undefined, {
+			layout: "default",
+			targetDate: this.targetDate,
+		});
 
 		// Add modal-specific class for any additional styling
 		taskCard.classList.add("task-selector-modal__suggestion");
@@ -391,16 +720,20 @@ export class TaskSelectorWithCreateModal extends SuggestModal<TaskInfo> {
 	onClose(): void {
 		// Remove event listeners
 		this.inputEl.removeEventListener("input", this.handleInputChange);
+		this.nlpSuggest?.close();
+		this.nlpSuggest = null;
 
 		// Clean up footer element
 		if (this.createFooterEl) {
+			this.createFooterEl.removeEventListener("click", this.handleCreateFooterActivation);
+			this.createFooterEl.removeEventListener("keydown", this.handleCreateFooterKeydown);
 			this.createFooterEl.remove();
 			this.createFooterEl = null;
 		}
 
 		// Obsidian's SuggestModal calls onClose() BEFORE onChooseSuggestion().
 		// Defer the cancelled check to the next tick so onChooseSuggestion() can set resultHandled first.
-		setTimeout(() => {
+		window.setTimeout(() => {
 			if (!this.resultHandled) {
 				this.options.onResult({ type: "cancelled" });
 			}
@@ -442,11 +775,15 @@ export function openTaskSelector(
 	plugin: TaskNotesPlugin,
 	tasks: TaskInfo[],
 	onChooseTask: (task: TaskInfo | null) => void,
-	options?: { placeholder?: string; title?: string }
+	options?: Omit<TaskSelectorWithCreateOptions, "onResult">
 ): void {
 	const modal = new TaskSelectorWithCreateModal(plugin.app, plugin, tasks, {
+		allowCreate: options?.allowCreate,
+		includeArchived: options?.includeArchived,
 		placeholder: options?.placeholder,
 		title: options?.title,
+		targetDate: options?.targetDate,
+		creationDefaults: options?.creationDefaults,
 		onResult: (result) => {
 			if (result.type === "selected" || result.type === "created") {
 				onChooseTask(result.task);

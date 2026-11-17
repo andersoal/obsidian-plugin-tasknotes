@@ -1,4 +1,8 @@
+import { uiData } from "../i18n/dataText";
+
 import { PriorityConfig } from "../types";
+import { normalizePriorityConfigValue } from "../core/fieldMapping";
+import { isSupportedColorValue, normalizeThemeColor } from "../utils/themeColors";
 
 /**
  * Service for managing custom task priorities
@@ -6,11 +10,16 @@ import { PriorityConfig } from "../types";
 export class PriorityManager {
 	constructor(private priorities: PriorityConfig[]) {}
 
+	normalizePriorityValue(value: unknown): string {
+		return normalizePriorityConfigValue(value, this.priorities) ?? String(value);
+	}
+
 	/**
 	 * Get priority configuration by value
 	 */
 	getPriorityConfig(value: string): PriorityConfig | undefined {
-		return this.priorities.find((p) => p.value === value);
+		const normalizedValue = this.normalizePriorityValue(value);
+		return this.priorities.find((p) => p.value === normalizedValue);
 	}
 
 	/**
@@ -32,7 +41,8 @@ export class PriorityManager {
 	 */
 	getNextPriority(currentPriority: string): string {
 		const sortedPriorities = this.getPrioritiesByWeightAsc();
-		const currentIndex = sortedPriorities.findIndex((p) => p.value === currentPriority);
+		const normalizedPriority = this.normalizePriorityValue(currentPriority);
+		const currentIndex = sortedPriorities.findIndex((p) => p.value === normalizedPriority);
 
 		if (currentIndex === -1) {
 			// Current priority not found, return first priority
@@ -60,17 +70,13 @@ export class PriorityManager {
 	}
 
 	/**
-	 * Get CSS variables for priority colors
+	 * Get CSS variables for priority colors.
 	 */
-	getPriorityStyles(): string {
-		const cssRules: string[] = [];
-
-		for (const priority of this.priorities) {
-			const cssClass = `--priority-${priority.value.replace(/[^a-zA-Z0-9-]/g, "-")}-color`;
-			cssRules.push(`${cssClass}: ${priority.color};`);
-		}
-
-		return `:root { ${cssRules.join(" ")} }`;
+	getPriorityColorVariables(): ReadonlyArray<readonly [string, string]> {
+		return this.priorities.map((priority) => [
+			`--priority-${priority.value.replace(/[^a-zA-Z0-9-]/g, "-")}-color`,
+			normalizeThemeColor(priority.color),
+		]);
 	}
 
 	/**
@@ -160,8 +166,8 @@ export class PriorityManager {
 				errors.push("Priority labels cannot be empty");
 				break;
 			}
-			if (!priority.color || !priority.color.match(/^#[0-9a-fA-F]{6}$/)) {
-				errors.push("Priority colors must be valid hex colors (#rrggbb)");
+			if (!isSupportedColorValue(priority.color)) {
+				errors.push("Priority colors must be valid CSS colors or Obsidian theme colors");
 				break;
 			}
 			if (typeof priority.weight !== "number" || priority.weight < 0) {
@@ -212,7 +218,7 @@ export class PriorityManager {
 		return {
 			id,
 			value: "new-priority",
-			label: "New priority",
+			label: uiData("New priority", "Writable persisted seed for a new user-configured label; not a display getter"),
 			color: "#808080",
 			weight,
 		};

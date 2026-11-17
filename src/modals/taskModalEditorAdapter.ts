@@ -1,15 +1,34 @@
-import { App } from "obsidian";
-import { EmbeddableMarkdownEditor } from "../editor/EmbeddableMarkdownEditor";
+import { App, TFile } from "obsidian";
+import type { Extension } from "@codemirror/state";
+import type { EmbeddableMarkdownEditor } from "../editor/EmbeddableMarkdownEditor";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Modals/TaskModalEditorAdapter" });
+
+type Nullable<T> = T | null;
+
+type EmbeddableMarkdownEditorConstructor =
+	typeof import("../editor/EmbeddableMarkdownEditor").EmbeddableMarkdownEditor;
+
+function loadEmbeddableMarkdownEditor(): EmbeddableMarkdownEditorConstructor {
+	// Lazy-load because the editor module resolves Obsidian internals during evaluation.
+	/* eslint-disable @typescript-eslint/no-require-imports -- Modal editor is lazy-loaded to avoid evaluating Obsidian internals during import. */
+	const editorModule =
+		require("../editor/EmbeddableMarkdownEditor") as typeof import("../editor/EmbeddableMarkdownEditor");
+	/* eslint-enable @typescript-eslint/no-require-imports -- Re-enable after the isolated lazy import. */
+	return editorModule.EmbeddableMarkdownEditor;
+}
 
 export interface TaskModalEditorOptions {
 	value: string;
 	placeholder: string;
 	cls: string;
 	onChange: (value: string) => void;
-	onSubmit: () => void;
+	onSubmit: (shift: boolean) => void;
 	onEscape: () => void;
-	onTab: () => boolean;
-	extensions?: any[];
+	onTab: (shift: boolean) => boolean;
+	extensions?: Extension[];
+	file?: Nullable<TFile>;
 }
 
 export function createTaskModalMarkdownEditor(
@@ -18,9 +37,18 @@ export function createTaskModalMarkdownEditor(
 	options: TaskModalEditorOptions
 ): EmbeddableMarkdownEditor | null {
 	try {
-		return new EmbeddableMarkdownEditor(app, container, options);
+		const EmbeddableMarkdownEditor = loadEmbeddableMarkdownEditor();
+		return new EmbeddableMarkdownEditor(app, container, {
+			...options,
+			onSubmit: (_editor, shift) => options.onSubmit(shift),
+			onTab: (_editor, shift) => options.onTab(shift),
+		});
 	} catch (error) {
-		console.error("Failed to create markdown editor:", error);
+		tasknotesLogger.error("Failed to create markdown editor:", {
+			category: "persistence",
+			operation: "create-markdown-editor",
+			error: error,
+		});
 
 		const fallbackTextarea = container.createEl("textarea", {
 			cls: options.cls + "-fallback",
@@ -33,12 +61,12 @@ export function createTaskModalMarkdownEditor(
 		fallbackTextarea.addEventListener("keydown", (e) => {
 			if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
 				e.preventDefault();
-				options.onSubmit();
+				options.onSubmit(e.shiftKey);
 			} else if (e.key === "Escape") {
 				e.preventDefault();
 				options.onEscape();
 			} else if (e.key === "Tab") {
-				const shouldPreventDefault = options.onTab();
+				const shouldPreventDefault = options.onTab(e.shiftKey);
 				if (shouldPreventDefault) {
 					e.preventDefault();
 				}

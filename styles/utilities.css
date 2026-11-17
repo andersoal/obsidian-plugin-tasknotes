@@ -771,77 +771,101 @@
    ================================================ */
 
 .tasknotes-plugin .tn-gap-0 {
-    gap: 0;
+    --tn-gap-row: 0;
+    --tn-gap-column: 0;
+    gap: var(--tn-gap-row) var(--tn-gap-column);
 }
 
 .tasknotes-plugin .tn-gap-xs {
-    gap: var(--tn-spacing-xs);
+    --tn-gap-row: var(--tn-spacing-xs);
+    --tn-gap-column: var(--tn-spacing-xs);
+    gap: var(--tn-gap-row) var(--tn-gap-column);
 }
 
 .tasknotes-plugin .tn-gap-sm {
-    gap: var(--tn-spacing-sm);
+    --tn-gap-row: var(--tn-spacing-sm);
+    --tn-gap-column: var(--tn-spacing-sm);
+    gap: var(--tn-gap-row) var(--tn-gap-column);
 }
 
 .tasknotes-plugin .tn-gap-md {
-    gap: var(--tn-spacing-md);
+    --tn-gap-row: var(--tn-spacing-md);
+    --tn-gap-column: var(--tn-spacing-md);
+    gap: var(--tn-gap-row) var(--tn-gap-column);
 }
 
 .tasknotes-plugin .tn-gap-lg {
-    gap: var(--tn-spacing-lg);
+    --tn-gap-row: var(--tn-spacing-lg);
+    --tn-gap-column: var(--tn-spacing-lg);
+    gap: var(--tn-gap-row) var(--tn-gap-column);
 }
 
 .tasknotes-plugin .tn-gap-xl {
-    gap: var(--tn-spacing-xl);
+    --tn-gap-row: var(--tn-spacing-xl);
+    --tn-gap-column: var(--tn-spacing-xl);
+    gap: var(--tn-gap-row) var(--tn-gap-column);
 }
 
 /* Column Gap */
 .tasknotes-plugin .tn-gap-x-0 {
-    column-gap: 0;
+    --tn-gap-column: 0;
+    gap: var(--tn-gap-row, 0) var(--tn-gap-column);
 }
 
 .tasknotes-plugin .tn-gap-x-xs {
-    column-gap: var(--tn-spacing-xs);
+    --tn-gap-column: var(--tn-spacing-xs);
+    gap: var(--tn-gap-row, 0) var(--tn-gap-column);
 }
 
 .tasknotes-plugin .tn-gap-x-sm {
-    column-gap: var(--tn-spacing-sm);
+    --tn-gap-column: var(--tn-spacing-sm);
+    gap: var(--tn-gap-row, 0) var(--tn-gap-column);
 }
 
 .tasknotes-plugin .tn-gap-x-md {
-    column-gap: var(--tn-spacing-md);
+    --tn-gap-column: var(--tn-spacing-md);
+    gap: var(--tn-gap-row, 0) var(--tn-gap-column);
 }
 
 .tasknotes-plugin .tn-gap-x-lg {
-    column-gap: var(--tn-spacing-lg);
+    --tn-gap-column: var(--tn-spacing-lg);
+    gap: var(--tn-gap-row, 0) var(--tn-gap-column);
 }
 
 .tasknotes-plugin .tn-gap-x-xl {
-    column-gap: var(--tn-spacing-xl);
+    --tn-gap-column: var(--tn-spacing-xl);
+    gap: var(--tn-gap-row, 0) var(--tn-gap-column);
 }
 
 /* Row Gap */
 .tasknotes-plugin .tn-gap-y-0 {
-    row-gap: 0;
+    --tn-gap-row: 0;
+    gap: var(--tn-gap-row) var(--tn-gap-column, 0);
 }
 
 .tasknotes-plugin .tn-gap-y-xs {
-    row-gap: var(--tn-spacing-xs);
+    --tn-gap-row: var(--tn-spacing-xs);
+    gap: var(--tn-gap-row) var(--tn-gap-column, 0);
 }
 
 .tasknotes-plugin .tn-gap-y-sm {
-    row-gap: var(--tn-spacing-sm);
+    --tn-gap-row: var(--tn-spacing-sm);
+    gap: var(--tn-gap-row) var(--tn-gap-column, 0);
 }
 
 .tasknotes-plugin .tn-gap-y-md {
-    row-gap: var(--tn-spacing-md);
+    --tn-gap-row: var(--tn-spacing-md);
+    gap: var(--tn-gap-row) var(--tn-gap-column, 0);
 }
 
 .tasknotes-plugin .tn-gap-y-lg {
-    row-gap: var(--tn-spacing-lg);
+    --tn-gap-row: var(--tn-spacing-lg);
+    gap: var(--tn-gap-row) var(--tn-gap-column, 0);
 }
 
 .tasknotes-plugin .tn-gap-y-xl {
-    row-gap: var(--tn-spacing-xl);
+    --tn-gap-row: var(--tn-spacing-xl);
+    gap: var(--tn-gap-row) var(--tn-gap-column, 0);
 }
 
 /* ================================================
@@ -861,7 +885,7 @@
 }
 
 .tasknotes-plugin .tn-hidden {
-    display: none !important;
+    display: none;
 }
 
 .tasknotes-plugin .tn-table {
@@ -1543,7 +1567,7 @@
 }
 
 .tasknotes-plugin .tn-cursor-pointer {
-    cursor: var(--cursor, pointer);
+    cursor: var(--cursor-link, pointer);
 }
 
 .tasknotes-plugin .tn-cursor-wait {
@@ -1615,15 +1639,15 @@
 }
 
 .tasknotes-plugin .tn-transition-fast {
-    transition: all var(--tn-transition-fast);
+    transition: background-color var(--tn-transition-fast), border-color var(--tn-transition-fast), box-shadow var(--tn-transition-fast), color var(--tn-transition-fast), opacity var(--tn-transition-fast), transform var(--tn-transition-fast);
 }
 
 .tasknotes-plugin .tn-transition {
-    transition: all var(--tn-transition-normal);
+    transition: background-color var(--tn-transition-normal), border-color var(--tn-transition-normal), box-shadow var(--tn-transition-normal), color var(--tn-transition-normal), opacity var(--tn-transition-normal), transform var(--tn-transition-normal);
 }
 
 .tasknotes-plugin .tn-transition-slow {
-    transition: all var(--tn-transition-slow);
+    transition: background-color var(--tn-transition-slow), border-color var(--tn-transition-slow), box-shadow var(--tn-transition-slow), color var(--tn-transition-slow), opacity var(--tn-transition-slow), transform var(--tn-transition-slow);
 }
 
 .tasknotes-plugin .tn-transition-colors {
@@ -2032,7 +2056,7 @@
     .tasknotes-plugin .tn-transition-colors,
     .tasknotes-plugin .tn-transition-opacity,
     .tasknotes-plugin .tn-transition-transform {
-        transition: none !important;
+        transition: none;
     }
     
     .tasknotes-plugin .tn-animate-spin,
@@ -2040,11 +2064,11 @@
     .tasknotes-plugin .tn-animate-bounce,
     .tasknotes-plugin .tn-animate-fade-in,
     .tasknotes-plugin .tn-animate-slide-up {
-        animation: none !important;
+        animation: none;
     }
     
     .tasknotes-plugin .tn-hover-scale:hover {
-        transform: none !important;
+        transform: none;
     }
 }
 
@@ -2082,12 +2106,12 @@
     font-size: var(--tn-font-size-md);
     font-weight: var(--tn-font-weight-medium);
     line-height: 1;
-    cursor: var(--cursor, pointer);
+    cursor: var(--cursor-link, pointer);
     user-select: none;
     text-decoration: none;
     outline: none;
     box-shadow: none;
-    transition: all var(--tn-transition-fast);
+    transition: background-color var(--tn-transition-fast), border-color var(--tn-transition-fast), box-shadow var(--tn-transition-fast), color var(--tn-transition-fast), transform var(--tn-transition-fast);
     min-height: var(--tn-button-height-md);
 }
 
@@ -2303,6 +2327,24 @@
 }
 
 /* Hide CodeMirror widgetBuffer image artifacts only */
-.cm-content > .cm-line:has(.cm-widget-cursor-fix) img.cm-widgetBuffer {
-    display: none !important;
+.cm-content .cm-widgetBuffer {
+    display: none;
+}
+
+.tn-virtual-scroller .virtual-scroller__spacer {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    pointer-events: none;
+}
+
+.tn-virtual-scroller .virtual-scroller__content {
+    position: relative;
+}
+
+.tn-virtual-scroller .virtual-scroller__sample {
+    position: absolute;
+    visibility: hidden;
+    pointer-events: none;
 }

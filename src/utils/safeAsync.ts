@@ -1,4 +1,25 @@
-import { Notice } from "obsidian";
+import { displayError } from "../i18n/runtime";
+import { uiText } from "../i18n/runtime";
+import { msg } from "@lingui/core/macro";
+import { createTaskNotesLogger } from "./tasknotesLogger";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Utils/SafeAsync" });
+
+type SafeAsyncNoticeHandler = (message: string) => void;
+
+interface SafeAsyncNoticeOptions {
+	showNotice?: boolean;
+	noticeHandler?: SafeAsyncNoticeHandler;
+}
+
+function notifyIfRequested(
+	message: string,
+	{ showNotice = true, noticeHandler }: SafeAsyncNoticeOptions
+): void {
+	if (showNotice) {
+		noticeHandler?.(message);
+	}
+}
 
 /**
  * Utility for safe async operations with error boundaries
@@ -13,13 +34,15 @@ export class SafeAsync {
 			fallback?: T;
 			errorMessage?: string;
 			showNotice?: boolean;
+			noticeHandler?: SafeAsyncNoticeHandler;
 			logError?: boolean;
 		} = {}
 	): Promise<T | undefined> {
 		const {
 			fallback,
-			errorMessage = "An error occurred",
+			errorMessage = uiText(msg({ message: "An error occurred", context: "utils/safeAsync: SafeAsync.execute display" })),
 			showNotice = true,
+			noticeHandler,
 			logError = true,
 		} = options;
 
@@ -27,12 +50,19 @@ export class SafeAsync {
 			return await operation();
 		} catch (error) {
 			if (logError) {
-				console.error(errorMessage, error);
+				tasknotesLogger.error(errorMessage, {
+					category: "provider",
+					operation: "execute-safe-operation",
+					error: error,
+				});
 			}
 
 			if (showNotice) {
 				const message = error instanceof Error ? error.message : String(error);
-				new Notice(`${errorMessage}: ${message}`);
+				notifyIfRequested(`${errorMessage}: ${message}`, {
+					showNotice,
+					noticeHandler,
+				});
 			}
 
 			return fallback;
@@ -49,13 +79,15 @@ export class SafeAsync {
 			retryDelay?: number;
 			errorMessage?: string;
 			showNotice?: boolean;
+			noticeHandler?: SafeAsyncNoticeHandler;
 		} = {}
 	): Promise<T | undefined> {
 		const {
 			maxRetries = 3,
 			retryDelay = 1000,
-			errorMessage = "Operation failed",
+			errorMessage = uiText(msg({ message: "Operation failed", context: "utils/safeAsync: SafeAsync.executeWithRetry display" })),
 			showNotice = true,
+			noticeHandler,
 		} = options;
 
 		let lastError: Error;
@@ -67,15 +99,23 @@ export class SafeAsync {
 				lastError = error instanceof Error ? error : new Error(String(error));
 
 				if (attempt < maxRetries) {
-					await new Promise((resolve) => setTimeout(resolve, retryDelay));
+					await new Promise((resolve) => window.setTimeout(resolve, retryDelay));
 					continue;
 				}
 
 				// Final attempt failed
-				console.error(`${errorMessage} after ${maxRetries + 1} attempts:`, lastError);
+				tasknotesLogger.error(`${errorMessage} after ${maxRetries + 1} attempts:`, {
+					category: "provider",
+					operation: "execute-with-retry",
+					details: { attempts: maxRetries + 1 },
+					error: lastError,
+				});
 
 				if (showNotice) {
-					new Notice(`${errorMessage}: ${lastError.message}`);
+					notifyIfRequested(uiText(msg({ message: "{errorMessage}: {message}", context: "utils/safeAsync: SafeAsync.executeWithRetry display" }), { errorMessage: displayError(errorMessage), message: displayError(lastError.message) }), {
+						showNotice,
+						noticeHandler,
+					});
 				}
 
 				return undefined;
@@ -92,15 +132,19 @@ export class SafeAsync {
 		options: {
 			errorMessage?: string;
 			showNotice?: boolean;
+			noticeHandler?: SafeAsyncNoticeHandler;
 		} = {}
 	): Promise<T | undefined> {
-		const { showNotice = true } = options;
+		const { showNotice = true, noticeHandler } = options;
 
 		// Check all validations
 		for (const validation of validations) {
 			if (!validation.condition) {
 				if (showNotice) {
-					new Notice(validation.message);
+					notifyIfRequested(validation.message, {
+						showNotice,
+						noticeHandler,
+					});
 				}
 				return undefined;
 			}

@@ -22,7 +22,7 @@ import { formatDateForStorage } from '../../../src/utils/dateUtils';
 import { format } from 'date-fns';
 import { TaskInfo } from '../../../src/types';
 import { TaskFactory } from '../../helpers/mock-factories';
-import { MockObsidian, TFile } from '../../__mocks__/obsidian';
+import { MockObsidian, TFile } from '../../helpers/obsidian-runtime';
 import { isDueByRRule, generateRecurringInstances } from '../../../src/utils/helpers';
 
 // Mock date-fns with default AEST timezone behavior
@@ -114,6 +114,10 @@ describe('Off-by-One Completion Date Bug', () => {
             return Promise.resolve();
           })
         }
+      },
+      statusManager: {
+        isCompletedStatus: jest.fn(() => false),
+        getConfiguredStatusAfterCompletion: jest.fn(),
       },
       fieldMapper: {
         toUserField: jest.fn((field) => {

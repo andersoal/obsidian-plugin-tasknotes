@@ -1,17 +1,221 @@
-import { MarkdownPostProcessor } from "obsidian";
+import { MarkdownPostProcessor, parseLinktext } from "obsidian";
 import { EditorView } from "@codemirror/view";
 import TaskNotesPlugin from "../main";
-import { TaskInfo } from "../types";
+import {
+	EVENT_DATA_CHANGED,
+	EVENT_DATE_CHANGED,
+	EVENT_TASK_DELETED,
+	EVENT_TASK_UPDATED,
+	TaskInfo,
+} from "../types";
 import { TaskLinkWidget } from "./TaskLinkWidget";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+import {
+	extractTaskLinkSubpath,
+	formatTaskLinkSubpathDisplayText,
+	isImplicitTaskLinkDisplayText,
+	resolveTaskLinkDisplayText,
+} from "./taskLinkDisplayText";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Editor/ReadingModeTaskLinkProcessor" });
+
+export interface ReadingModeSourceLink {
+	target: string;
+	hasAlias: boolean;
+	subpath?: string;
+}
+
+export interface ReadingModeSourceLinkCursor {
+	index: number;
+}
+
+function safeDecodeURIComponent(value: string): string {
+	try {
+		return decodeURIComponent(value);
+	} catch {
+		return value;
+	}
+}
+
+export function normalizeReadingModeLinkTarget(value: string): string {
+	let target = safeDecodeURIComponent(value).trim();
+	if (!target) return "";
+
+	if (target.startsWith("app://")) {
+		try {
+			target = new URL(target).pathname;
+		} catch {
+			// Keep the original target if URL parsing fails.
+		}
+	}
+
+	target = target.replace(/^\/+/, "");
+	target = target.split("#")[0].trim();
+	if (target.endsWith(".md")) {
+		target = target.slice(0, -3);
+	}
+	return target;
+}
+
+function getReadingModeTargetBasename(target: string): string {
+	const normalizedTarget = normalizeReadingModeLinkTarget(target);
+	const parts = normalizedTarget.split("/");
+	return parts[parts.length - 1] ?? normalizedTarget;
+}
+
+function readingModeLinkTargetsMatch(sourceTarget: string, linkTarget: string): boolean {
+	const normalizedSourceTarget = normalizeReadingModeLinkTarget(sourceTarget);
+	const normalizedLinkTarget = normalizeReadingModeLinkTarget(linkTarget);
+	if (!normalizedSourceTarget || !normalizedLinkTarget) return false;
+	if (normalizedSourceTarget === normalizedLinkTarget) return true;
+
+	return (
+		getReadingModeTargetBasename(normalizedSourceTarget) ===
+		getReadingModeTargetBasename(normalizedLinkTarget)
+	);
+}
+
+export function parseReadingModeSourceLinks(sourceText: string): ReadingModeSourceLink[] {
+	const links: ReadingModeSourceLink[] = [];
+	const wikilinkPattern = /!?\[\[([^\]]+)\]\]/g;
+	let match: RegExpExecArray | null;
+
+	while ((match = wikilinkPattern.exec(sourceText)) !== null) {
+		if (match[0].startsWith("!")) continue;
+
+		const content = match[1].trim();
+		if (!content) continue;
+
+		const pipeIndex = content.indexOf("|");
+		const rawTarget = pipeIndex === -1 ? content : content.slice(0, pipeIndex);
+		const target = normalizeReadingModeLinkTarget(rawTarget);
+		if (!target) continue;
+
+		links.push({
+			target,
+			hasAlias: pipeIndex !== -1,
+			subpath: extractTaskLinkSubpath(rawTarget),
+		});
+	}
+
+	return links;
+}
+
+export function consumeReadingModeSourceLink(
+	sourceLinks: ReadingModeSourceLink[],
+	cursor: ReadingModeSourceLinkCursor,
+	linkTarget: string
+): ReadingModeSourceLink | null {
+	const normalizedTarget = normalizeReadingModeLinkTarget(linkTarget);
+	if (!normalizedTarget) return null;
+
+	const findFromCursor = (): ReadingModeSourceLink | null => {
+		for (let i = cursor.index; i < sourceLinks.length; i++) {
+			const sourceLink = sourceLinks[i];
+			if (readingModeLinkTargetsMatch(sourceLink.target, normalizedTarget)) {
+				cursor.index = i + 1;
+				return sourceLink;
+			}
+		}
+
+		return null;
+	};
+
+	const match = findFromCursor();
+	if (match) return match;
+
+	if (cursor.index > 0) {
+		cursor.index = 0;
+		return findFromCursor();
+	}
+
+	return null;
+}
+
+function sourceLinkCursorKey(sourcePath: string, sectionText: string): string {
+	return `${sourcePath}\0${sectionText}`;
+}
+
+function createSourceLinkCursor(): ReadingModeSourceLinkCursor {
+	return { index: 0 };
+}
+
+const READING_MODE_TASK_LINK_SELECTOR = ".task-inline-preview--reading-mode[data-task-path]";
+
+interface ReadingModeTaskUpdatePayload {
+	path?: string;
+	task?: TaskInfo;
+	updatedTask?: TaskInfo;
+}
+
+export function shouldSkipReadingModeTaskLinkOverlay(options: {
+	disableOverlayOnAlias: boolean;
+	hasExplicitAlias: boolean;
+	linkText: string;
+	originalLinkPath: string;
+	taskSubpath?: string;
+	taskPath?: string;
+	taskTitle: string;
+}): boolean {
+	if (!options.disableOverlayOnAlias) return false;
+	if (options.hasExplicitAlias) return true;
+
+	const currentText = options.linkText.trim();
+	const subpathDisplayText = formatTaskLinkSubpathDisplayText(
+		options.taskTitle,
+		options.taskSubpath ?? extractTaskLinkSubpath(options.originalLinkPath)
+	);
+	if (subpathDisplayText && currentText === subpathDisplayText) {
+		return false;
+	}
+	if (
+		isImplicitTaskLinkDisplayText(
+			currentText,
+			options.taskPath,
+			options.originalLinkPath,
+			options.taskTitle
+		)
+	) {
+		return false;
+	}
+	return currentText !== options.originalLinkPath && currentText !== options.taskTitle;
+}
+
+/**
+ * Tags (`a.tag`) and same-note heading links (`[[#Heading]]`, `[text](#Heading)`)
+ * render as anchors whose target starts with `#`. They have no link path, so they
+ * would otherwise resolve to the current note and be replaced by its task widget.
+ */
+function isSameNoteFragmentLink(linkEl: HTMLAnchorElement): boolean {
+	if (linkEl.classList.contains("tag")) return true;
+	const target = linkEl.getAttribute("data-href") || linkEl.getAttribute("href") || "";
+	return target.startsWith("#");
+}
+
+function getMarkdownSectionText(
+	ctx: Parameters<MarkdownPostProcessor>[1],
+	el: HTMLElement
+): string {
+	try {
+		return ctx.getSectionInfo?.(el)?.text ?? "";
+	} catch {
+		return "";
+	}
+}
 
 /**
  * Markdown post processor that adds task previews to wikilinks in reading mode
  */
 export class ReadingModeTaskLinkProcessor {
 	private plugin: TaskNotesPlugin;
+	private sourceLinkCursors = new Map<string, ReadingModeSourceLinkCursor>();
+	private refreshTimer: number | null = null;
+	private pendingRefreshAll = false;
+	private pendingRefreshTaskPaths = new Set<string>();
 
 	constructor(plugin: TaskNotesPlugin) {
 		this.plugin = plugin;
+		this.setupEventListeners();
 	}
 
 	/**
@@ -26,14 +230,32 @@ export class ReadingModeTaskLinkProcessor {
 
 			// Find all links in the rendered content
 			const allLinks = el.querySelectorAll("a");
+			const sectionText = getMarkdownSectionText(ctx, el);
+			const sourceLinks = parseReadingModeSourceLinks(sectionText);
+			const cursorKey = sourceLinkCursorKey(ctx.sourcePath, sectionText);
+			const sourceLinkCursor =
+				this.sourceLinkCursors.get(cursorKey) ?? createSourceLinkCursor();
+			this.sourceLinkCursors.set(cursorKey, sourceLinkCursor);
 
 			for (const link of Array.from(allLinks)) {
-				const linkEl = link as HTMLAnchorElement;
+				const linkEl = link;
+				if (isSameNoteFragmentLink(linkEl)) continue;
 				const href = linkEl.getAttribute("href");
+				const linkTarget = linkEl.getAttribute("data-href") || href || "";
+				const sourceLink =
+					sourceLinks.length > 0
+						? consumeReadingModeSourceLink(sourceLinks, sourceLinkCursor, linkTarget)
+						: null;
 
 				// Process internal links (wikilinks) - these have .internal-link class
 				if (linkEl.classList.contains("internal-link")) {
-					this.processLink(linkEl, ctx.sourcePath, "internal");
+					void this.processLink(
+						linkEl,
+						ctx.sourcePath,
+						"internal",
+						sourceLink?.hasAlias ?? false,
+						sourceLink?.subpath
+					);
 				}
 				// Process other links that might be markdown links to internal files
 				else if (
@@ -42,7 +264,13 @@ export class ReadingModeTaskLinkProcessor {
 					!href.startsWith("https://") &&
 					!href.includes("://")
 				) {
-					this.processLink(linkEl, ctx.sourcePath, "external");
+					void this.processLink(
+						linkEl,
+						ctx.sourcePath,
+						"external",
+						sourceLink?.hasAlias ?? false,
+						sourceLink?.subpath
+					);
 				}
 			}
 		};
@@ -54,7 +282,9 @@ export class ReadingModeTaskLinkProcessor {
 	private async processLink(
 		linkEl: HTMLAnchorElement,
 		sourcePath: string,
-		linkType: "internal" | "external"
+		linkType: "internal" | "external",
+		hasExplicitAlias: boolean,
+		implicitSubpath?: string
 	): Promise<void> {
 		try {
 			// Get the link path from the href attribute
@@ -98,10 +328,169 @@ export class ReadingModeTaskLinkProcessor {
 			if (!taskInfo) return;
 
 			// Create a task widget and replace the link
-			await this.replaceWithTaskWidget(linkEl, taskInfo, linkPath);
+			await this.replaceWithTaskWidget(
+				linkEl,
+				taskInfo,
+				linkPath,
+				hasExplicitAlias,
+				implicitSubpath
+			);
 		} catch (error) {
-			console.debug("Error processing link in reading mode:", error);
+			tasknotesLogger.debug("Error processing link in reading mode:", {
+				category: "persistence",
+				operation: "processing-link-reading-mode",
+				error: error,
+			});
 		}
+	}
+
+	private setupEventListeners(): void {
+		this.plugin.registerEvent(
+			this.plugin.emitter.on(EVENT_TASK_UPDATED, (data?: ReadingModeTaskUpdatePayload) => {
+				this.scheduleReadingModeWidgetRefresh(
+					data?.path ?? data?.updatedTask?.path ?? data?.task?.path
+				);
+			})
+		);
+
+		this.plugin.registerEvent(
+			this.plugin.emitter.on(EVENT_TASK_DELETED, (data?: ReadingModeTaskUpdatePayload) => {
+				this.scheduleReadingModeWidgetRefresh(data?.path);
+			})
+		);
+
+		this.plugin.registerEvent(
+			this.plugin.emitter.on(EVENT_DATA_CHANGED, () => {
+				this.scheduleReadingModeWidgetRefresh();
+			})
+		);
+
+		this.plugin.registerEvent(
+			this.plugin.emitter.on(EVENT_DATE_CHANGED, () => {
+				this.scheduleReadingModeWidgetRefresh();
+			})
+		);
+
+		this.plugin.registerEvent(
+			this.plugin.emitter.on("settings-changed", () => {
+				this.scheduleReadingModeWidgetRefresh();
+			})
+		);
+
+		this.plugin.register(() => {
+			if (this.refreshTimer !== null) {
+				window.clearTimeout(this.refreshTimer);
+				this.refreshTimer = null;
+			}
+		});
+	}
+
+	private scheduleReadingModeWidgetRefresh(taskPath?: string): void {
+		if (taskPath) {
+			if (!this.pendingRefreshAll) {
+				this.pendingRefreshTaskPaths.add(taskPath);
+			}
+		} else {
+			this.pendingRefreshAll = true;
+			this.pendingRefreshTaskPaths.clear();
+		}
+
+		if (this.refreshTimer !== null) {
+			window.clearTimeout(this.refreshTimer);
+		}
+
+		this.refreshTimer = window.setTimeout(() => {
+			this.refreshTimer = null;
+			const taskPaths = this.pendingRefreshAll
+				? undefined
+				: new Set(this.pendingRefreshTaskPaths);
+			this.pendingRefreshAll = false;
+			this.pendingRefreshTaskPaths.clear();
+			this.refreshReadingModeWidgets(taskPaths);
+		}, 100);
+	}
+
+	refreshReadingModeWidgets(taskPaths?: Set<string>): void {
+		const containers = this.getReadingModeContainers();
+		if (containers.length === 0) return;
+
+		for (const container of containers) {
+			const widgets = Array.from(
+				container.querySelectorAll<HTMLElement>(READING_MODE_TASK_LINK_SELECTOR)
+			);
+
+			for (const widgetEl of widgets) {
+				const taskPath = widgetEl.dataset.taskPath;
+				if (!taskPath) continue;
+				if (taskPaths && !taskPaths.has(taskPath)) continue;
+
+				if (!this.plugin.settings.enableTaskLinkOverlay) {
+					this.replaceWidgetWithOriginalLink(widgetEl);
+					continue;
+				}
+
+				const taskInfo = this.getTaskInfo(taskPath);
+				if (!taskInfo) {
+					this.replaceWidgetWithOriginalLink(widgetEl);
+					continue;
+				}
+
+				const originalLinkPath = widgetEl.dataset.originalLinkPath || taskInfo.path;
+				const originalText = widgetEl.dataset.originalText || taskInfo.title;
+				const displayText = widgetEl.dataset.displayText || undefined;
+				const widget = new TaskLinkWidget(
+					taskInfo, this.plugin, originalText, displayText,
+					undefined, parseLinktext(originalLinkPath).subpath || undefined
+				);
+				const refreshedElement = this.createReadingModeWidget(
+					widget,
+					taskInfo,
+					originalLinkPath,
+					originalText,
+					displayText
+				);
+				widgetEl.replaceWith(refreshedElement);
+			}
+		}
+	}
+
+	private getReadingModeContainers(): HTMLElement[] {
+		const leaves = this.plugin.app.workspace.getLeavesOfType?.("markdown") ?? [];
+		const containers: HTMLElement[] = [];
+
+		for (const leaf of leaves) {
+			const view = leaf.view as {
+				getMode?: () => string;
+				previewMode?: { containerEl?: HTMLElement };
+				containerEl?: HTMLElement;
+			};
+
+			if (typeof view.getMode === "function" && view.getMode() !== "preview") {
+				continue;
+			}
+
+			const containerEl = view.previewMode?.containerEl ?? view.containerEl;
+			if (containerEl) {
+				containers.push(containerEl);
+			}
+		}
+
+		return containers;
+	}
+
+	private replaceWidgetWithOriginalLink(widgetEl: HTMLElement): void {
+		const originalLinkPath = widgetEl.dataset.originalLinkPath;
+		if (!originalLinkPath) {
+			widgetEl.remove();
+			return;
+		}
+
+		const linkEl = activeWindow.createEl("a");
+		linkEl.className = "internal-link";
+		linkEl.setAttribute("href", originalLinkPath);
+		linkEl.setAttribute("data-href", originalLinkPath);
+		linkEl.textContent = widgetEl.dataset.originalText || originalLinkPath;
+		widgetEl.replaceWith(linkEl);
 	}
 
 	/**
@@ -111,12 +500,16 @@ export class ReadingModeTaskLinkProcessor {
 		try {
 			// Use Obsidian's metadata cache to resolve the link - it handles relative paths safely
 			const file = this.plugin.app.metadataCache.getFirstLinkpathDest(
-				linkPath,
-				sourcePath
+				parseLinktext(linkPath).path, sourcePath
 			);
 			return file?.path || null;
 		} catch (error) {
-			console.debug("Error resolving link path:", linkPath, error);
+			tasknotesLogger.debug("Error resolving link path:", {
+				category: "persistence",
+				operation: "resolving-link-path",
+				details: { value: linkPath },
+				error: error,
+			});
 			return null;
 		}
 	}
@@ -146,7 +539,12 @@ export class ReadingModeTaskLinkProcessor {
 
 			return null;
 		} catch (error) {
-			console.debug("Error getting task info for:", filePath, error);
+			tasknotesLogger.debug("Error getting task info for:", {
+				category: "persistence",
+				operation: "getting-task-info",
+				details: { value: filePath },
+				error: error,
+			});
 			return null;
 		}
 	}
@@ -157,38 +555,59 @@ export class ReadingModeTaskLinkProcessor {
 	private async replaceWithTaskWidget(
 		linkEl: HTMLAnchorElement,
 		taskInfo: TaskInfo,
-		originalLinkPath: string
+		originalLinkPath: string,
+		hasExplicitAlias: boolean,
+		implicitSubpath?: string
 	): Promise<void> {
 		try {
 			// Get the original link text for display
 			const originalText = linkEl.textContent || `[[${originalLinkPath}]]`;
+			const implicitSubpathDisplayText = formatTaskLinkSubpathDisplayText(
+				taskInfo.title,
+				implicitSubpath ?? extractTaskLinkSubpath(originalLinkPath)
+			);
 
 			// Check for alias exclusion
-			if (this.plugin.settings.disableOverlayOnAlias) {
-				// In reading mode, we check if the displayed text differs from the path or title
-				// If it does, it's likely an alias/custom text
-				const currentText = linkEl.textContent || "";
-				
-				// If text doesn't match path AND doesn't match task title, it's an alias
-				if (currentText !== originalLinkPath && currentText !== taskInfo.title) {
-					return;
-				}
+			if (
+				shouldSkipReadingModeTaskLinkOverlay({
+					disableOverlayOnAlias: this.plugin.settings.disableOverlayOnAlias,
+					hasExplicitAlias,
+					linkText: linkEl.textContent || "",
+					originalLinkPath,
+					taskSubpath: implicitSubpath,
+					taskPath: taskInfo.path,
+					taskTitle: taskInfo.title,
+				})
+			) {
+				return;
 			}
 
 			// Parse display text if it's a piped link
 			let displayText: string | undefined;
 			const linkContent = linkEl.textContent || "";
-			if (linkContent !== originalLinkPath && linkContent !== taskInfo.title) {
-				displayText = linkContent;
+			if (hasExplicitAlias) {
+				displayText = linkContent.trim() || undefined;
+			} else if (implicitSubpathDisplayText) {
+				displayText = implicitSubpathDisplayText;
+			} else if (linkContent !== originalLinkPath && linkContent !== taskInfo.title) {
+				displayText = resolveTaskLinkDisplayText(
+					linkContent,
+					taskInfo.path,
+					originalLinkPath
+				);
 			}
 
 			// Create a task widget instance
-			const widget = new TaskLinkWidget(taskInfo, this.plugin, originalText, displayText);
+			const widget = new TaskLinkWidget(
+				taskInfo, this.plugin, originalText, displayText,
+				undefined, parseLinktext(originalLinkPath).subpath || undefined
+			);
 
 			// Create the DOM element for reading mode
 			const widgetElement = this.createReadingModeWidget(
 				widget,
 				taskInfo,
+				originalLinkPath,
 				originalText,
 				displayText
 			);
@@ -196,7 +615,11 @@ export class ReadingModeTaskLinkProcessor {
 			// Replace the original link with the widget
 			linkEl.parentNode?.replaceChild(widgetElement, linkEl);
 		} catch (error) {
-			console.error("Error replacing wikilink with task widget:", error);
+			tasknotesLogger.error("Error replacing wikilink with task widget:", {
+				category: "persistence",
+				operation: "replacing-wikilink-task-widget",
+				error: error,
+			});
 		}
 	}
 
@@ -207,6 +630,7 @@ export class ReadingModeTaskLinkProcessor {
 	private createReadingModeWidget(
 		widget: TaskLinkWidget,
 		taskInfo: TaskInfo,
+		originalLinkPath: string,
 		originalText: string,
 		displayText?: string
 	): HTMLElement {
@@ -222,6 +646,12 @@ export class ReadingModeTaskLinkProcessor {
 
 		// Add reading mode specific class
 		element.classList.add("task-inline-preview--reading-mode");
+		element.dataset.taskPath = taskInfo.path;
+		element.dataset.originalLinkPath = originalLinkPath;
+		element.dataset.originalText = originalText;
+		if (displayText) {
+			element.dataset.displayText = displayText;
+		}
 
 		return element;
 	}

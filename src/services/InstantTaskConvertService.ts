@@ -1,28 +1,148 @@
-import { Editor, TFile, Notice, EditorPosition } from "obsidian";
+import { uiData } from "../i18n/dataText";
+import { displayError } from "../i18n/runtime";
+import { uiText } from "../i18n/runtime";
+import { msg } from "@lingui/core/macro";
+import { Editor, TFile, EditorPosition } from "obsidian";
+import type { HeadingCache } from "obsidian";
+import type { EditorView } from "@codemirror/view";
 import TaskNotesPlugin from "../main";
 import { TasksPluginParser, ParsedTaskData } from "../utils/TasksPluginParser";
-import { NaturalLanguageParser } from "./NaturalLanguageParser";
-import { TaskCreationData } from "../types";
+import { createLivePluginParser, type TaskTextParser } from "./NaturalLanguageParser";
+import { Reminder, TaskCreationData } from "../types";
 import {
 	getCurrentTimestamp,
 	combineDateAndTime,
 	parseDateToUTC,
 	formatDateForStorage,
 } from "../utils/dateUtils";
-import { calculateDefaultDate } from "../utils/helpers";
+import { calculateDefaultDateTime } from "../utils/helpers";
 import { StatusManager } from "./StatusManager";
 import { PriorityManager } from "./PriorityManager";
 import { dispatchTaskUpdate } from "../editor/TaskLinkOverlay";
 import { splitListPreservingLinksAndQuotes } from "../utils/stringSplit";
-import { TranslationKey } from "../i18n";
+import { getTaskFilenameNotice } from "../utils/filenameGenerator";
+import type { InterpolationValues, MessageDescriptor } from "../i18n";
+import { createTaskNotesLogger } from "../utils/tasknotesLogger";
+import { sanitizeGeneratedLinkAlias, sanitizeLinkAliasText } from "../utils/linkAliasUtils";
+import { publishUserNotice } from "../core/userNotices";
+import {
+	modifyVaultFile,
+	processVaultFileWithinMutation,
+	processVaultFrontMatterWithinMutation,
+	withVaultFileMutation,
+} from "./VaultMutationService";
+import {
+	applyPropertyTaskIdentifier,
+	getFrontmatterTags,
+} from "../utils/taskIdentificationFrontmatter";
+
+const tasknotesLogger = createTaskNotesLogger({ tag: "Services/InstantTaskConvertService" });
+
+type Nullable<T> = T | null;
+type Optional<T> = T | undefined;
+
+interface ConvertedTaskFile {
+	file: TFile;
+	/** Set when an existing note was reused; undoes the conversion's changes to it. */
+	revert?: () => Promise<void>;
+}
+
+// A task line can name its existing note with a link aliased "note", e.g. [[Skills/Review|note]].
+const LINKED_TASK_NOTE_PATTERN = /(?:^|[^!])(\[\[([^\]|]+)\|\s*note\s*\]\])/i;
+
+function frontmatterValueIncludes(existing: unknown, value: unknown): boolean {
+	const existingValues = (Array.isArray(existing) ? existing : [existing]).map(String);
+	return (Array.isArray(value) ? value : [value]).every((item) =>
+		existingValues.includes(String(item))
+	);
+}
+
+/** Add tags without rewriting the note's own tags unless there is something new to add. */
+function addMissingFrontmatterTags(frontmatter: Record<string, unknown>, tags: string[]): void {
+	const existing = Array.isArray(frontmatter.tags)
+		? frontmatter.tags.map(String)
+		: typeof frontmatter.tags === "string"
+			? frontmatter.tags.split(/[,\s]+/).filter(Boolean)
+			: [];
+	const normalize = (tag: string) => tag.replace(/^#/, "").toLowerCase();
+	const known = new Set(existing.map(normalize));
+	const missing = tags.filter((tag) => !known.has(normalize(tag)));
+	if (missing.length > 0) {
+		frontmatter.tags = [...existing, ...new Set(missing)];
+	}
+}
+
+export function findClosestHeadingAboveLine(
+	headings: Optional<HeadingCache[]>,
+	lineNumber: number
+): Nullable<HeadingCache> {
+	if (!headings || !Number.isInteger(lineNumber) || lineNumber < 0) {
+		return null;
+	}
+
+	let closest: Nullable<HeadingCache> = null;
+	for (const heading of headings) {
+		if (heading.position.start.line >= lineNumber) {
+			continue;
+		}
+		if (!closest || heading.position.start.line > closest.position.start.line) {
+			closest = heading;
+		}
+	}
+
+	return closest;
+}
+
+export function extractProjectFromHeadingText(headingText: string): string | null {
+	const heading = headingText.trim();
+	if (!heading) {
+		return null;
+	}
+
+	const wikilinkMatch = heading.match(/\[\[([^[\]]+)\]\]/);
+	if (wikilinkMatch) {
+		return `[[${wikilinkMatch[1].trim()}]]`;
+	}
+
+	const markdownLinkMatch = heading.match(/\[[^\]]+\]\(([^)]+)\)/);
+	if (markdownLinkMatch) {
+		return markdownLinkMatch[0].trim();
+	}
+
+	if (/^\d{4}(?:-\d{2}){0,2}$/.test(heading)) {
+		return null;
+	}
+
+	return heading;
+}
+
+function splitBlockquotePrefix(line: string): {
+	leadingWhitespace: string;
+	blockquotePrefix: string;
+	content: string;
+} {
+	const leadingWhitespace = line.match(/^(\s*)/)?.[1] || "";
+	let content = line.slice(leadingWhitespace.length);
+	let blockquotePrefix = "";
+
+	while (/^>\s*/.test(content)) {
+		const match = content.match(/^(>\s*)/);
+		if (!match) break;
+		blockquotePrefix += match[1];
+		content = content.slice(match[1].length);
+	}
+
+	return { leadingWhitespace, blockquotePrefix, content };
+}
 
 export class InstantTaskConvertService {
 	private plugin: TaskNotesPlugin;
 	private statusManager: StatusManager;
 	private priorityManager: PriorityManager;
-	private nlParser: NaturalLanguageParser;
+	private nlParser: TaskTextParser;
+	private inFlightConversions = new WeakMap<Editor, Map<number, Promise<void>>>();
 
-	private translate(key: TranslationKey, variables?: Record<string, any>): string {
+	private translate(key: MessageDescriptor, variables?: InterpolationValues): string {
 		return this.plugin.i18n.translate(key, variables);
 	}
 
@@ -34,14 +154,7 @@ export class InstantTaskConvertService {
 		this.plugin = plugin;
 		this.statusManager = statusManager;
 		this.priorityManager = priorityManager;
-		this.nlParser = new NaturalLanguageParser(
-			plugin.settings.customStatuses,
-			plugin.settings.customPriorities,
-			plugin.settings.nlpDefaultToScheduled,
-			plugin.settings.nlpLanguage,
-			plugin.settings.nlpTriggers,
-			plugin.settings.userFields
-		);
+		this.nlParser = createLivePluginParser(plugin);
 	}
 
 	/**
@@ -53,15 +166,13 @@ export class InstantTaskConvertService {
 			const checkboxTasks = this.findAllCheckboxTasks(editor);
 
 			if (checkboxTasks.length === 0) {
-				new Notice(this.translate("services.instantTaskConvert.notices.noCheckboxTasks"));
+				publishUserNotice(this.plugin.emitter, this.translate(msg({ message: "No checkbox tasks found in the current note.", context: "services.instantTaskConvert.notices.noCheckboxTasks" })));
 				return;
 			}
 
-			const plural = checkboxTasks.length === 1 ? "" : "s";
-			new Notice(
-				this.translate("services.instantTaskConvert.notices.convertingTasks", {
+			publishUserNotice(this.plugin.emitter,
+				this.translate(msg({ message: "{count, plural, one {Converting {count, number} task...} other {Converting {count, number} tasks...}}", context: "services.instantTaskConvert.notices.convertingTasks" }), {
 					count: checkboxTasks.length,
-					plural,
 				})
 			);
 
@@ -70,29 +181,33 @@ export class InstantTaskConvertService {
 
 			// Show summary
 			if (result.failures.length === 0) {
-				const plural = result.successCount === 1 ? "" : "s";
-				new Notice(
-					this.translate("services.instantTaskConvert.notices.conversionSuccess", {
+				publishUserNotice(this.plugin.emitter,
+					this.translate(msg({ message: "{count, plural, one {✅ Successfully converted {count, number} task to TaskNotes!} other {✅ Successfully converted {count, number} tasks to TaskNotes!}}", context: "services.instantTaskConvert.notices.conversionSuccess" }), {
 						count: result.successCount,
-						plural,
 					})
 				);
 			} else {
-				const successPlural = result.successCount === 1 ? "" : "s";
-				new Notice(
-					this.translate("services.instantTaskConvert.notices.partialConversion", {
+				publishUserNotice(this.plugin.emitter,
+					this.translate(msg({ message: "{successCount, plural, one {Converted {successCount, number} task. {failureCount, number} failed.} other {Converted {successCount, number} tasks. {failureCount, number} failed.}}", context: "services.instantTaskConvert.notices.partialConversion" }), {
 						successCount: result.successCount,
-						successPlural,
 						failureCount: result.failures.length,
 					})
 				);
 
 				// Log failures for debugging
-				console.warn("Batch conversion failures:", result.failures);
+				tasknotesLogger.warn("Batch conversion failures:", {
+					category: "configuration",
+					operation: "batch-conversion-failures",
+					details: { value: result.failures },
+				});
 			}
 		} catch (error) {
-			console.error("Error during batch task conversion:", error);
-			new Notice(this.translate("services.instantTaskConvert.notices.batchConversionFailed"));
+			tasknotesLogger.error("Error during batch task conversion:", {
+				category: "configuration",
+				operation: "batch-task-conversion",
+				error: error,
+			});
+			publishUserNotice(this.plugin.emitter, this.translate(msg({ message: "Failed to perform batch conversion. Please try again.", context: "services.instantTaskConvert.notices.batchConversionFailed" })));
 		}
 	}
 
@@ -119,7 +234,12 @@ export class InstantTaskConvertService {
 					throw new Error("Failed to parse task");
 				}
 
-				const file = await this.createTaskFile(parsedData);
+				const { file } = await this.createTaskFile(
+					parsedData,
+					"",
+					task.lineNumber,
+					task.line
+				);
 				const linkText = this.generateLinkText(task.line, file);
 
 				return { lineNumber: task.lineNumber, line: task.line, file, linkText };
@@ -154,15 +274,49 @@ export class InstantTaskConvertService {
 	}
 
 	/**
-	 * Instantly convert a checkbox task to a TaskNote without showing the modal
-	 * Supports multi-line selection where additional lines become task details
+	 * Instantly convert a checkbox task to a TaskNote without showing the modal.
+	 * Repeated activation for the same editor line reuses the active conversion.
 	 */
 	async instantConvertTask(editor: Editor, lineNumber: number): Promise<void> {
+		if (!editor) {
+			await this.performInstantConversion(editor, lineNumber);
+			return;
+		}
+
+		let editorConversions = this.inFlightConversions.get(editor);
+		if (!editorConversions) {
+			editorConversions = new Map<number, Promise<void>>();
+			this.inFlightConversions.set(editor, editorConversions);
+		}
+
+		const existingConversion = editorConversions.get(lineNumber);
+		if (existingConversion) {
+			await existingConversion;
+			return;
+		}
+
+		const conversion = this.performInstantConversion(editor, lineNumber);
+		editorConversions.set(lineNumber, conversion);
+
+		try {
+			await conversion;
+		} finally {
+			if (editorConversions.get(lineNumber) === conversion) {
+				editorConversions.delete(lineNumber);
+			}
+		}
+	}
+
+	/**
+	 * Performs one instant conversion after the caller has claimed its source line.
+	 * Supports multi-line selection where additional lines become task details.
+	 */
+	private async performInstantConversion(editor: Editor, lineNumber: number): Promise<void> {
 		try {
 			// Validate input parameters
 			const validationResult = this.validateInputParameters(editor, lineNumber);
 			if (!validationResult.isValid) {
-				new Notice(this.translate("services.instantTaskConvert.notices.invalidParameters"));
+				publishUserNotice(this.plugin.emitter, this.translate(msg({ message: "Invalid input parameters.", context: "services.instantTaskConvert.notices.invalidParameters" })));
 				return;
 			}
 
@@ -182,7 +336,7 @@ export class InstantTaskConvertService {
 				const taskTitle = this.extractLineContentAsTitle(currentLine);
 
 				if (!taskTitle.trim()) {
-					new Notice(this.translate("services.instantTaskConvert.notices.emptyLine"));
+					publishUserNotice(this.plugin.emitter, this.translate(msg({ message: "Current line is empty or contains no valid content.", context: "services.instantTaskConvert.notices.emptyLine" })));
 					return;
 				}
 
@@ -208,9 +362,9 @@ export class InstantTaskConvertService {
 			} else {
 				// Line is a checkbox task, process normally
 				if (taskLineInfo.error || !taskLineInfo.parsedData) {
-					new Notice(
-						this.translate("services.instantTaskConvert.notices.parseError", {
-							error: taskLineInfo.error || "No data extracted",
+					publishUserNotice(this.plugin.emitter,
+						this.translate(msg({ message: "Error parsing task: {error}", context: "services.instantTaskConvert.notices.parseError" }), {
+							error: displayError(taskLineInfo.error || uiText(msg({ message: "No task data was extracted", context: "instant task parsing failure" }))),
 						})
 					);
 					return;
@@ -251,12 +405,17 @@ export class InstantTaskConvertService {
 			// Validate final parsed data before proceeding
 			const taskValidation = this.validateTaskData(parsedData);
 			if (!taskValidation.isValid) {
-				new Notice(this.translate("services.instantTaskConvert.notices.invalidTaskData"));
+				publishUserNotice(this.plugin.emitter, this.translate(msg({ message: "Invalid task data.", context: "services.instantTaskConvert.notices.invalidTaskData" })));
 				return;
 			}
 
 			// Create the task file with default settings and details
-			const file = await this.createTaskFile(parsedData, details);
+			const { file, revert } = await this.createTaskFile(
+				parsedData,
+				details,
+				selectionInfo.startLine,
+				currentLine
+			);
 
 			// Replace the original line(s) with a link (includes race condition protection)
 			const replaceResult = await this.replaceOriginalTaskLines(
@@ -267,33 +426,56 @@ export class InstantTaskConvertService {
 			);
 
 			if (!replaceResult.success) {
-				new Notice(this.translate("services.instantTaskConvert.notices.replaceLineFailed"));
-				// Clean up the created file since replacement failed
+				publishUserNotice(this.plugin.emitter, this.translate(msg({ message: "Failed to replace task line.", context: "services.instantTaskConvert.notices.replaceLineFailed" })));
+				// Undo the conversion since replacement failed. A reused note is restored, never trashed.
 				try {
-					await this.plugin.app.vault.delete(file);
+					if (revert) {
+						await revert();
+					} else {
+						await this.plugin.app.fileManager.trashFile(file);
+					}
 				} catch (cleanupError) {
-					console.warn(
+					tasknotesLogger.warn(
 						"Failed to clean up created file after replacement failure:",
-						cleanupError
+						{
+							category: "validation",
+							operation: "clean-up-created-file-replacement",
+							error: cleanupError,
+						}
 					);
 				}
 				return;
 			}
 
-			// Check if filename was changed due to length constraints
-			const expectedFilename = this.sanitizeTitle(parsedData.title);
-			const actualFilename = file.basename;
+			await this.persistSourceNoteAfterReplacement(editor);
 
-			if (actualFilename.startsWith("task-") && actualFilename !== expectedFilename) {
-				new Notice(
+			// A reused note keeps its own filename, so only a newly created file can need a notice.
+			const filenameNotice = revert
+				? undefined
+				: getTaskFilenameNotice(this.plugin.settings, parsedData.title, file.basename);
+			if (revert) {
+				publishUserNotice(this.plugin.emitter,
+					this.translate(msg({ message: "Task converted: {title}", context: "services.instantTaskConvert.notices.conversionComplete" }), {
+						title: file.basename,
+					})
+				);
+			} else if (filenameNotice === "shortened") {
+				publishUserNotice(this.plugin.emitter,
 					this.translate(
-						"services.instantTaskConvert.notices.conversionCompleteShortened",
+						msg({ message: "Task converted: \"{title}\" (filename shortened due to length)", context: "services.instantTaskConvert.notices.conversionCompleteShortened" }),
 						{ title: parsedData.title }
 					)
 				);
+			} else if (filenameNotice === "sanitized") {
+				publishUserNotice(this.plugin.emitter,
+					this.translate(
+						msg({ message: "Task converted: \"{title}\" as file \"{filename}\". Filenames cannot contain some characters, so the full title is kept in the title property.", context: "services.instantTaskConvert.notices.conversionCompleteFilenameSanitized" }),
+						{ title: parsedData.title, filename: file.basename }
+					)
+				);
 			} else {
-				new Notice(
-					this.translate("services.instantTaskConvert.notices.conversionComplete", {
+				publishUserNotice(this.plugin.emitter,
+					this.translate(msg({ message: "Task converted: {title}", context: "services.instantTaskConvert.notices.conversionComplete" }), {
 						title: parsedData.title,
 					})
 				);
@@ -302,11 +484,15 @@ export class InstantTaskConvertService {
 			// Trigger immediate refresh of task link overlays to show the inline widget
 			await this.refreshTaskLinkOverlays(editor, file);
 		} catch (error) {
-			console.error("Error during instant task conversion:", error);
+			tasknotesLogger.error("Error during instant task conversion:", {
+				category: "configuration",
+				operation: "instant-task-conversion",
+				error: error,
+			});
 			if (error.message.includes("file already exists")) {
-				new Notice(this.translate("services.instantTaskConvert.notices.fileExists"));
+				publishUserNotice(this.plugin.emitter, this.translate(msg({ message: "A file with this name already exists. Please try again or rename the task.", context: "services.instantTaskConvert.notices.fileExists" })));
 			} else {
-				new Notice(this.translate("services.instantTaskConvert.notices.conversionFailed"));
+				publishUserNotice(this.plugin.emitter, this.translate(msg({ message: "Failed to convert task. Please try again.", context: "services.instantTaskConvert.notices.conversionFailed" })));
 			}
 		}
 	}
@@ -323,14 +509,30 @@ export class InstantTaskConvertService {
 		startLine: number;
 		endLine: number;
 		originalContent: string[];
+		rangeStart?: EditorPosition;
+		rangeEnd?: EditorPosition;
 	} {
 		const selection = editor.getSelection();
 
 		// If there's a selection, check if the specified lineNumber is within it
 		if (selection && selection.trim()) {
 			const selectionRange = editor.listSelections()[0];
-			const startLine = Math.min(selectionRange.anchor.line, selectionRange.head.line);
-			const endLine = Math.max(selectionRange.anchor.line, selectionRange.head.line);
+			const { anchor, head } = selectionRange;
+			const isForward =
+				anchor.line < head.line || (anchor.line === head.line && anchor.ch <= head.ch);
+			const rangeStart = isForward ? anchor : head;
+			const selectionEnd = isForward ? head : anchor;
+			// Editor selections are half-open. Keep a selected trailing newline in the
+			// source, rather than consuming the next line or joining it to the link.
+			const rangeEnd =
+				selectionEnd.ch === 0 && selectionEnd.line > rangeStart.line
+					? {
+							line: selectionEnd.line - 1,
+							ch: editor.getLine(selectionEnd.line - 1).length,
+						}
+					: selectionEnd;
+			const startLine = rangeStart.line;
+			const endLine = rangeEnd.line;
 
 			// Only use selection if the specified lineNumber is within the selection range
 			// This handles cases where instant convert button is clicked with an active selection
@@ -341,9 +543,16 @@ export class InstantTaskConvertService {
 					selectedLines.push(editor.getLine(i));
 				}
 
-				// First line should be the task, rest become details
-				const taskLine = selectedLines[0];
-				const detailLines = selectedLines.slice(1);
+				// Snapshot whole lines for the existing race check, but only convert
+				// selected text; prefixes and suffixes outside the range stay untouched.
+				const selectedContent = selectedLines.map((line, index) =>
+					line.slice(
+						index === 0 ? rangeStart.ch : 0,
+						index === selectedLines.length - 1 ? rangeEnd.ch : undefined
+					)
+				);
+				const taskLine = selectedContent[0];
+				const detailLines = selectedContent.slice(1);
 				// Join without trimming to preserve indentation, but remove trailing whitespace only
 				const details = detailLines.join("\n").trimEnd();
 
@@ -353,6 +562,8 @@ export class InstantTaskConvertService {
 					startLine,
 					endLine,
 					originalContent: selectedLines,
+					rangeStart,
+					rangeEnd,
 				};
 			}
 		}
@@ -437,19 +648,29 @@ export class InstantTaskConvertService {
 	/**
 	 * Create a task file using default settings and parsed data
 	 */
-	private async createTaskFile(parsedData: ParsedTaskData, details = ""): Promise<TFile> {
+	private async createTaskFile(
+		parsedData: ParsedTaskData,
+		details = "",
+		sourceLineNumber?: number,
+		sourceLine?: string
+	): Promise<ConvertedTaskFile> {
 		// Sanitize and validate input data
 		// Check if title will be truncated and preserve overflow text (issue #1310)
 		const originalTitle = parsedData.title?.trim() || "";
-		const title = this.sanitizeTitle(originalTitle) || "Untitled Task";
+		const linkedNote = this.findLinkedTaskNote(originalTitle);
+		const titleLinkPreservation = this.extractTitleLinks(originalTitle);
+		const titleSource = titleLinkPreservation.cleanTitle || originalTitle;
+		const title = this.sanitizeTitle(titleSource) || uiData("Untitled Task", "Pre-port persisted instant-conversion fallback title; never localize stored titles");
 
 		// If title was truncated, preserve the overflow in details
-		let enhancedDetails = details;
-		if (originalTitle.length > 200) {
-			const overflowText = this.extractOverflowText(originalTitle, 200);
+		const parsedDetails = parsedData.details?.trim();
+		const sourceDetails = [parsedDetails, details].filter(Boolean).join("\n\n");
+		let enhancedDetails = this.appendPreservedTitleLinks(sourceDetails, titleLinkPreservation.links);
+		if (titleSource.length > 200) {
+			const overflowText = this.extractOverflowText(titleSource, 200);
 			if (overflowText) {
 				// Prepend overflow text to existing details
-				enhancedDetails = overflowText + (details ? "\n\n" + details : "");
+				enhancedDetails = overflowText + (enhancedDetails ? "\n\n" + enhancedDetails : "");
 			}
 		}
 
@@ -474,7 +695,10 @@ export class InstantTaskConvertService {
 		let scheduledDate: string | undefined;
 		let contextsArray: string[] = [];
 		// Only add task tag if using tag-based identification
-		let tagsArray = this.plugin.settings.taskIdentificationMethod === 'tag' ? [this.plugin.settings.taskTag] : [];
+		let tagsArray =
+			this.plugin.settings.taskIdentificationMethod === "tag"
+				? [this.plugin.settings.taskTag]
+				: [];
 		let timeEstimate: number | undefined;
 		let recurrence: string | undefined;
 
@@ -500,7 +724,10 @@ export class InstantTaskConvertService {
 					? combineDateAndTime(parsedDueDate, parsedDueTime)
 					: parsedDueDate;
 			} else if (defaults.defaultDueDate !== "none") {
-				dueDate = calculateDefaultDate(defaults.defaultDueDate);
+				dueDate = calculateDefaultDateTime(
+					defaults.defaultDueDate,
+					defaults.defaultDueTime
+				);
 			}
 
 			// Apply scheduled date: parsed date takes priority, then defaults
@@ -509,7 +736,10 @@ export class InstantTaskConvertService {
 					? combineDateAndTime(parsedScheduledDate, parsedScheduledTime)
 					: parsedScheduledDate;
 			} else if (defaults.defaultScheduledDate !== "none") {
-				scheduledDate = calculateDefaultDate(defaults.defaultScheduledDate);
+				scheduledDate = calculateDefaultDateTime(
+					defaults.defaultScheduledDate,
+					defaults.defaultScheduledTime
+				);
 			}
 
 			// Apply contexts: start with parsed contexts, then add default contexts
@@ -528,7 +758,10 @@ export class InstantTaskConvertService {
 			contextsArray = [...new Set(contextsArray)];
 
 			// Apply tags: start with task tag (if using tag mode), add parsed tags, then add default tags
-			tagsArray = this.plugin.settings.taskIdentificationMethod === 'tag' ? [this.plugin.settings.taskTag] : [];
+			tagsArray =
+				this.plugin.settings.taskIdentificationMethod === "tag"
+					? [this.plugin.settings.taskTag]
+					: [];
 			if (parsedTags.length > 0) {
 				tagsArray.push(...parsedTags);
 			}
@@ -584,7 +817,10 @@ export class InstantTaskConvertService {
 				contextsArray.push(...parsedContexts);
 			}
 			// Apply tags: start with task tag (if using tag mode), add parsed tags
-			tagsArray = this.plugin.settings.taskIdentificationMethod === 'tag' ? [this.plugin.settings.taskTag] : [];
+			tagsArray =
+				this.plugin.settings.taskIdentificationMethod === "tag"
+					? [this.plugin.settings.taskTag]
+					: [];
 			if (parsedTags.length > 0) {
 				tagsArray.push(...parsedTags);
 			}
@@ -618,6 +854,16 @@ export class InstantTaskConvertService {
 				// The parentNote is already a markdown link, so we can add it directly
 				projectsArray.push(parentNote);
 			}
+
+			if (defaults.useParentHeaderAsProject && currentFile) {
+				const parentHeaderProject = this.getParentHeaderProject(
+					currentFile,
+					sourceLineNumber
+				);
+				if (parentHeaderProject) {
+					projectsArray.push(parentHeaderProject);
+				}
+			}
 		}
 
 		// Add parsed projects
@@ -629,7 +875,7 @@ export class InstantTaskConvertService {
 		const uniqueProjects = [...new Set(projectsArray)];
 
 		// Apply default reminders if enabled
-		let reminders: any[] | undefined = undefined;
+		let reminders: Reminder[] | undefined = undefined;
 		if (this.plugin.settings.useDefaultsOnInstantConvert) {
 			const defaults = this.plugin.settings.taskCreationDefaults;
 			if (defaults.defaultReminders && defaults.defaultReminders.length > 0) {
@@ -643,7 +889,9 @@ export class InstantTaskConvertService {
 
 		// Prepare custom frontmatter from NLP-parsed user fields
 		// Default values for user fields are applied by TaskService.createTask()
-		const customFrontmatter: Record<string, any> = {};
+		const customFrontmatter: Record<string, unknown> = {
+			...(parsedData.customFrontmatter || {}),
+		};
 		if (parsedData.userFields) {
 			for (const [fieldId, value] of Object.entries(parsedData.userFields)) {
 				// Find the user field definition to get the frontmatter key
@@ -656,7 +904,13 @@ export class InstantTaskConvertService {
 						customFrontmatter[userField.key] = value;
 					}
 				} else {
-					console.warn(`[InstantTaskConvert] No user field definition found for field ID: ${fieldId}`);
+					tasknotesLogger.warn(
+						`[InstantTaskConvert] No user field definition found for field ID: ${fieldId}`,
+						{
+							category: "validation",
+							operation: "no-user-field-definition-found-field-id",
+						}
+					);
 				}
 			}
 		}
@@ -673,19 +927,213 @@ export class InstantTaskConvertService {
 			tags: tagsArray,
 			timeEstimate: timeEstimate,
 			recurrence: recurrence,
+			recurrence_anchor: parsedData.recurrenceAnchor,
 			reminders: reminders,
 			details: enhancedDetails, // Use enhanced details with any overflow from title truncation
 			parentNote: parentNote, // Include parent note for template variable
 			creationContext: "inline-conversion", // Mark as inline conversion for folder logic
 			dateCreated: getCurrentTimestamp(),
 			dateModified: getCurrentTimestamp(),
-			customFrontmatter: Object.keys(customFrontmatter).length > 0 ? customFrontmatter : undefined,
+			customFrontmatter:
+				Object.keys(customFrontmatter).length > 0 ? customFrontmatter : undefined,
 		};
+
+		if (linkedNote) {
+			const { cleanTitle } = this.extractTitleLinks(originalTitle.replace(linkedNote.link, " "));
+			const lineText = this.extractLineContentAsTitle(sourceLine ?? originalTitle)
+				.replace(linkedNote.link, " ")
+				.replace(/\s+/g, " ")
+				.trim();
+			// Values written on the line, without defaults, to tell when the note disagrees.
+			const lineFrontmatter: Record<string, unknown> = {
+				...this.plugin.fieldMapper.mapToFrontmatter({
+					due: parsedDueDate ? dueDate : undefined,
+					scheduled: parsedScheduledDate ? scheduledDate : undefined,
+					priority: parsedData.priority ? this.sanitizePriority(parsedData.priority) : undefined,
+					status: parsedData.status ? this.sanitizeStatus(parsedData.status) : undefined,
+					contexts: parsedContexts.length > 0 ? parsedContexts : undefined,
+					projects: parsedProjects.length > 0 ? parsedProjects : undefined,
+					recurrence: parsedData.recurrence,
+					timeEstimate: parsedData.timeEstimate,
+				}),
+				...customFrontmatter,
+			};
+			return this.addTaskDataToExistingNote(linkedNote.file, taskData, {
+				lineFrontmatter,
+				lineText,
+				lineTitleDiffers: cleanTitle.toLowerCase() !== linkedNote.file.basename.toLowerCase(),
+				details: sourceDetails,
+			});
+		}
 
 		// Use the centralized task creation service
 		const { file } = await this.plugin.taskService.createTask(taskData);
 
-		return file;
+		return { file };
+	}
+
+	/**
+	 * Resolve a `[[path|note]]` link in the task text to an existing note, using Obsidian's
+	 * normal link resolution from the source note.
+	 */
+	private findLinkedTaskNote(title: string): Nullable<{ file: TFile; link: string }> {
+		const match = title.match(LINKED_TASK_NOTE_PATTERN);
+		const linkpath = match?.[2].split("#")[0].trim();
+		if (!match || !linkpath) {
+			return null;
+		}
+
+		const sourcePath = this.plugin.app.workspace.getActiveFile()?.path ?? "";
+		const file = this.plugin.app.metadataCache.getFirstLinkpathDest(linkpath, sourcePath);
+		if (!file || file.extension !== "md" || file.path === sourcePath) {
+			return null;
+		}
+		return { file, link: match[1] };
+	}
+
+	/**
+	 * Make an existing note the task. Its frontmatter and body are kept: task fields are only
+	 * added where the note has no value. The task line is replaced by a link, so when the note
+	 * disagrees with it (or the line says more than the note's name) the line text is appended
+	 * to the body, along with any selected details.
+	 */
+	private async addTaskDataToExistingNote(
+		file: TFile,
+		taskData: TaskCreationData,
+		line: {
+			lineFrontmatter: Record<string, unknown>;
+			lineText: string;
+			lineTitleDiffers: boolean;
+			details: string;
+		}
+	): Promise<ConvertedTaskFile> {
+		const { app, settings, fieldMapper } = this.plugin;
+		const taskTag = settings.taskIdentificationMethod === "tag" ? settings.taskTag : undefined;
+		const mapped: Record<string, unknown> = {
+			...fieldMapper.mapToFrontmatter(
+				{ ...taskData, title: file.basename },
+				taskTag,
+				settings.storeTitleInFilename
+			),
+			...(taskData.customFrontmatter || {}),
+		};
+
+		return withVaultFileMutation(file, async () => {
+			const originalContent = await app.vault.read(file);
+			let lineConflicts = false;
+
+			await processVaultFrontMatterWithinMutation(app, file, (frontmatter) => {
+				for (const [key, value] of Object.entries(line.lineFrontmatter)) {
+					if (
+						value !== undefined &&
+						Object.prototype.hasOwnProperty.call(frontmatter, key) &&
+						!frontmatterValueIncludes(frontmatter[key], value)
+					) {
+						lineConflicts = true;
+					}
+				}
+				for (const [key, value] of Object.entries(mapped)) {
+					if (
+						key !== "tags" &&
+						value !== undefined &&
+						!Object.prototype.hasOwnProperty.call(frontmatter, key)
+					) {
+						frontmatter[key] = value;
+					}
+				}
+				addMissingFrontmatterTags(frontmatter, getFrontmatterTags(mapped.tags));
+				if (settings.taskIdentificationMethod === "property") {
+					applyPropertyTaskIdentifier(
+						frontmatter,
+						settings.taskPropertyName,
+						settings.taskPropertyValue
+					);
+				}
+			});
+
+			const keptText = [
+				(lineConflicts || line.lineTitleDiffers) && line.lineText ? line.lineText : "",
+				line.details.replace(/\r\n/g, "\n").trim(),
+			]
+				.filter(Boolean)
+				.join("\n\n");
+			let convertedContent = await app.vault.read(file);
+			// Undo only if nothing else has edited the note since the conversion.
+			const restoreUnchanged = (current: string) =>
+				current === convertedContent ? originalContent : current;
+			if (keptText) {
+				try {
+					convertedContent = await processVaultFileWithinMutation(
+						app,
+						file,
+						(content) => `${content.trimEnd()}\n\n${keptText}\n`
+					);
+				} catch (error) {
+					await processVaultFileWithinMutation(app, file, restoreUnchanged);
+					throw error;
+				}
+			}
+
+			return {
+				file,
+				revert: () =>
+					withVaultFileMutation(file, async () => {
+						await processVaultFileWithinMutation(app, file, restoreUnchanged);
+					}),
+			};
+		});
+	}
+
+	private getParentHeaderProject(currentFile: TFile, sourceLineNumber?: number): string | null {
+		if (sourceLineNumber === undefined) {
+			return null;
+		}
+
+		const headings = this.plugin.app.metadataCache.getFileCache(currentFile)?.headings;
+		const parentHeading = findClosestHeadingAboveLine(headings, sourceLineNumber);
+		if (!parentHeading) {
+			return null;
+		}
+
+		const project = extractProjectFromHeadingText(parentHeading.heading);
+		if (!project) {
+			return null;
+		}
+
+		return this.resolveProjectLinks([project])[0] ?? project;
+	}
+
+	private extractTitleLinks(title: string): { cleanTitle: string; links: string[] } {
+		if (!title) {
+			return { cleanTitle: "", links: [] };
+		}
+
+		const links: string[] = [];
+		let cleanTitle = title.replace(/\[([^\]]+)\]\((<[^>]+>|[^)]+)\)/g, (match, label) => {
+			links.push(match);
+			return String(label).trim();
+		});
+
+		cleanTitle = cleanTitle.replace(/\[\[([^[\]]+)\]\]/g, (match) => {
+			links.push(match);
+			return sanitizeLinkAliasText(match);
+		});
+
+		const uniqueLinks = [...new Set(links)];
+		return {
+			cleanTitle: cleanTitle.replace(/\s+/g, " ").trim(),
+			links: uniqueLinks,
+		};
+	}
+
+	private appendPreservedTitleLinks(details: string, links: string[]): string {
+		const linksToAppend = links.filter((link) => !details.includes(link));
+		if (linksToAppend.length === 0) {
+			return details;
+		}
+
+		const linkBlock = [uiData("Source links:", "Pre-port persisted task body heading; preserve English across locales"), ...linksToAppend.map((link) => `- ${link}`)].join("\n");
+		return details.trimEnd() ? `${details.trimEnd()}\n\n${linkBlock}` : linkBlock;
 	}
 
 	/**
@@ -724,9 +1172,19 @@ export class InstantTaskConvertService {
 	private sanitizePriority(priority: string): string {
 		const validPriorities = this.priorityManager
 			.getAllPriorities()
-			.map((p: any) => (p && typeof p === "object" ? p.value : p))
+			.map((p) => p.value)
 			.filter((value) => value != null);
-		return validPriorities.includes(priority) ? priority : "";
+		if (validPriorities.includes(priority)) {
+			return priority;
+		}
+
+		const taskPluginPriorityFallbacks: Record<string, string> = {
+			highest: "high",
+			medium: "normal",
+			lowest: "low",
+		};
+		const fallback = taskPluginPriorityFallbacks[priority];
+		return fallback && validPriorities.includes(fallback) ? fallback : "";
 	}
 
 	/**
@@ -735,7 +1193,7 @@ export class InstantTaskConvertService {
 	private sanitizeStatus(status: string): string {
 		const validStatuses = this.statusManager
 			.getAllStatuses()
-			.map((s: any) => (s && typeof s === "object" ? s.value : s))
+			.map((s) => s.value)
 			.filter((value) => value != null);
 		return validStatuses.includes(status) ? status : "";
 	}
@@ -761,6 +1219,8 @@ export class InstantTaskConvertService {
 			startLine: number;
 			endLine: number;
 			originalContent: string[];
+			rangeStart?: EditorPosition;
+			rangeEnd?: EditorPosition;
 		},
 		file: TFile,
 		title: string
@@ -794,7 +1254,7 @@ export class InstantTaskConvertService {
 			}
 
 			// Re-validate that the first line still has content (additional safety)
-			const taskLineInfo = TasksPluginParser.parseTaskLine(originalContent[0]);
+			const taskLineInfo = TasksPluginParser.parseTaskLine(selectionInfo.taskLine);
 			const isCheckboxTask = taskLineInfo.isTaskLine;
 
 			// For checkbox tasks, ensure it's still a valid task
@@ -803,34 +1263,9 @@ export class InstantTaskConvertService {
 				return { success: false, error: "First line is no longer a valid task." };
 			} else if (
 				!isCheckboxTask &&
-				!this.extractLineContentAsTitle(originalContent[0]).trim()
+				!this.extractLineContentAsTitle(selectionInfo.taskLine).trim()
 			) {
 				return { success: false, error: "First line no longer contains valid content." };
-			}
-
-			// Create link text preserving original format and indentation from the first line
-			const originalIndentation = originalContent[0].match(/^(\s*)/)?.[1] || "";
-
-			let listPrefix = "";
-			if (isCheckboxTask) {
-				// For checkbox tasks, preserve the list prefix without the checkbox
-				const listPrefixMatch = originalContent[0].match(/^\s*((?:[-*+]|\d+\.)\s+)\[/);
-				listPrefix = listPrefixMatch?.[1] || "- ";
-			} else {
-				// For non-checkbox lines, try to preserve existing list markers
-				const bulletMatch = originalContent[0].match(/^\s*([-*+]\s+)/);
-				const numberedMatch = originalContent[0].match(/^\s*(\d+\.\s+)/);
-				const blockquoteMatch = originalContent[0].match(/^\s*(>\s*)/);
-
-				if (bulletMatch) {
-					listPrefix = bulletMatch[1];
-				} else if (numberedMatch) {
-					listPrefix = numberedMatch[1];
-				} else if (blockquoteMatch) {
-					listPrefix = blockquoteMatch[1];
-				} else {
-					listPrefix = "- "; // Default to bullet point
-				}
 			}
 
 			// Get the current file context for relative link generation
@@ -838,10 +1273,15 @@ export class InstantTaskConvertService {
 			const sourcePath = currentFile?.path || "";
 
 			// Use Obsidian's generateMarkdownLink (respects user's link format settings)
-			const properLink = this.plugin.app.fileManager.generateMarkdownLink(file, sourcePath);
+			const properLink = sanitizeGeneratedLinkAlias(
+				this.plugin.app.fileManager.generateMarkdownLink(file, sourcePath)
+			);
 
 			// Create the final line with proper indentation and original list format
-			const linkText = `${originalIndentation}${listPrefix}${properLink}`;
+			const replacementPrefix = (selectionInfo.rangeStart?.ch ?? 0) > 0
+				? ""
+				: this.getReplacementPrefix(selectionInfo.taskLine, isCheckboxTask);
+			const linkText = `${replacementPrefix}${properLink}`;
 
 			// Validate the generated link text
 			if (linkText.length > 500) {
@@ -850,16 +1290,55 @@ export class InstantTaskConvertService {
 			}
 
 			// Replace the entire selection with the link
-			const rangeStart: EditorPosition = { line: startLine, ch: 0 };
-			const rangeEnd: EditorPosition = { line: endLine, ch: editor.getLine(endLine).length };
+			const rangeStart = selectionInfo.rangeStart ?? { line: startLine, ch: 0 };
+			const rangeEnd = selectionInfo.rangeEnd ?? {
+				line: endLine,
+				ch: editor.getLine(endLine).length,
+			};
 
 			editor.replaceRange(linkText, rangeStart, rangeEnd);
 
 			return { success: true };
 		} catch (error) {
-			console.error("Error replacing task lines:", error);
+			tasknotesLogger.error("Error replacing task lines:", {
+				category: "validation",
+				operation: "replacing-task-lines",
+				error: error,
+			});
 			return { success: false, error: `Failed to replace lines: ${error.message}` };
 		}
+	}
+
+	private getCheckboxReplacementPrefix(originalLine: string): string {
+		if (this.plugin.settings.preserveCheckboxOnConvert) {
+			const checkboxPrefixMatch = originalLine.match(/^(\s*(?:[-*+]|\d+\.)\s+\[[^\]]\]\s*)/);
+			return checkboxPrefixMatch?.[1] || "- [ ] ";
+		}
+
+		const listPrefixMatch = originalLine.match(/^(\s*(?:[-*+]|\d+\.)\s+)\[/);
+		return listPrefixMatch?.[1] || "- ";
+	}
+
+	private getNonCheckboxReplacementPrefix(originalLine: string): string {
+		const bulletMatch = originalLine.match(/^(\s*[-*+]\s+)/);
+		const numberedMatch = originalLine.match(/^(\s*\d+\.\s+)/);
+
+		if (bulletMatch) {
+			return bulletMatch[1];
+		}
+		if (numberedMatch) {
+			return numberedMatch[1];
+		}
+		return "- ";
+	}
+
+	private getReplacementPrefix(originalLine: string, isCheckboxTask: boolean): string {
+		const { leadingWhitespace, blockquotePrefix, content } =
+			splitBlockquotePrefix(originalLine);
+		const contentPrefix = isCheckboxTask
+			? this.getCheckboxReplacementPrefix(content)
+			: this.getNonCheckboxReplacementPrefix(content);
+		return `${leadingWhitespace}${blockquotePrefix}${contentPrefix}`;
 	}
 
 	/**
@@ -872,10 +1351,10 @@ export class InstantTaskConvertService {
 			await this.forceMetadataCacheUpdate(taskFile);
 
 			// Small delay to allow the editor to process the line replacement and cache update
-			setTimeout(() => {
+			window.setTimeout(() => {
 				try {
 					// Access the CodeMirror instance from the editor
-					const cmEditor = (editor as any).cm;
+					const cmEditor = (editor as unknown as { cm?: EditorView }).cm;
 					if (cmEditor) {
 						// Preserve cursor position before dispatching update
 						const cursorPos = editor.getCursor();
@@ -884,21 +1363,64 @@ export class InstantTaskConvertService {
 						dispatchTaskUpdate(cmEditor, taskFile.path);
 
 						// Restore cursor position after a brief delay
-						setTimeout(() => {
+						window.setTimeout(() => {
 							try {
 								editor.setCursor(cursorPos);
 							} catch (error) {
-								console.debug("Error restoring cursor position:", error);
+								tasknotesLogger.debug("Error restoring cursor position:", {
+									category: "validation",
+									operation: "restoring-cursor-position",
+									error: error,
+								});
 							}
 						}, 10);
 					}
 				} catch (error) {
-					console.debug("Error dispatching task update for overlays:", error);
+					tasknotesLogger.debug("Error dispatching task update for overlays:", {
+						category: "validation",
+						operation: "dispatching-task-update-overlays",
+						error: error,
+					});
 				}
 			}, 100);
 		} catch (error) {
-			console.debug("Error refreshing task link overlays:", error);
+			tasknotesLogger.debug("Error refreshing task link overlays:", {
+				category: "stale-data",
+				operation: "refreshing-task-link-overlays",
+				error: error,
+			});
 		}
+	}
+
+	private async persistSourceNoteAfterReplacement(editor: Editor): Promise<Nullable<TFile>> {
+		type WorkspaceWithActiveEditor = {
+			activeEditor?: Nullable<{ editor?: Editor; file?: Nullable<TFile> }>;
+			getActiveFile?: () => Nullable<TFile>;
+		};
+
+		const workspace = this.plugin.app.workspace as WorkspaceWithActiveEditor;
+		const activeEditor = workspace.activeEditor;
+		const sourceFile =
+			activeEditor?.editor === editor
+				? activeEditor.file
+				: (workspace.getActiveFile?.() ?? null);
+
+		if (!sourceFile) {
+			return null;
+		}
+
+		try {
+			await modifyVaultFile(this.plugin.app, sourceFile, editor.getValue());
+			this.plugin.notifyDataChanged(sourceFile.path, false, false);
+		} catch (error) {
+			tasknotesLogger.debug("Error saving source note after instant task conversion:", {
+				category: "configuration",
+				operation: "saving-source-note-instant-task-conversion",
+				error: error,
+			});
+		}
+
+		return sourceFile;
 	}
 
 	/**
@@ -914,16 +1436,26 @@ export class InstantTaskConvertService {
 			if (this.plugin.app.metadataCache.getFileCache(file) === null) {
 				// If cache is still null, trigger a manual update
 				// by reading the file again with a small delay
-				setTimeout(async () => {
-					try {
-						await this.plugin.app.vault.cachedRead(file);
-					} catch (error) {
-						console.debug("Error in delayed cache update:", error);
-					}
+				window.setTimeout(() => {
+					void (async () => {
+						try {
+							await this.plugin.app.vault.cachedRead(file);
+						} catch (error) {
+							tasknotesLogger.debug("Error in delayed cache update:", {
+								category: "stale-data",
+								operation: "delayed-cache-update",
+								error: error,
+							});
+						}
+					})();
 				}, 10);
 			}
 		} catch (error) {
-			console.debug("Error forcing metadata cache update:", error);
+			tasknotesLogger.debug("Error forcing metadata cache update:", {
+				category: "stale-data",
+				operation: "forcing-metadata-cache-update",
+				error: error,
+			});
 		}
 	}
 
@@ -957,6 +1489,11 @@ export class InstantTaskConvertService {
 			return Object.keys(merged).length > 0 ? merged : undefined;
 		};
 
+		const customFrontmatter = {
+			...(nlpData.customFrontmatter || {}),
+			...(tasksPluginData.customFrontmatter || {}),
+		};
+
 		return {
 			// Use NLP title (cleaner, with NL phrases removed) unless it's empty
 			title: nlpData.title?.trim() || tasksPluginData.title,
@@ -972,6 +1509,7 @@ export class InstantTaskConvertService {
 			priority: tasksPluginData.priority || nlpData.priority,
 			status: tasksPluginData.status || nlpData.status,
 			recurrence: tasksPluginData.recurrence || nlpData.recurrence,
+			recurrenceAnchor: tasksPluginData.recurrenceAnchor,
 			recurrenceData: tasksPluginData.recurrenceData, // NLP doesn't have this structure
 			timeEstimate: tasksPluginData.timeEstimate || nlpData.timeEstimate,
 
@@ -985,6 +1523,13 @@ export class InstantTaskConvertService {
 
 			// Merge user fields
 			userFields: mergeUserFields(tasksPluginData.userFields, nlpData.userFields),
+			customFrontmatter:
+				Object.keys(customFrontmatter).length > 0 ? customFrontmatter : undefined,
+			details: tasksPluginData.details || nlpData.details,
+			blockLink: tasksPluginData.blockLink,
+			taskPluginId: tasksPluginData.taskPluginId,
+			dependsOn: tasksPluginData.dependsOn,
+			onCompletion: tasksPluginData.onCompletion,
 
 			// Preserve completion status from TasksPlugin (it parses [x] checkboxes)
 			isCompleted: tasksPluginData.isCompleted,
@@ -1040,11 +1585,22 @@ export class InstantTaskConvertService {
 				createdDate: undefined,
 				doneDate: undefined,
 				recurrenceData: undefined,
+				recurrenceAnchor: undefined,
+				customFrontmatter: undefined,
+				details: undefined,
+				blockLink: undefined,
+				taskPluginId: undefined,
+				dependsOn: undefined,
+				onCompletion: undefined,
 			};
 
 			return parsedData;
 		} catch (error) {
-			console.debug("NLP fallback parsing failed:", error);
+			tasknotesLogger.debug("NLP fallback parsing failed:", {
+				category: "validation",
+				operation: "nlp-fallback-parsing",
+				error: error,
+			});
 			return null;
 		}
 	}
@@ -1092,7 +1648,11 @@ export class InstantTaskConvertService {
 						}
 					} catch (error) {
 						// If file resolution fails, return the original project
-						console.debug("Error resolving project link:", error);
+						tasknotesLogger.debug("Error resolving project link:", {
+							category: "validation",
+							operation: "resolving-project-link",
+							error: error,
+						});
 					}
 
 					// If file not found, return the original project
@@ -1103,7 +1663,11 @@ export class InstantTaskConvertService {
 				return project;
 			});
 		} catch (error) {
-			console.debug("Error in resolveProjectLinks:", error);
+			tasknotesLogger.debug("Error in resolveProjectLinks:", {
+				category: "validation",
+				operation: "resolveprojectlinks",
+				error: error,
+			});
 			// Fallback: return projects as-is if resolution fails
 			return projects;
 		}
@@ -1125,15 +1689,16 @@ export class InstantTaskConvertService {
 	private extractLineContentAsTitle(line: string): string {
 		let cleanLine = line.trim();
 
-		// Remove common list markers and bullet points
-		cleanLine = cleanLine.replace(/^\s*[-*+]\s+/, ""); // Remove bullet points
-		cleanLine = cleanLine.replace(/^\s*\d+\.\s+/, ""); // Remove numbered lists
-
 		// Remove blockquote markers (for issue #262 - callouts support)
 		// Handle multiple levels of blockquotes like "> > > text"
 		while (cleanLine.match(/^\s*>\s*/)) {
 			cleanLine = cleanLine.replace(/^\s*>\s*/, "");
 		}
+
+		// Remove common list markers and bullet points
+		cleanLine = cleanLine.replace(/^\s*[-*+]\s+/, ""); // Remove bullet points
+		cleanLine = cleanLine.replace(/^\s*\d+\.\s+/, ""); // Remove numbered lists
+		cleanLine = cleanLine.replace(/^\s*\[[ xX]\]\s+/, ""); // Remove checkbox after callout/list stripping
 
 		// Remove markdown headers
 		cleanLine = cleanLine.replace(/^\s*#+\s+/, "");
@@ -1242,7 +1807,11 @@ export class InstantTaskConvertService {
 				return taskLineInfo.parsedData;
 			}
 		} catch (error) {
-			console.warn("Error parsing task for batch:", error);
+			tasknotesLogger.warn("Error parsing task for batch:", {
+				category: "validation",
+				operation: "parsing-task-batch",
+				error: error,
+			});
 			return null;
 		}
 	}
@@ -1251,38 +1820,17 @@ export class InstantTaskConvertService {
 	 * Generate link text for a task line replacement
 	 */
 	private generateLinkText(originalLine: string, file: TFile): string {
-		const originalIndentation = originalLine.match(/^(\s*)/)?.[1] || "";
-
 		// Determine if this was a checkbox task
 		const taskLineInfo = TasksPluginParser.parseTaskLine(originalLine);
 		const isCheckboxTask = taskLineInfo.isTaskLine;
 
-		let listPrefix = "";
-		if (isCheckboxTask) {
-			const listPrefixMatch = originalLine.match(/^\s*((?:[-*+]|\d+\.)\s+)\[/);
-			listPrefix = listPrefixMatch?.[1] || "- ";
-		} else {
-			// For non-checkbox lines, preserve existing markers
-			const bulletMatch = originalLine.match(/^\s*([-*+]\s+)/);
-			const numberedMatch = originalLine.match(/^\s*(\d+\.\s+)/);
-			const blockquoteMatch = originalLine.match(/^\s*(>\s*)/);
-
-			if (bulletMatch) {
-				listPrefix = bulletMatch[1];
-			} else if (numberedMatch) {
-				listPrefix = numberedMatch[1];
-			} else if (blockquoteMatch) {
-				listPrefix = blockquoteMatch[1];
-			} else {
-				listPrefix = "- ";
-			}
-		}
-
 		const currentFile = this.plugin.app.workspace.getActiveFile();
 		const sourcePath = currentFile?.path || "";
-		const properLink = this.plugin.app.fileManager.generateMarkdownLink(file, sourcePath);
+		const properLink = sanitizeGeneratedLinkAlias(
+			this.plugin.app.fileManager.generateMarkdownLink(file, sourcePath)
+		);
 
-		return `${originalIndentation}${listPrefix}${properLink}`;
+		return `${this.getReplacementPrefix(originalLine, isCheckboxTask)}${properLink}`;
 	}
 
 	/**

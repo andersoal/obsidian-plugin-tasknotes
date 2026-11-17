@@ -20,13 +20,20 @@ Choosing a stable `groupBy` field is the most important design decision. Frequen
 
 ### Kanban-Specific Options
 
-Access these options through the Bases view settings panel:
+Access these options through the Bases view settings panel. In YAML, put them directly on the view, alongside `type`, `groupBy`, and `sort`. Existing settings nested under `config:` or `options:` remain supported; direct settings take precedence, followed by `config:` and then `options:`. TaskNotes does not rewrite existing files.
 
 - **Swim Lane**: Optional property for horizontal grouping. Creates a two-dimensional layout where tasks are organized by both column (groupBy) and row (swimLane)
 - **Column Width**: Controls the width of columns in pixels. Range: 200-500px. Default: 280px
-- **Hide Empty Columns**: When enabled, columns containing no tasks are hidden from the view
+- **Max Swimlane Height**: Caps each swimlane row before the task area scrolls. Range: 300-1200px. Default: 600px
+- **Hide Empty Columns**: When enabled, unpinned columns containing no tasks matching the view's filters are hidden
+- **Pinned Columns**: Optional comma-separated list of column values that should stay visible even when empty. This is useful with **Hide Empty Columns** when each board needs a small stable subset of shared statuses or categories. Pinning is not a whitelist: other columns with matching tasks remain visible
+- **WIP Limits**: Advanced JSON configuration for showing per-column work-in-progress limits in column headers
+- **Hide Empty Swimlanes**: When enabled, swimlanes with no visible top-level cards are hidden. When disabled, all configured priority values appear as swimlanes, even if they have no cards or only contain hidden subtasks
+- **Card Layout**: Chooses the task card density for this board. **Default** uses the standard TaskNotes card layout. **Compact** uses a tighter card layout for denser boards
 - **Show items in multiple columns**: When enabled (default), tasks with multiple values in list properties (contexts, tags, projects) appear in each individual column. For example, a task with `contexts: [work, call]` appears in both the "work" and "call" columns. When disabled, tasks appear in a single combined column (e.g., "work, call")
+- **Hide top-level subtasks**: When enabled, tasks whose Projects field links to another task in the current filtered board are hidden as standalone cards and remain available through the parent task's expanded subtasks
 - **Column Order**: Managed automatically when dragging column headers. Stores custom column ordering
+- **Swim Lane Order**: Managed automatically when dragging swimlane labels. Can also be edited as JSON to pin swimlane rows in a stable order
 A common setup is to keep one board grouped by status and another grouped by project or context, each in a separate `.base` file.
 
 ## Interface Layout
@@ -35,9 +42,12 @@ A common setup is to keep one board grouped by status and another grouped by pro
 
 In standard mode, the Kanban board displays a horizontal row of columns. Each column corresponds to a unique value of the `groupBy` property.
 
+When columns are grouped by Status (including a mapped status property), their backgrounds and borders use a subtle tint from the configured status colour. Swimlane column headers and cells use the same colour. Other grouping properties, unknown statuses and missing or unresolved colours keep the normal theme surface. Updating a status colour refreshes open boards.
+
 Each column includes:
 - A header showing the property value and task count
 - A scrollable area containing task cards
+- An add button that opens the TaskNotes creation modal with the column value filled in
 - Drag-and-drop functionality for reordering columns or moving tasks between columns
 
 ### Swimlane Layout
@@ -48,10 +58,30 @@ Each swimlane row includes:
 - A label cell showing the swimlane property value and total task count
 - Multiple cells, each representing a column within that swimlane
 - Scrollable cells containing task cards
+- Add buttons inside cells that fill in both the column value and swimlane value
+
+To pin swimlanes in a stable order, set the advanced `swimLaneOrder` option to a JSON object keyed by the swimlane property:
+
+```yaml
+swimLane: note.contexts
+swimLaneOrder: '{"note.contexts":["transitcal","bill","cycles-research","astrolabe"]}'
+```
+
+Listed swimlane values render first in the configured order. Values not listed in `swimLaneOrder` render below them using the default order for status and priority swimlanes, or alphabetically for other properties. If `hideEmptySwimLanes` is disabled, listed values can remain visible even when no matching tasks are currently present. Priority swimlanes also include every configured priority, including priorities with no visible top-level cards.
+
+To show WIP limits in column headers, set the advanced `wipLimits` option to a JSON object keyed by column value:
+
+```yaml
+wipLimits: '{"in-progress":5,"review":2}'
+```
+
+Columns with limits display counts as `(current/limit)`. When the current count is above the configured limit, the count uses the error color. In swimlane boards, the column header count is the total for that column across all swimlanes.
 
 ## Task Cards
 
 Each task card displays information based on the visible properties configured in the Bases view. Standard task information includes title, priority, due date, and scheduled date.
+
+Use the **Card Layout** setting when a board needs a different density from other task views. Existing boards use **Default** unless `cardLayout: compact` is set in the view options.
 
 To show checklist progress on cards, include `file.tasks` in the view `order` array.
 For existing `.base` files, add this in YAML manually first; after it is in `order`, it appears in the Bases picker as `tasks`.
@@ -60,16 +90,30 @@ Click a card to open the task file for editing. Right-click to access the contex
 
 ## Column Operations
 
+### Collapsing Columns
+
+In a standard (non-swimlane) board, use the chevron button in a column header to collapse that column to a narrow strip. The strip keeps the column's status icon (when **Show status icon in column header only** is on) and shows its title vertically, reading from top to bottom; long titles are cut off with an ellipsis. Click it again, or focus the button and press Enter or Space, to expand it. You can still reorder collapsed columns or drop tasks onto them.
+
+Collapsed columns are saved per view and grouping property in the `collapsedColumns` configuration of the `.base` file, so they stay collapsed after Obsidian restarts. Swimlane columns are unchanged.
+
 ### Reordering Columns
 
 Drag column headers to reorder columns. The new order persists across sessions and is stored in the `columnOrder` configuration.
 
+In swimlane mode, drag a swimlane label to reorder rows. The new order persists across sessions and is stored in the `swimLaneOrder` configuration. Rows hidden by search or by **Hide Empty Swimlanes** keep their positions. As with a hand-written `swimLaneOrder`, saved rows stay visible as empty rows when **Hide Empty Swimlanes** is off. Row dragging needs a mouse; on touch devices, edit `swimLaneOrder` instead.
+
 ### Drag-and-Drop Tasks
+
+Use a mouse to drag immediately, including on touchscreen laptops. With touch, hold a card or column header for 350 ms before dragging. Moving before the hold completes keeps normal scrolling; no input-mode setting is needed when switching between mouse and touch.
 
 Drag task cards between columns to update the `groupBy` property value. In swimlane mode, dragging a task to a different cell updates both the `groupBy` and `swimLane` properties.
 
+Dropping a recurring task on a status marked **Completed** completes the occurrence shown on its card, as its checkbox does, instead of setting the task to that status. The task moves on to its next date, and the notification offers **Undo**. Nothing else in the drop is applied, including a change of swimlane. If that occurrence has since been completed, skipped or rescheduled, for example on another device, the drop changes nothing and a notice says so. To change the task's own status, use the context menu or edit modal.
+
 When grouping by a list property (contexts, tags, projects) with "Show items in multiple columns" enabled, dragging a task between columns modifies the list rather than replacing it. The source column's value is removed and the target column's value is added. For example, dragging a task from the "work" column to the "home" column changes `contexts: [work, call]` to `contexts: [call, home]`.
 Drag operations write directly to task metadata, so consistent grouping values reduce ambiguity.
+
+The add button at the bottom of a column or swimlane cell keeps deterministic view filter defaults and fills in the grouped values for that location.
 
 ### Manual Reordering Within Columns
 
@@ -107,27 +151,27 @@ Virtual scrolling activates automatically based on task count. No configuration 
 A typical Kanban view `.base` file includes:
 
 ```yaml
----
-type: query
-source: TaskNotes
-view: TaskNotes Kanban
 views:
   - name: TaskNotes Kanban
     type: tasknotesKanban
     groupBy:
-      property: task.status
-    config:
-      swimLane: task.priority
-      columnWidth: 300
-      hideEmptyColumns: true
----
+      property: status
+      direction: ASC
+    swimLane: priority
+    swimLaneOrder: '{"priority":["high","normal","low"]}'
+    columnWidth: 300
+    hideEmptyColumns: true
+    pinnedColumns: to-do, in-progress, done
+    wipLimits: '{"in-progress":5}'
 ```
 
 This configuration creates a Kanban board with:
 - Columns based on task status
 - Swimlanes based on task priority
+- Priority swimlanes pinned in high, normal, low order
 - 300px column width
-- Empty columns hidden
+- Empty unpinned columns hidden, while the to-do, in-progress, and done columns stay visible as drop targets
+- A WIP limit of 5 tasks on the in-progress column
 
 ## Filtering and Sorting
 

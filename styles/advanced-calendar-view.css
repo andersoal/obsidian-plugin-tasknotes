@@ -4,28 +4,70 @@
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    max-width: 100%;
+    container-type: inline-size;
+}
+
+.advanced-calendar-view.advanced-calendar-view--auto-height {
+    height: auto;
+    min-height: 0;
+    overflow: visible;
+}
+
+.advanced-calendar-view.advanced-calendar-view--auto-height .advanced-calendar-view__calendar--auto-height {
+    flex: 0 0 auto;
+    min-height: 0;
+}
+
+.advanced-calendar-view__calendar--popout-blocked {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 240px;
+    padding: 24px;
+}
+
+.advanced-calendar-view__popout-blocked {
+    max-width: 420px;
+    color: var(--text-muted);
+    text-align: center;
+}
+
+.advanced-calendar-view__popout-blocked h3 {
+    margin: 0 0 8px;
+    color: var(--text-normal);
+    font-size: 1rem;
+    font-weight: 600;
+}
+
+.advanced-calendar-view__popout-blocked p {
+    margin: 0;
+    line-height: 1.5;
 }
 
 /* ICS Event Styles */
-.fc-event[data-ics-event="true"] {
-    opacity: 0.9;
-    border-radius: 4px;
+
+.ics-related-note-indicator,
+.tasknotes-plugin .ics-card__related-note-indicator {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    width: 12px;
+    height: 12px;
+    color: currentColor;
+    opacity: 0.78;
+    vertical-align: text-bottom;
 }
 
-/* Only apply calendar emoji to ICS events in non-list views */
-.fc-daygrid-event[data-ics-event="true"]:before,
-.fc-timegrid-event[data-ics-event="true"]:before {
-    content: "📅";
-    position: absolute;
-    top: 2px;
-    right: 2px;
-    font-size: 10px;
-    opacity: 0.7;
+.ics-related-note-indicator svg,
+.tasknotes-plugin .ics-card__related-note-indicator svg {
+    width: 12px;
+    height: 12px;
 }
 
-.fc-event[data-ics-event="true"]:hover {
-    opacity: 1;
-    box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+.tasknotes-plugin .ics-card__related-note-indicator {
+    color: var(--tn-text-muted);
 }
 
 /* ICS Event Info Modal */
@@ -46,7 +88,7 @@
 }
 
 .ics-context-menu-item:hover {
-    background-color: var(--background-modifier-hover) !important;
+    background-color: var(--background-modifier-hover);
 }
 
 /* Timeblock Help Text */
@@ -57,99 +99,37 @@
     padding: 0.5rem;
     background: var(--background-secondary);
     border-radius: 4px;
-    border-left: 3px solid var(--color-accent);
+    border: 1px solid var(--background-modifier-border);
+    border-inline-start-color: var(--color-accent);
 }
-
-/* Event Type Specific Styles */
 
 /* Timeblock Events */
-.fc-timeblock-event,
-.fc-event[data-event-type="timeblock"] {
+.fc-timeblock-event {
     opacity: 0.65;
     border-radius: 4px;
-    border-width: 1px !important;
-    border-style: solid !important;
-    transition: opacity 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
+    border-width: 1px;
+    border-style: solid;
+    transition: opacity 0.2s ease, box-shadow 0.2s ease;
 }
 
-.fc-timeblock-event:hover,
-.fc-event[data-event-type="timeblock"]:hover {
+.fc-timeblock-event:hover {
     opacity: 0.90;
     box-shadow: 0 1px 4px rgba(0, 0, 0, 0.1);
-    transform: translateY(-0.5px);
-}
-
-/* Time Entry Events - Recorded time with distinctive dashed border */
-.fc-event[data-event-type="timeEntry"] {
-    opacity: 0.9;
-    border-radius: 4px;
-    border-width: 2px !important;
-    border-style: dashed !important; /* Dashed border to differentiate from solid timeblocks */
-    background: repeating-linear-gradient(
-        45deg,
-        rgba(16, 185, 129, 0.08),
-        rgba(16, 185, 129, 0.08) 10px,
-        rgba(16, 185, 129, 0.15) 10px,
-        rgba(16, 185, 129, 0.15) 20px
-    ) !important; /* Subtle diagonal stripes in green */
-    border-color: #10b981 !important; /* Green to indicate "completed/recorded" time */
-}
-
-.fc-event[data-event-type="timeEntry"] .fc-event-time,
-.fc-event[data-event-type="timeEntry"] .fc-event-title {
-    color: #059669 !important; /* Darker green for better readability */
-    font-weight: 500;
-}
-
-.fc-event[data-event-type="timeEntry"]:hover {
-    opacity: 1;
-    box-shadow: 0 2px 6px rgba(16, 185, 129, 0.3);
-    border-style: solid !important; /* Solid border on hover for clarity */
-}
-
-/* Dark mode adjustments for time entries */
-.theme-dark .fc-event[data-event-type="timeEntry"] {
-    background: repeating-linear-gradient(
-        45deg,
-        rgba(52, 211, 153, 0.1),
-        rgba(52, 211, 153, 0.1) 10px,
-        rgba(52, 211, 153, 0.18) 10px,
-        rgba(52, 211, 153, 0.18) 20px
-    ) !important;
-    border-color: #34d399 !important; /* Lighter green for dark mode */
-}
-
-.theme-dark .fc-event[data-event-type="timeEntry"] .fc-event-time,
-.theme-dark .fc-event[data-event-type="timeEntry"] .fc-event-title {
-    color: #6ee7b7 !important; /* Even lighter green for text in dark mode */
 }
 
 /* Task Events */
 .fc-task-event {
     border-radius: 4px;
-    border-width: 1px !important;
+    border-width: 1px;
 }
 
 .fc-task-event:hover {
     box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1);
 }
 
-/* ICS Events - only in non-list views */
-.fc-daygrid-event.fc-ics-event,
-.fc-timegrid-event.fc-ics-event {
-    border-radius: 4px;
-    border-width: 2px !important;
-    border-style: solid !important;
-}
-
-.fc-daygrid-event.fc-ics-event:hover,
-.fc-timegrid-event.fc-ics-event:hover {
-    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1);
-}
-
 /* Recurring Events */
 .fc-recurring-event {
-    border-style: dashed !important;
+    border-style: dashed;
 }
 
 /* Completed Events */
@@ -168,12 +148,6 @@
     background: var(--background-secondary);
     border-radius: 6px;
     text-align: center;
-}
-
-.timeblock-time-container {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 1rem;
 }
 
 .timeblock-modal-buttons {
@@ -221,7 +195,7 @@
     align-items: center;
     justify-content: space-between;
     padding: 0.5rem;
-    margin-bottom: 0.5rem;
+    margin-bottom: 0.25rem;
     background: var(--background-secondary);
     border-radius: 4px;
     border: 1px solid var(--background-modifier-border);
@@ -254,7 +228,7 @@
     border: none;
     color: var(--text-muted);
     font-size: 1.2em;
-    cursor: var(--cursor, pointer);
+    cursor: var(--cursor-link, pointer);
     padding: 0.2rem 0.5rem;
     border-radius: 3px;
     margin-left: 0.5rem;
@@ -264,6 +238,65 @@
 .timeblock-attachment-remove:hover {
     background: var(--background-modifier-error);
     color: var(--text-on-accent);
+}
+
+body.is-mobile .timeblock-creation-modal input.tasknotes-theme-color-text-input,
+body.is-mobile .timeblock-info-modal input.tasknotes-theme-color-text-input {
+    width: auto;
+}
+
+body.is-mobile .timeblock-creation-modal input.tasknotes-theme-color-picker,
+body.is-mobile .timeblock-info-modal input.tasknotes-theme-color-picker {
+    width: 2.25rem;
+    min-width: 2.25rem;
+    max-width: 2.25rem;
+}
+
+body.is-mobile .timeblock-creation-modal .setting-item,
+body.is-mobile .timeblock-info-modal .setting-item,
+body.is-mobile .tasknotes-plugin.calendar-event-creation-modal .setting-item {
+    align-items: stretch;
+    flex-direction: column;
+    gap: var(--size-4-2);
+}
+
+body.is-mobile .timeblock-creation-modal .setting-item-control,
+body.is-mobile .timeblock-info-modal .setting-item-control,
+body.is-mobile .tasknotes-plugin.calendar-event-creation-modal .setting-item-control {
+    justify-content: flex-start;
+    width: 100%;
+}
+
+body.is-mobile .timeblock-creation-modal input,
+body.is-mobile .timeblock-creation-modal textarea,
+body.is-mobile .timeblock-info-modal input,
+body.is-mobile .timeblock-info-modal textarea,
+body.is-mobile .tasknotes-plugin.calendar-event-creation-modal input,
+body.is-mobile .tasknotes-plugin.calendar-event-creation-modal textarea,
+body.is-mobile .tasknotes-plugin.calendar-event-creation-modal select {
+    width: 100%;
+}
+
+body.is-mobile .timeblock-modal-buttons,
+body.is-mobile .tasknotes-plugin.calendar-event-creation-modal .calendar-event-modal-buttons {
+    flex-direction: column;
+}
+
+body.is-mobile .timeblock-modal-buttons button,
+body.is-mobile .tasknotes-plugin.calendar-event-creation-modal .calendar-event-modal-buttons button {
+    width: 100%;
+}
+
+body.is-mobile .timeblock-modal-buttons-right {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    width: 100%;
+}
+
+body.is-mobile .timeblock-attachment-remove {
+    width: 32px;
+    height: 32px;
 }
 
 /* Attachment Suggestion Modal Styles */
@@ -298,14 +331,10 @@
     margin-top: 0.5rem;
 }
 
-.timeblock-attachment-item {
-    margin-bottom: 0.25rem;
-}
-
 .timeblock-attachment-item .internal-link {
     color: var(--link-color);
     text-decoration: none;
-    cursor: var(--cursor, pointer);
+    cursor: var(--cursor-link, pointer);
 }
 
 .timeblock-attachment-item .internal-link:hover {
@@ -401,13 +430,13 @@
 }
 
 .ics-subscription-delete {
-    color: var(--text-error) !important;
-    border-color: var(--text-error) !important;
+    color: var(--text-error);
+    border-color: var(--text-error);
 }
 
 .ics-subscription-delete:hover {
-    background: var(--text-error) !important;
-    color: white !important;
+    background: var(--text-error);
+    color: var(--text-on-accent, var(--background-primary));
 }
 
 /* ICS Subscription Forms */
@@ -467,7 +496,7 @@
     height: 30px;
     border: 1px solid var(--background-modifier-border);
     border-radius: 3px;
-    cursor: var(--cursor, pointer);
+    cursor: var(--cursor-link, pointer);
 }
 
 .ics-form-number,
@@ -485,7 +514,7 @@
     display: flex;
     align-items: center;
     gap: 0.25rem;
-    cursor: var(--cursor, pointer);
+    cursor: var(--cursor-link, pointer);
 }
 
 .ics-form-checkbox,
@@ -569,7 +598,7 @@
     color: var(--text-on-accent);
     border: none;
     border-radius: 6px;
-    cursor: var(--cursor, pointer);
+    cursor: var(--cursor-link, pointer);
     font-size: 0.85rem;
     font-weight: 500;
     transition: background-color 0.2s ease;
@@ -587,328 +616,39 @@
     min-height: 0;
 }
 
-/* FullCalendar overrides - Minimalist & Clean */
-.advanced-calendar-view .fc {
-    height: 100%;
-    width: 100%;
-    font-family: var(--font-interface);
+/* Agenda/list mode can live in narrow sidebars; respond to container width, not viewport width. */
+.advanced-calendar-view.advanced-calendar-view--list {
+    overflow-x: hidden;
 }
 
-/* Ensure calendar table expands to fill container width */
-.advanced-calendar-view .fc-view-harness {
-    width: 100%;
+.advanced-calendar-view.advanced-calendar-view--list .tnc {
+    max-width: 100%;
+    min-width: 0;
 }
 
-.advanced-calendar-view .fc-scrollgrid {
-    width: 100% !important;
+.advanced-calendar-view.advanced-calendar-view--list .task-card,
+.advanced-calendar-view.advanced-calendar-view--list .task-card__main-row,
+.advanced-calendar-view.advanced-calendar-view--list .task-card__content,
+.advanced-calendar-view.advanced-calendar-view--list .task-card__title {
+    min-width: 0;
+    max-width: 100%;
 }
 
-.advanced-calendar-view .fc-scrollgrid-sync-table {
-    width: 100% !important;
+.advanced-calendar-view.advanced-calendar-view--list .task-card__title-text {
+    min-width: 0;
+    overflow-wrap: anywhere;
 }
 
-/* Remove outer borders only */
-.advanced-calendar-view .fc-theme-standard .fc-scrollgrid {
-    border: none;
-}
-
-/* Light dividers for clean look */
-.advanced-calendar-view .fc-col-header-cell {
-    border-bottom: 1px solid var(--background-modifier-border);
-    border-top: 1px solid var(--background-modifier-border);
-}
-
-.advanced-calendar-view .fc-daygrid-day {
-    border-right: 1px solid var(--background-modifier-border-hover);
-    border-bottom: 1px solid var(--background-modifier-border-hover);
-}
-
-.advanced-calendar-view .fc-timegrid-slot {
-    border-bottom: 1px solid var(--background-modifier-border-hover);
-}
-
-.advanced-calendar-view .fc-timegrid-col {
-    border-right: 1px solid var(--background-modifier-border-hover);
-}
-
-/* Header toolbar styling */
-.advanced-calendar-view .fc-header-toolbar {
-	flex-wrap: wrap;
-    padding: 0;
-    border-bottom: 1px solid var(--background-modifier-border);
-    background: transparent;
-}
-
-/* Calendar title styling - smaller and minimalist */
-.advanced-calendar-view .fc-toolbar-title {
-    font-size: 1rem;
-    font-weight: 400;
-    color: var(--text-muted);
-    margin: 0;
-    padding: 0.3rem 0.6rem;
-}
-
-.advanced-calendar-view .fc-toolbar-chunk {
-    display: flex;
-    align-items: center;
-    gap: 0.25rem;
-}
-
-.advanced-calendar-view .fc-toolbar.fc-header-toolbar {
-    margin-bottom: 0;
-}
-
-/* Remove all borders from FullCalendar buttons */
-.advanced-calendar-view .fc-button,
-.advanced-calendar-view .fc-button-primary,
-.advanced-calendar-view .fc-button-secondary,
-.advanced-calendar-view .fc-prev-button,
-.advanced-calendar-view .fc-next-button,
-.advanced-calendar-view .fc-today-button,
-.advanced-calendar-view .fc-dayGridMonth-button,
-.advanced-calendar-view .fc-timeGridWeek-button,
-.advanced-calendar-view .fc-timeGridDay-button,
-.advanced-calendar-view .fc-listWeek-button {
-    border: none !important;
-    box-shadow: none !important;
-    background: transparent;
-    color: var(--text-muted);
-    font-size: 0.8rem;
-    font-weight: 400;
-    padding: 0.3rem 0.6rem;
-    border-radius: 4px;
-    transition: all 0.2s ease;
-}
-
-/* Hover states for all FC buttons */
-.advanced-calendar-view .fc-button:hover:not(:disabled),
-.advanced-calendar-view .fc-button-primary:hover:not(:disabled),
-.advanced-calendar-view .fc-button-secondary:hover:not(:disabled),
-.advanced-calendar-view .fc-prev-button:hover:not(:disabled),
-.advanced-calendar-view .fc-next-button:hover:not(:disabled) {
-    background: var(--tn-interactive-hover);
-    color: var(--text-normal);
-    border: none !important;
-    box-shadow: none !important;
-}
-
-.advanced-calendar-view .fc-button-primary:disabled {
-    background: transparent;
-    color: var(--text-faint);
-    opacity: 0.5;
-}
-
-/* Active state for FC buttons (currently selected view) */
-.advanced-calendar-view .fc-button-active,
-.advanced-calendar-view .fc-button.fc-button-active {
-    background: var(--interactive-accent) !important;
-    border: none !important;
-    box-shadow: none !important;
-    color: var(--text-on-accent) !important;
-}
-
-/* Use consistent button system for today button */
-.advanced-calendar-view .fc-today-button {
-    background: var(--interactive-accent);
-    border: none;
-    box-shadow: none;
-    color: var(--text-on-accent);
-}
-
-.advanced-calendar-view .fc-today-button:hover:not(:disabled) {
-    background: var(--interactive-accent-hover);
-    box-shadow: none;
-}
-
-/* Clean today styling */
-.advanced-calendar-view .fc-daygrid-day.fc-day-today {
-    background: color-mix(in srgb, var(--interactive-accent) 8%, var(--background-primary)) !important;
-    border: 2px solid var(--interactive-accent);
-    position: relative;
-}
-
-.advanced-calendar-view .fc-daygrid-day.fc-day-today .fc-daygrid-day-number {
-    font-weight: 600;
-    color: var(--interactive-accent) !important;
-}
-
-/* Fix today styling specifically for multi-month (year) view */
-.advanced-calendar-view .fc-multimonth-daygrid .fc-daygrid-day.fc-day-today {
-    background: color-mix(in srgb, var(--interactive-accent) 8%, var(--background-primary)) !important;
-    border: 2px solid var(--interactive-accent) !important;
-}
-
-.advanced-calendar-view .fc-multimonth-daygrid .fc-daygrid-day.fc-day-today .fc-daygrid-day-number {
-    font-weight: 600;
-    color: var(--interactive-accent) !important;
-}
-
-.advanced-calendar-view .fc-daygrid-day.fc-day-today::before {
-    content: '';
-    position: absolute;
-    top: 2px;
-    right: 2px;
-    width: 6px;
-    height: 6px;
-    background: var(--interactive-accent);
-    border-radius: 50%;
-    z-index: 1;
-}
-
-/* Timegrid (week/day view) today column - use subtle accent instead of FullCalendar default yellow */
-/* Must match FullCalendar's specificity: .fc .fc-timegrid-col.fc-day-today */
-.advanced-calendar-view .fc .fc-timegrid-col.fc-day-today {
-    background-color: color-mix(in srgb, var(--interactive-accent) 8%, var(--background-primary)) !important;
-}
-
-/* Override FullCalendar's today background CSS variable for consistent theming */
-/* Scoped to .fc inside our view to ensure the variable is properly inherited */
-.advanced-calendar-view .fc {
-    --fc-today-bg-color: color-mix(in srgb, var(--interactive-accent) 8%, var(--background-primary));
-}
-
-/* Header cells */
-.advanced-calendar-view .fc-col-header-cell {
-    background: var(--background-primary) !important;
-    color: var(--text-muted) !important;
-    font-weight: 400;
-    font-size: 0.75rem;
-    /* text-transform: lowercase; */
-    letter-spacing: 0;
-    padding: 0.5rem 0.5rem;
-}
-
-/* Day cells - ensure proper theme colors */
-.advanced-calendar-view .fc-daygrid-day {
-    background: var(--background-primary) !important;
-    color: var(--text-normal) !important;
-}
-
-/* Multi-month (year view) styling - minimalist */
-.advanced-calendar-view .fc-multimonth-daygrid .fc-daygrid-day {
-    background: var(--background-primary) !important;
-    color: var(--text-normal) !important;
-}
-
-/* Multi-month month headers */
-.advanced-calendar-view .fc-multimonth-header {
-    background: transparent !important;
-    color: var(--text-normal) !important;
-    border-bottom: 1px solid var(--divider-color);
-}
-
-.advanced-calendar-view .fc-multimonth-title {
-    background: transparent !important;
-    color: var(--text-normal) !important;
-    font-weight: 500;
-    padding: 0.5rem;
-}
-
-/* Multi-month day headers (Mon, Tue, etc.) */
-.advanced-calendar-view .fc-multimonth .fc-col-header-cell {
-    background: transparent !important;
-    color: var(--text-muted) !important;
-    font-size: 0.85rem;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-}
-
-/* Day numbers */
-.advanced-calendar-view .fc-daygrid-day-number {
-    color: var(--text-normal) !important;
-    font-weight: 400;
-    font-size: 0.9rem;
-    padding: 0.5rem;
-}
-
-/* List view day headers - minimalist */
-.advanced-calendar-view .fc-list-day-cushion {
-    background: transparent !important;
-    color: var(--text-normal) !important;
-    font-weight: 500;
-    border-bottom: 1px solid var(--divider-color);
-    padding: 0.5rem 0.25rem;
-}
-
-.advanced-calendar-view .fc-list-day {
-    background: transparent !important;
-}
-
-/* Today highlight in list/agenda view */
-.advanced-calendar-view .fc-list-day.fc-day-today .fc-list-day-cushion {
-    color: var(--interactive-accent) !important;
-    font-weight: 600;
-    border-bottom-color: var(--interactive-accent);
-}
-
-.hide-today-highlight .fc-list-day.fc-day-today .fc-list-day-cushion {
-    color: var(--text-normal) !important;
-    font-weight: 500;
-    border-bottom-color: var(--divider-color);
-}
-
-.advanced-calendar-view .fc-list-table th {
-    background: var(--background-secondary-alt) !important;
-}
-
-/* Clean event styling */
-.advanced-calendar-view .fc-event {
-    border-radius: 6px;
-    border: 1px solid;
-    font-size: 0.8rem;
-    font-weight: 500;
-    padding: 0.2rem 0.5rem;
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
-    transition: all 0.2s ease;
-    cursor: var(--cursor, pointer);
-}
-
-.advanced-calendar-view .fc-event:hover {
-    transform: translateY(-1px);
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
-}
-
-.advanced-calendar-view .fc-event-title {
-    font-weight: 500;
-    line-height: 1.3;
-	text-decoration: inherit;
-}
-
-/* Time grid specific styles */
-.advanced-calendar-view .fc-timegrid-slot {
-    height: 3rem;
-}
-
-.advanced-calendar-view .fc-timegrid-slot-label {
-    font-size: 0.8rem;
-    color: var(--text-muted);
-    padding: 0.5rem;
-}
-
-.advanced-calendar-view .fc-timegrid-axis {
-    width: 4rem;
-}
-
-
-/* More events link */
-.advanced-calendar-view .fc-more-link {
-    color: var(--interactive-accent);
-    font-size: 0.75rem;
-    font-weight: 500;
-}
-
-.advanced-calendar-view .fc-more-link:hover {
-    color: var(--interactive-accent-hover);
-}
-
-/* Current time indicator (red line) */
-.advanced-calendar-view .fc-timegrid-now-indicator-line {
-    border-color: #ff0000;
-    border-width: 1px;
-}
-
-.advanced-calendar-view .fc-timegrid-now-indicator-arrow {
-    border-color: #ff0000;
+.advanced-calendar-view.advanced-calendar-view--list .task-card__badges,
+.advanced-calendar-view.advanced-calendar-view--list .task-card__recurring-indicator,
+.advanced-calendar-view.advanced-calendar-view--list .task-card__reminder-indicator,
+.advanced-calendar-view.advanced-calendar-view--list .task-card__details-indicator,
+.advanced-calendar-view.advanced-calendar-view--list .task-card__attachment-indicator,
+.advanced-calendar-view.advanced-calendar-view--list .task-card__project-indicator,
+.advanced-calendar-view.advanced-calendar-view--list .task-card__chevron,
+.advanced-calendar-view.advanced-calendar-view--list .task-card__blocking-toggle,
+.advanced-calendar-view.advanced-calendar-view--list .task-card__blocked-toggle {
+    flex: 0 0 auto;
 }
 
 /* Mobile collapse toggle - hidden by default */
@@ -924,8 +664,8 @@
     border-radius: 6px;
     padding: 0.4rem 0.8rem;
     font-size: 0.85rem;
-    cursor: var(--cursor, pointer);
-    transition: all 0.2s ease;
+    cursor: var(--cursor-link, pointer);
+    transition: background-color 0.2s ease, border-color 0.2s ease, color 0.2s ease;
 }
 
 .advanced-calendar-view__collapse-btn:hover {
@@ -983,288 +723,15 @@
     .advanced-calendar-view__header {
         padding: 0.25rem 0.5rem;
     }
-}
 
-/* Today highlighting disabled */
-.hide-today-highlight .fc-unthemed td.fc-today {
-    background: inherit;
-}
-
-.hide-today-highlight .fc-daygrid-day.fc-day-today {
-    background: inherit !important;
-    border: none !important;
-}
-
-.hide-today-highlight .fc-daygrid-day.fc-day-today .fc-daygrid-day-number {
-    font-weight: 400;
-    color: var(--text-normal);
-}
-
-.hide-today-highlight .fc-daygrid-day.fc-day-today::before {
-    display: none;
-}
-
-.hide-today-highlight .fc .fc-timegrid-col.fc-day-today {
-    background: inherit !important;
-    border: none !important;
-}
-
-/* ICS Refresh Button - Match exact styling of other FullCalendar buttons */
-.advanced-calendar-view .fc-refreshICS-button {
-    background: transparent !important;
-    border: none !important;
-    box-shadow: none !important;
-    color: var(--text-muted) !important;
-    font-size: 0.8rem !important;
-    font-weight: 400 !important;
-    padding: 0.3rem 0.6rem !important;
-    border-radius: 4px !important;
-    transition: all 0.2s ease !important;
-}
-
-.advanced-calendar-view .fc-refreshICS-button .fc-icon,
-.advanced-calendar-view .fc-refreshICS-button .fc-button-label {
-    color: var(--text-muted) !important;
-    font-size: 0.8rem !important;
-    font-weight: 400 !important;
-    line-height: 1.2;
-    display: inline;
-    visibility: visible;
-}
-
-/* Hover state - match other buttons exactly */
-.advanced-calendar-view .fc-refreshICS-button:hover:not(:disabled) {
-    background: var(--tn-interactive-hover) !important;
-    color: var(--text-normal) !important;
-    border: none !important;
-    box-shadow: none !important;
-}
-
-.advanced-calendar-view .fc-refreshICS-button:hover:not(:disabled) .fc-icon,
-.advanced-calendar-view .fc-refreshICS-button:hover:not(:disabled) .fc-button-label {
-    color: var(--text-normal) !important;
-}
-
-/* Active/Focus state - match other buttons */
-.advanced-calendar-view .fc-refreshICS-button:active,
-.advanced-calendar-view .fc-refreshICS-button:focus {
-    background: var(--tn-interactive-hover) !important;
-    border: none !important;
-    box-shadow: none !important;
-    outline: none !important;
-    color: var(--text-normal) !important;
-}
-
-/* Disabled state - match other buttons */
-.advanced-calendar-view .fc-refreshICS-button:disabled {
-    background: transparent !important;
-    color: var(--text-faint) !important;
-    opacity: 0.5 !important;
-    border: none !important;
-    box-shadow: none !important;
-}
-
-/* ===== CLEAN LIST VIEW STYLING - NO INHERITANCE ===== */
-
-/* Base styling for ALL list events - completely independent from calendar views */
-.fc-list-event {
-    /* Reset any inherited styling from calendar views */
-    opacity: 1 !important;
-    border: none !important;
-    border-radius: 0 !important;
-    background: transparent !important;
-    box-shadow: none !important;
-}
-
-/* Consistent light hover background for ALL list events */
-.fc-list-event:hover {
-    background-color: var(--background-modifier-hover) !important;
-}
-
-/* Fix time element color on hover in list view */
-.fc-list-event:hover .fc-list-event-time {
-    color: inherit !important;
-    background-color: transparent !important;
-}
-
-.fc-list-event .fc-list-event-time {
-    /* Consistent time styling for all events */
-    font-size: inherit !important;
-    color: inherit !important;
-    font-weight: inherit !important;
-    vertical-align: top;
-}
-
-.fc-list-event .fc-list-event-title {
-    /* Base title styling - clean and consistent */
-    padding: 8px 12px;
-    border: none !important;
-    border-radius: 0 !important;
-    background: transparent !important;
-    box-shadow: none !important;
-    font-size: inherit !important;
-    font-weight: inherit !important;
-    color: inherit !important;
-    display: table-cell;
-    vertical-align: top;
-}
-
-
-.fc-list-event .fc-list-event-dot {
-    /* Standard dot styling for all events */
-    border: inherit !important;
-    background: inherit !important;
-}
-
-/* ===== TASK-SPECIFIC ENHANCEMENTS ===== */
-
-/* Task events get ONLY functional enhancements - NO visual styling differences */
-.fc-list-event.fc-list-task-card .fc-list-event-title {
-    /* Keep base styling identical to ICS events - no background, borders, or shadows */
-    background-color: transparent !important;
-    border-radius: 0 !important;
-    box-shadow: none !important;
-}
-
-/* Remove task-specific hover - now handled by base .fc-list-event:hover */
-
-/* Hide default FullCalendar dot for tasks since we have custom indicators */
-.fc-list-event.fc-list-task-card .fc-list-event-dot {
-    display: none;
-}
-
-/* Style the status dot in graphic column */
-.fc-list-event-status-dot {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    margin: auto;
-}
-
-/* Prevent graphic column from getting hover background */
-.fc-list-event:hover .fc-list-event-graphic {
-    background-color: transparent !important;
-}
-
-/* Task title row with indicators on same line */
-.fc-list-task-title-row {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    width: 100%;
-    margin-bottom: 4px;
-}
-
-/* Metadata spacing without separators */
-.fc-list-task-metadata > span {
-    display: block;
-    margin: 2px 0;
-}
-
-/* Status and priority dots */
-.fc-list-task-status-dot,
-.fc-list-task-priority-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    border: 2px solid currentColor;
-    background-color: transparent;
-    flex-shrink: 0;
-}
-
-.fc-list-task-priority-dot {
-    cursor: var(--cursor, pointer);
-}
-
-.fc-list-task-priority-dot {
-    background-color: var(--priority-color, currentColor);
-}
-
-/* Recurring indicator styling */
-.fc-list-task-recurring-indicator {
-    width: 12px;
-    height: 12px;
-    flex-shrink: 0;
-    opacity: 0.7;
-    cursor: var(--cursor, pointer);
-}
-
-.fc-list-task-recurring-indicator:hover {
-    opacity: 1;
-}
-
-.fc-list-task-status-dot {
-    border-color: var(--current-status-color, var(--text-muted));
-}
-
-/* Recurring indicator */
-.fc-list-task-recurring-indicator {
-    font-size: 12px;
-    opacity: 0.8;
-    flex-shrink: 0;
-}
-
-/* Task title */
-.fc-list-task-title {
-    font-weight: 500 !important;
-    color: var(--text-normal) !important;
-    font-size: 14px !important;
-    flex-grow: 1;
-}
-
-/* Task metadata */
-.fc-list-task-metadata {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-    align-items: center;
-    font-size: 12px;
-    color: var(--text-muted);
-    margin-top: 2px;
-}
-
-.fc-list-task-metadata > span {
-    background-color: var(--background-secondary);
-    padding: 2px 6px;
-    border-radius: 3px;
-    font-size: 11px;
-}
-
-.fc-list-task-projects {
-    background-color: rgba(var(--color-blue-rgb, 13 110 253), 0.1) !important;
-    color: var(--color-blue) !important;
-}
-
-.fc-list-task-contexts {
-    background-color: rgba(var(--color-green-rgb, 25 135 84), 0.1) !important;
-    color: var(--color-green) !important;
-}
-
-.fc-list-task-tags {
-    background-color: rgba(var(--color-purple-rgb, 102 16 242), 0.1) !important;
-    color: var(--color-purple) !important;
-}
-
-.fc-list-task-time-estimate {
-    background-color: rgba(var(--color-orange-rgb, 255 159 67), 0.1) !important;
-    color: var(--color-orange) !important;
-}
-
-.fc-list-task-metadata-separator {
-    color: var(--text-faint);
-    font-weight: 300;
-}
-
-/* Responsive design for smaller screens */
-@media (max-width: 768px) {
-    .fc-list-task-metadata {
-        flex-direction: column;
-        align-items: flex-start;
-        gap: 4px;
+    body.is-mobile .advanced-calendar-view .tn-calendar-event-touch-target {
+        -webkit-touch-callout: none;
+        user-select: none;
     }
 
-    .fc-list-task-title-row {
-        gap: 4px;
+    body.is-mobile .advanced-calendar-view .tn-calendar-event-touch-target .task-card {
+        -webkit-touch-callout: none;
+        user-select: none;
     }
 }
 
@@ -1278,68 +745,4 @@
         opacity: 1;
         transform: translateY(0);
     }
-}
-
-.fc-list-event.fc-list-task-card[data-newly-added] {
-    animation: slideInUp 0.3s ease-out;
-}
-
-/* Dark mode fixes for FullCalendar popover ("+more" popup) */
-.theme-dark .advanced-calendar-view .fc-popover {
-    background: var(--background-primary) !important;
-    border: 1px solid var(--background-modifier-border) !important;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5) !important;
-}
-
-.theme-dark .advanced-calendar-view .fc-popover-header {
-    background: var(--background-secondary) !important;
-    border-bottom: 1px solid var(--background-modifier-border) !important;
-}
-
-.theme-dark .advanced-calendar-view .fc-popover-title {
-    color: var(--text-normal) !important;
-}
-
-.theme-dark .advanced-calendar-view .fc-popover-close {
-    color: var(--text-muted) !important;
-}
-
-.theme-dark .advanced-calendar-view .fc-popover-close:hover {
-    color: var(--text-normal) !important;
-    background: var(--background-modifier-hover) !important;
-}
-
-.theme-dark .advanced-calendar-view .fc-popover-body {
-    background: var(--background-primary) !important;
-    color: var(--text-normal) !important;
-}
-
-/* Dark mode fixes for timeGrid more link (eventMaxStack) */
-.advanced-calendar-view .fc-timegrid-more-link {
-    color: var(--text-normal);
-    background: var(--background-secondary);
-    border: 1px solid var(--background-modifier-border);
-    border-radius: 4px;
-    padding: 2px 6px;
-    font-size: 0.75rem;
-    font-weight: 500;
-    text-decoration: none;
-    display: inline-block;
-    margin-top: 2px;
-}
-
-.advanced-calendar-view .fc-timegrid-more-link:hover {
-    background: var(--background-modifier-hover);
-    color: var(--text-normal);
-}
-
-.theme-dark .advanced-calendar-view .fc-timegrid-more-link {
-    background: var(--background-secondary);
-    color: var(--text-normal);
-    border-color: var(--background-modifier-border);
-}
-
-.theme-dark .advanced-calendar-view .fc-timegrid-more-link:hover {
-    background: var(--background-modifier-hover);
-    color: var(--text-normal);
 }

@@ -2,14 +2,39 @@ import { TFile } from "obsidian";
 import { TaskInfo } from "../types";
 import TaskNotesPlugin from "../main";
 
+interface BatchContextMenuAdapter {
+	show(event: MouseEvent): void;
+}
+
+type BatchContextMenuFactory = (
+	selectedPaths: string[],
+	onUpdate: () => void
+) => BatchContextMenuAdapter;
+
 export interface ClickHandlerOptions {
 	task: TaskInfo;
 	plugin: TaskNotesPlugin;
 	excludeSelector?: string; // CSS selector for elements that should not trigger click behavior
-	onSingleClick?: (e: MouseEvent) => Promise<void>; // Optional override for single click
-	onDoubleClick?: (e: MouseEvent) => Promise<void>; // Optional override for double click
-	contextMenuHandler?: (e: MouseEvent) => Promise<void>; // Optional context menu handler
+	onSingleClick?: (e: MouseEvent) => void | Promise<void>; // Optional override for single click
+	onDoubleClick?: (e: MouseEvent) => void | Promise<void>; // Optional override for double click
+	/** A view can consume selection before standalone card navigation runs. */
+	onSelectionClick?: (e: MouseEvent) => boolean;
+	contextMenuHandler?: (e: MouseEvent) => void | Promise<void>; // Optional context menu handler
+	createBatchContextMenu?: BatchContextMenuFactory;
+	navigationSubpath?: string;
 }
+
+export const DEFAULT_TASK_CLICK_EXCLUDE_SELECTOR = [
+	"a",
+	"button",
+	"input",
+	"textarea",
+	"select",
+	'[role="button"]',
+	'[data-tn-no-drag="true"]',
+	'[data-tn-click-exclude="true"]',
+	".tag",
+].join(", ");
 
 /**
  * Creates a reusable click handler that supports single/double click distinction
@@ -17,18 +42,32 @@ export interface ClickHandlerOptions {
  * Ctrl/Cmd + Click: Opens source note immediately
  */
 export function createTaskClickHandler(options: ClickHandlerOptions) {
-	const { task, plugin, excludeSelector, onSingleClick, onDoubleClick, contextMenuHandler } =
-		options;
+	const {
+		task,
+		plugin,
+		excludeSelector,
+		onSingleClick,
+		onDoubleClick,
+		contextMenuHandler,
+		onSelectionClick,
+		createBatchContextMenu,
+		navigationSubpath,
+	} = options;
+	const clickExcludeSelector = excludeSelector
+		? `${DEFAULT_TASK_CLICK_EXCLUDE_SELECTOR}, ${excludeSelector}`
+		: DEFAULT_TASK_CLICK_EXCLUDE_SELECTOR;
 
-	let clickTimeout: ReturnType<typeof setTimeout> | null = null;
+	let clickTimeout: number | null = null;
 
 	const openNote = (newTab = false) => {
 		const file = plugin.app.vault.getAbstractFileByPath(task.path);
 		if (file instanceof TFile) {
-			if (newTab) {
-				plugin.app.workspace.openLinkText(task.path, "", true);
+			if (navigationSubpath) {
+				void plugin.app.workspace.openLinkText(task.path + navigationSubpath, "", newTab);
+			} else if (newTab) {
+				void plugin.app.workspace.openLinkText(task.path, "", true);
 			} else {
-				plugin.app.workspace.getLeaf(false).openFile(file);
+				void plugin.app.workspace.getLeaf(false).openFile(file);
 			}
 		}
 	};
@@ -70,15 +109,23 @@ export function createTaskClickHandler(options: ClickHandlerOptions) {
 		}
 	};
 
-	const clickHandler = async (e: MouseEvent) => {
-		if (excludeSelector) {
-			const target = e.target as HTMLElement;
-			if (target.closest(excludeSelector)) {
-				return;
-			}
+	const handleClick = async (e: MouseEvent) => {
+		const target = e.target as HTMLElement;
+		if (target.closest(clickExcludeSelector)) {
+			return;
 		}
 
-		// Check for selection mode - only shift+click triggers selection
+		if (onSelectionClick?.(e)) {
+			e.preventDefault();
+			e.stopPropagation();
+			if (clickTimeout) {
+				window.clearTimeout(clickTimeout);
+				clickTimeout = null;
+			}
+			return;
+		}
+
+		// Standalone cards keep Shift-selection and Ctrl/Cmd source navigation.
 		const selectionService = plugin.taskSelectionService;
 		if (selectionService) {
 			if (e.shiftKey) {
@@ -110,22 +157,49 @@ export function createTaskClickHandler(options: ClickHandlerOptions) {
 		}
 
 		if (clickTimeout) {
-			clearTimeout(clickTimeout);
+			window.clearTimeout(clickTimeout);
 			clickTimeout = null;
 			await handleDoubleClick(e);
 		} else {
-			clickTimeout = setTimeout(() => {
+			clickTimeout = window.setTimeout(() => {
 				clickTimeout = null;
-				handleSingleClick(e);
+				void handleSingleClick(e);
 			}, 250);
 		}
 	};
 
-	const dblclickHandler = async (e: MouseEvent) => {
+	const clickHandler = (event: MouseEvent) => {
+		void handleClick(event);
+	};
+
+	const handleAuxClick = (e: MouseEvent) => {
+		if (e.button !== 1) {
+			return;
+		}
+
+		const target = e.target as HTMLElement;
+		if (target.closest(clickExcludeSelector)) {
+			return;
+		}
+
+		e.preventDefault();
+		e.stopPropagation();
+		if (clickTimeout) {
+			window.clearTimeout(clickTimeout);
+			clickTimeout = null;
+		}
+		openNote(true);
+	};
+
+	const auxclickHandler = (event: MouseEvent) => {
+		handleAuxClick(event);
+	};
+
+	const dblclickHandler = (_event: MouseEvent) => {
 		// This is handled by the clickHandler to distinguish single/double clicks
 	};
 
-	const contextmenuHandler = async (e: MouseEvent) => {
+	const handleContextMenu = async (e: MouseEvent) => {
 		e.preventDefault();
 		e.stopPropagation(); // Prevent event from bubbling to parent cards
 
@@ -142,13 +216,8 @@ export function createTaskClickHandler(options: ClickHandlerOptions) {
 
 			// Show batch context menu if we have selections
 			if (selectionService.getSelectionCount() > 0) {
-				const { BatchContextMenu } = require("../components/BatchContextMenu");
-				const menu = new BatchContextMenu({
-					plugin,
-					selectedPaths: selectionService.getSelectedPaths(),
-					onUpdate: () => {},
-				});
-				menu.show(e);
+				const menu = createBatchContextMenu?.(selectionService.getSelectedPaths(), () => {});
+				menu?.show(e);
 			}
 			return;
 		}
@@ -161,15 +230,10 @@ export function createTaskClickHandler(options: ClickHandlerOptions) {
 			}
 
 			// Import and show batch context menu
-			const { BatchContextMenu } = require("../components/BatchContextMenu");
-			const menu = new BatchContextMenu({
-				plugin,
-				selectedPaths: selectionService.getSelectedPaths(),
-				onUpdate: () => {
-					// Views will refresh via events
-				},
+			const menu = createBatchContextMenu?.(selectionService.getSelectedPaths(), () => {
+				// Views will refresh via events
 			});
-			menu.show(e);
+			menu?.show(e);
 			return;
 		}
 
@@ -184,13 +248,18 @@ export function createTaskClickHandler(options: ClickHandlerOptions) {
 		}
 	};
 
+	const contextmenuHandler = (event: MouseEvent) => {
+		void handleContextMenu(event);
+	};
+
 	return {
 		clickHandler,
+		auxclickHandler,
 		dblclickHandler,
 		contextmenuHandler,
 		cleanup: () => {
 			if (clickTimeout) {
-				clearTimeout(clickTimeout);
+				window.clearTimeout(clickTimeout);
 				clickTimeout = null;
 			}
 		},
@@ -219,7 +288,7 @@ export function createTaskHoverHandler(task: TaskInfo, plugin: TaskNotesPlugin) 
 /**
  * Calendar click timeout tracker to distinguish single/double clicks
  */
-const calendarClickTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
+const calendarClickTimeouts = new Map<string, number>();
 
 /**
  * Handle calendar event clicks with single/double click detection
@@ -236,9 +305,9 @@ export async function handleCalendarTaskClick(
 		const file = plugin.app.vault.getAbstractFileByPath(task.path);
 		if (file instanceof TFile) {
 			if (newTab) {
-				plugin.app.workspace.openLinkText(task.path, "", true);
+				void plugin.app.workspace.openLinkText(task.path, "", true);
 			} else {
-				plugin.app.workspace.getLeaf(false).openFile(file);
+				void plugin.app.workspace.getLeaf(false).openFile(file);
 			}
 		}
 	};
@@ -281,14 +350,14 @@ export async function handleCalendarTaskClick(
 
 	if (existingTimeout) {
 		// This is a double-click
-		clearTimeout(existingTimeout);
+		window.clearTimeout(existingTimeout);
 		calendarClickTimeouts.delete(eventId);
 		await handleDoubleClick(jsEvent);
 	} else {
 		// This might be a single-click, wait to see if double-click follows
-		const timeout = setTimeout(() => {
+		const timeout = window.setTimeout(() => {
 			calendarClickTimeouts.delete(eventId);
-			handleSingleClick(jsEvent);
+			void handleSingleClick(jsEvent);
 		}, 250);
 		calendarClickTimeouts.set(eventId, timeout);
 	}
@@ -300,7 +369,7 @@ export async function handleCalendarTaskClick(
 export function cleanupCalendarClickTimeout(eventId: string) {
 	const timeout = calendarClickTimeouts.get(eventId);
 	if (timeout) {
-		clearTimeout(timeout);
+		window.clearTimeout(timeout);
 		calendarClickTimeouts.delete(eventId);
 	}
 }
